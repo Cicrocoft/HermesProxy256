@@ -32,8 +32,63 @@ public class InitializeFactions : ServerPacket, ISpanWritable
 
     public InitializeFactions() : base(Opcode.SMSG_INITIALIZE_FACTIONS, ConnectionType.Instance) { }
 
+    // 5.5.0-engine body, verified against the 69110 client's own message reader
+    // (ctor rva 0x5BFBC0: u32 count, u32 bonusCount, count x { u32, u16, u32 },
+    // bonusCount x { u32, u8 }; the bonus bit is flushed to a full byte per entry):
+    //   i32 FactionCount, i32 BonusCount
+    //   FactionCount x { u32 FactionID, u16 Flags, i32 Standing }
+    //   BonusCount   x { u32 FactionID, 1 bit FactionHasBonus (FlushBits per entry) }
+    // Entries carry Faction IDs, not reputation-index slots, so the legacy slots are
+    // translated through GameData.GetFactionIdByReputationIndex; slots with no mapping
+    // are gaps in the reputation index space and are skipped. Within the 10-byte entry
+    // the u16 pins Flags; FactionID-before-Standing follows WPP 5.5.0 and TrinityCore.
+    // The low flag byte is bit-compatible between legacy and modern (Visible/AtWar/
+    // Hidden/ForcedInvisible/Peaceful/Inactive/ShowPropagated/HeaderShowsBar).
+    void Write550(ref SpanPacketWriter writer)
+    {
+        int count = 0;
+        for (uint i = 0; i < FactionCount; ++i)
+            if (GameData.GetFactionIdByReputationIndex(i) != 0)
+                ++count;
+
+        writer.WriteInt32(count);
+        writer.WriteInt32(0); // BonusCount - legacy data has no faction bonus info
+
+        for (uint i = 0; i < FactionCount; ++i)
+        {
+            uint factionId = GameData.GetFactionIdByReputationIndex(i);
+            if (factionId == 0)
+                continue;
+            writer.WriteUInt32(factionId);
+            writer.WriteUInt16((ushort)((ushort)FactionFlags[i] & 0xFF));
+            writer.WriteInt32(FactionStandings[i]);
+        }
+    }
+
     public override void Write()
     {
+        if (ModernVersion.Uses550Engine)
+        {
+            int count = 0;
+            for (uint i = 0; i < FactionCount; ++i)
+                if (GameData.GetFactionIdByReputationIndex(i) != 0)
+                    ++count;
+
+            _worldPacket.WriteInt32(count);
+            _worldPacket.WriteInt32(0); // BonusCount - legacy data has no faction bonus info
+
+            for (uint i = 0; i < FactionCount; ++i)
+            {
+                uint factionId = GameData.GetFactionIdByReputationIndex(i);
+                if (factionId == 0)
+                    continue;
+                _worldPacket.WriteUInt32(factionId);
+                _worldPacket.WriteUInt16((ushort)((ushort)FactionFlags[i] & 0xFF));
+                _worldPacket.WriteInt32(FactionStandings[i]);
+            }
+            return;
+        }
+
         for (ushort i = 0; i < FactionCount; ++i)
         {
             _worldPacket.WriteUInt8((byte)((ushort)FactionFlags[i] & 0xFF));
@@ -46,12 +101,21 @@ public class InitializeFactions : ServerPacket, ISpanWritable
         _worldPacket.FlushBits();
     }
 
-    // Fixed size: 400 factions × (byte + int) + 400 bits = 2000 + 50 = 2050 bytes
-    public int MaxSize => FactionCount * 5 + 50;
+    // Legacy fixed size: 400 factions × (byte + int) + 400 bits = 2000 + 50 = 2050 bytes
+    // 5.5.0: 2 counts + one 10-byte entry per tracked faction (75 on TBC data)
+    public int MaxSize => ModernVersion.Uses550Engine
+        ? 8 + GameData.FactionIdByRepIndex.Count * 10
+        : FactionCount * 5 + 50;
 
     public int WriteToSpan(Span<byte> buffer)
     {
         var writer = new SpanPacketWriter(buffer);
+
+        if (ModernVersion.Uses550Engine)
+        {
+            Write550(ref writer);
+            return writer.Position;
+        }
 
         for (ushort i = 0; i < FactionCount; ++i)
         {
@@ -75,8 +139,33 @@ class SetFactionStanding : ServerPacket, ISpanWritable
 {
     public SetFactionStanding() : base(Opcode.SMSG_SET_FACTION_STANDING, ConnectionType.Instance) { }
 
+    // 5.5.0-engine body, verified against the 69110 client's own message reader
+    // (ctor rva 0x5C0150: u32, u32 count, count x { u32, u32, u32 }, u8 bit byte):
+    //   f32 BonusFromAchievementSystem
+    //   i32 Count, Count x { i32 Index, i32 Standing, i32 FactionID }
+    //   1 bit ShowVisual
+    // One leading float, not the pre-5.5.0 two. Field sizes and loop structure are
+    // client-verified; the order within the 12-byte entry (Index, Standing, FactionID)
+    // follows WPP 5.5.0 and TrinityCore, whose structs agree.
     public override void Write()
     {
+        if (ModernVersion.Uses550Engine)
+        {
+            _worldPacket.WriteFloat(BonusFromAchievementSystem);
+
+            _worldPacket.WriteInt32(Factions.Count);
+            foreach (FactionStandingData factionStanding in Factions)
+            {
+                _worldPacket.WriteInt32(factionStanding.Index);
+                _worldPacket.WriteInt32(factionStanding.Standing);
+                _worldPacket.WriteInt32((int)GameData.GetFactionIdByReputationIndex((uint)factionStanding.Index));
+            }
+
+            _worldPacket.WriteBit(ShowVisual);
+            _worldPacket.FlushBits();
+            return;
+        }
+
         _worldPacket.WriteFloat(ReferAFriendBonus);
         _worldPacket.WriteFloat(BonusFromAchievementSystem);
 
@@ -90,8 +179,11 @@ class SetFactionStanding : ServerPacket, ISpanWritable
 
     // Cap for faction standing changes - usually just a few at once
     private const int MaxFactions = 16;
-    // 2 floats(8) + count(4) + factions(8 each) + 1 bit
-    public int MaxSize => 8 + 4 + MaxFactions * 8 + 1;
+    // legacy: 2 floats(8) + count(4) + factions(8 each) + 1 bit
+    // 5.5.0:  1 float(4) + count(4) + factions(12 each) + 1 bit
+    public int MaxSize => ModernVersion.Uses550Engine
+        ? 4 + 4 + MaxFactions * 12 + 1
+        : 8 + 4 + MaxFactions * 8 + 1;
 
     public int WriteToSpan(Span<byte> buffer)
     {
@@ -99,6 +191,22 @@ class SetFactionStanding : ServerPacket, ISpanWritable
             return -1;
 
         var writer = new SpanPacketWriter(buffer);
+
+        if (ModernVersion.Uses550Engine)
+        {
+            writer.WriteFloat(BonusFromAchievementSystem);
+            writer.WriteInt32(Factions.Count);
+            foreach (FactionStandingData factionStanding in Factions)
+            {
+                writer.WriteInt32(factionStanding.Index);
+                writer.WriteInt32(factionStanding.Standing);
+                writer.WriteInt32((int)GameData.GetFactionIdByReputationIndex((uint)factionStanding.Index));
+            }
+            writer.WriteBit(ShowVisual);
+            writer.FlushBits();
+            return writer.Position;
+        }
+
         writer.WriteFloat(ReferAFriendBonus);
         writer.WriteFloat(BonusFromAchievementSystem);
         writer.WriteInt32(Factions.Count);

@@ -32,19 +32,41 @@ public class QueryTimeResponse : ServerPacket, ISpanWritable
 
     public override void Write()
     {
+        if (ModernVersion.Uses550Engine)
+        {
+            // Client reader 0x5BB550: u32 to +0x20, u32 to +0x24, then a bits byte of which it
+            // keeps bit 7. Nine bytes. The int64 this replaces came from WowPacketParser's
+            // hand-written SessionHandler and starved the reader.
+            _worldPacket.WriteUInt32((uint)CurrentTime);
+            _worldPacket.WriteUInt32(DailyReset);
+            _worldPacket.WriteBits(0, 1);
+            _worldPacket.FlushBits();
+            return;
+        }
         _worldPacket.WriteInt64(CurrentTime);
     }
 
-    public int MaxSize => 8; // int64
+    public int MaxSize => 9;
 
     public int WriteToSpan(Span<byte> buffer)
     {
         var writer = new SpanPacketWriter(buffer);
+        if (ModernVersion.Uses550Engine)
+        {
+            writer.WriteUInt32((uint)CurrentTime);
+            writer.WriteUInt32(DailyReset);
+            writer.WriteUInt8(0);        // the bits byte, single flag clear
+            return writer.Position;
+        }
         writer.WriteInt64(CurrentTime);
         return writer.Position;
     }
 
     public long CurrentTime;
+
+    /// <summary>Seconds until the daily reset. The legacy handler already reads this and used to
+    /// discard it; on this build the client has a field for it.</summary>
+    public uint DailyReset;
 }
 
 class QueryPetName : ClientPacket
@@ -285,146 +307,340 @@ public class QueryQuestInfoResponse : ServerPacket
         _worldPacket.WriteBit(Allow);
         _worldPacket.FlushBits();
 
-        if (Allow)
+        if (!Allow)
+            return;
+
+        if (ModernVersion.Uses550Engine)
+            WriteQuestInfo550();
+        else
+            WriteQuestInfo252();
+    }
+
+    // 2.5.6 (69110) layout, decoded from the client's own reader at 0x63BF60 (dispatched for
+    // opcode 0x640016) and cross-checked against the jump-table body derivation in
+    // tools-256-spike/opcode_bodies_jt.txt, which agrees token for token. WowPacketParser
+    // V5_5_0_61735 has no 5.5.3 arm for this packet; verified differences from its 5.5.0 shape:
+    //   * one extra u32 between RewardArtifactXPDifficulty and RewardArtifactXPMultiplier
+    //     (client stores +0x54; the multiplier float is pinned at +0x58 by movss);
+    //   * AllowableRaces is no longer a u64: after ObjectiveCount come ten u32s
+    //     [scalar +0x2e48, scalar +0x2e4c, count, count, scalar +0x2e80, scalar +0x2e88,
+    //     count, count, count, count]. The six counts feed, in order: u32 list +0x2e50,
+    //     u32 list +0x2e68, conditional-text struct list +0x2e90, conditional-text struct
+    //     list +0x2ea8, u32 list +0x2ec0, u32 list +0x2ed8. The four u32 lists' elements
+    //     follow the ten u32s; the conditional texts come after the trailing strings.
+    //   * objective Type is u32 (2.5.2 wrote u8); the objective fixed part has an extra u32
+    //     between Flags2 and ProgressBarWeight (+0x1c), another extra u32 after the
+    //     VisualEffects count and before the effects (+0x140), and one extra flag bit after
+    //     the 8-bit description length (the client reads the second byte's MSB into +0x144).
+    // The top-level bit block is unchanged from 2.5.2: 9/12/12/9/10/8/10/8/11-bit lengths plus
+    // one flag bit, confirmed by the client's string buffer sizes and the final
+    // `shr r9b, 6; and r9b, 1` extraction (89 bits precede the flag).
+    // Tail scalar NAMES are inferred by relative order against WPP 5.5.0 (the disassembly only
+    // proves they are plain u32 stores, not counts): +0x2e48 = AllowableRaces narrowed to u32,
+    // +0x2e80 = Expansion, +0x2e88 = QuestGiverCreatureID; +0x2e4c and the +0x2e68/+0x2ec0/
+    // +0x2ed8 lists are new in 5.5.x with unknown meaning and are written zero/empty.
+    private void WriteQuestInfo550()
+    {
+        _worldPacket.WriteUInt32(Info.QuestID);
+        _worldPacket.WriteInt32(Info.QuestType);
+        _worldPacket.WriteInt32(Info.QuestLevel);
+        _worldPacket.WriteInt32(Info.QuestScalingFactionGroup);
+        _worldPacket.WriteInt32(Info.QuestMaxScalingLevel);
+        _worldPacket.WriteUInt32(Info.QuestPackageID);
+        _worldPacket.WriteInt32(Info.MinLevel);
+        _worldPacket.WriteInt32(Info.QuestSortID);
+        _worldPacket.WriteUInt32(Info.QuestInfoID);
+        _worldPacket.WriteUInt32(Info.SuggestedGroupNum);
+        _worldPacket.WriteUInt32(Info.RewardNextQuest);
+        _worldPacket.WriteUInt32(Info.RewardXPDifficulty);
+        _worldPacket.WriteFloat(Info.RewardXPMultiplier);
+        _worldPacket.WriteInt32(Info.RewardMoney);
+        _worldPacket.WriteUInt32(Info.RewardMoneyDifficulty);
+        _worldPacket.WriteFloat(Info.RewardMoneyMultiplier);
+        _worldPacket.WriteUInt32(Info.RewardBonusMoney);
+
+        // Fixed trip count 3 in the client (`mov edi, 3`).
+        for (uint i = 0; i < QuestConst.QuestRewardDisplaySpellCount; ++i)
+            _worldPacket.WriteUInt32(Info.RewardDisplaySpell[i]);
+
+        _worldPacket.WriteUInt32(Info.RewardSpell);
+        _worldPacket.WriteUInt32(Info.RewardHonor);
+        _worldPacket.WriteFloat(Info.RewardKillHonor);
+
+        _worldPacket.WriteInt32(Info.RewardArtifactXPDifficulty);
+        _worldPacket.WriteUInt32(0); // unknown u32, new in 5.5.x (client stores +0x54)
+        _worldPacket.WriteFloat(Info.RewardArtifactXPMultiplier);
+        _worldPacket.WriteInt32(Info.RewardArtifactCategoryID);
+
+        _worldPacket.WriteUInt32(Info.StartItem);
+        _worldPacket.WriteUInt32(Info.Flags);
+        _worldPacket.WriteUInt32(Info.FlagsEx);
+        _worldPacket.WriteUInt32(Info.FlagsEx2);
+        _worldPacket.WriteUInt32(0); // FlagsEx3 - no legacy source
+
+        for (uint i = 0; i < QuestConst.QuestRewardItemCount; ++i)
         {
-            _worldPacket.WriteUInt32(Info.QuestID);
-            _worldPacket.WriteInt32(Info.QuestType);
-            _worldPacket.WriteInt32(Info.QuestLevel);
-            _worldPacket.WriteInt32(Info.QuestScalingFactionGroup);
-            _worldPacket.WriteInt32(Info.QuestMaxScalingLevel);
-            _worldPacket.WriteUInt32(Info.QuestPackageID);
-            _worldPacket.WriteInt32(Info.MinLevel);
-            _worldPacket.WriteInt32(Info.QuestSortID);
-            _worldPacket.WriteUInt32(Info.QuestInfoID);
-            _worldPacket.WriteUInt32(Info.SuggestedGroupNum);
-            _worldPacket.WriteUInt32(Info.RewardNextQuest);
-            _worldPacket.WriteUInt32(Info.RewardXPDifficulty);
+            _worldPacket.WriteUInt32(Info.RewardItems[i]);
+            _worldPacket.WriteUInt32(Info.RewardAmount[i]);
+            _worldPacket.WriteInt32(Info.ItemDrop[i]);
+            _worldPacket.WriteInt32(Info.ItemDropQuantity[i]);
+        }
 
-            _worldPacket.WriteFloat(Info.RewardXPMultiplier);
+        for (uint i = 0; i < QuestConst.QuestRewardChoicesCount; ++i)
+        {
+            _worldPacket.WriteUInt32(Info.UnfilteredChoiceItems[i].ItemID);
+            _worldPacket.WriteUInt32(Info.UnfilteredChoiceItems[i].Quantity);
+            _worldPacket.WriteUInt32(Info.UnfilteredChoiceItems[i].DisplayID);
+        }
 
-            _worldPacket.WriteInt32(Info.RewardMoney);
-            _worldPacket.WriteUInt32(Info.RewardMoneyDifficulty);
-            _worldPacket.WriteFloat(Info.RewardMoneyMultiplier);
-            _worldPacket.WriteUInt32(Info.RewardBonusMoney);
+        _worldPacket.WriteUInt32(Info.POIContinent);
+        _worldPacket.WriteFloat(Info.POIx);
+        _worldPacket.WriteFloat(Info.POIy);
+        _worldPacket.WriteUInt32(Info.POIPriority);
 
-            for (uint i = 0; i < QuestConst.QuestRewardDisplaySpellCount; ++i)
-                _worldPacket.WriteUInt32(Info.RewardDisplaySpell[i]);
+        _worldPacket.WriteUInt32(Info.RewardTitle);
+        _worldPacket.WriteInt32(Info.RewardArenaPoints);
+        _worldPacket.WriteUInt32(Info.RewardSkillLineID);
+        _worldPacket.WriteUInt32(Info.RewardNumSkillUps);
 
-            _worldPacket.WriteUInt32(Info.RewardSpell);
-            _worldPacket.WriteUInt32(Info.RewardHonor);
+        _worldPacket.WriteUInt32(Info.PortraitGiver);
+        _worldPacket.WriteUInt32(Info.PortraitGiverMount);
+        _worldPacket.WriteUInt32(0); // PortraitGiverModelSceneID - no legacy source
+        _worldPacket.WriteUInt32(Info.PortraitTurnIn);
 
-            _worldPacket.WriteFloat(Info.RewardKillHonor);
+        // Fixed trip count 5 in the client (`mov edi, 5`); wire order per iteration is
+        // ID, Value, Override, CapIn (the client stores into four parallel arrays).
+        for (uint i = 0; i < QuestConst.QuestRewardReputationsCount; ++i)
+        {
+            _worldPacket.WriteUInt32(Info.RewardFactionID[i]);
+            _worldPacket.WriteInt32(Info.RewardFactionValue[i]);
+            _worldPacket.WriteInt32(Info.RewardFactionOverride[i]);
+            _worldPacket.WriteInt32(Info.RewardFactionCapIn[i]);
+        }
 
-            _worldPacket.WriteInt32(Info.RewardArtifactXPDifficulty);
-            _worldPacket.WriteFloat(Info.RewardArtifactXPMultiplier);
-            _worldPacket.WriteInt32(Info.RewardArtifactCategoryID);
+        _worldPacket.WriteUInt32(Info.RewardFactionFlags);
 
-            _worldPacket.WriteUInt32(Info.StartItem);
-            _worldPacket.WriteUInt32(Info.Flags);
-            _worldPacket.WriteUInt32(Info.FlagsEx);
-            _worldPacket.WriteUInt32(Info.FlagsEx2);
+        // Fixed trip count 4 in the client (`mov edi, 4`); ID then Qty per iteration.
+        for (uint i = 0; i < QuestConst.QuestRewardCurrencyCount; ++i)
+        {
+            _worldPacket.WriteUInt32(Info.RewardCurrencyID[i]);
+            _worldPacket.WriteUInt32(Info.RewardCurrencyQty[i]);
+        }
 
-            for (uint i = 0; i < QuestConst.QuestRewardItemCount; ++i)
-            {
-                _worldPacket.WriteUInt32(Info.RewardItems[i]);
-                _worldPacket.WriteUInt32(Info.RewardAmount[i]);
-                _worldPacket.WriteInt32(Info.ItemDrop[i]);
-                _worldPacket.WriteInt32(Info.ItemDropQuantity[i]);
-            }
+        _worldPacket.WriteUInt32(Info.AcceptedSoundKitID);
+        _worldPacket.WriteUInt32(Info.CompleteSoundKitID);
+        _worldPacket.WriteUInt32(Info.AreaGroupID);
+        _worldPacket.WriteUInt64(Info.TimeAllowed); // u64 - the only 64-bit field in the tail
 
-            for (uint i = 0; i < QuestConst.QuestRewardChoicesCount; ++i)
-            {
-                _worldPacket.WriteUInt32(Info.UnfilteredChoiceItems[i].ItemID);
-                _worldPacket.WriteUInt32(Info.UnfilteredChoiceItems[i].Quantity);
-                _worldPacket.WriteUInt32(Info.UnfilteredChoiceItems[i].DisplayID);
-            }
+        _worldPacket.WriteInt32(Info.Objectives.Count);
 
-            _worldPacket.WriteUInt32(Info.POIContinent);
-            _worldPacket.WriteFloat(Info.POIx);
-            _worldPacket.WriteFloat(Info.POIy);
-            _worldPacket.WriteUInt32(Info.POIPriority);
+        // The ten u32s described in the header comment.
+        int treasureCount = Info.TreasurePickerID != 0 ? 1 : 0;
+        _worldPacket.WriteUInt32((uint)Info.AllowableRaces); // +0x2e48 (name inferred)
+        _worldPacket.WriteUInt32(0);                         // +0x2e4c - unknown, new in 5.5.x
+        _worldPacket.WriteInt32(treasureCount);              // count of u32 list +0x2e50 (TreasurePicker)
+        _worldPacket.WriteInt32(0);                          // count of u32 list +0x2e68
+        _worldPacket.WriteInt32(Info.Expansion);             // +0x2e80 (name inferred)
+        _worldPacket.WriteUInt32(0);                         // +0x2e88 - QuestGiverCreatureID (inferred); no source here
+        _worldPacket.WriteUInt32(0);                         // count of conditional QuestDescription structs +0x2e90
+        _worldPacket.WriteUInt32(0);                         // count of conditional QuestCompletionLog structs +0x2ea8
+        _worldPacket.WriteUInt32(0);                         // count of u32 list +0x2ec0
+        _worldPacket.WriteUInt32(0);                         // count of u32 list +0x2ed8
 
-            _worldPacket.WriteUInt32(Info.RewardTitle);
-            _worldPacket.WriteInt32(Info.RewardArenaPoints);
-            _worldPacket.WriteUInt32(Info.RewardSkillLineID);
-            _worldPacket.WriteUInt32(Info.RewardNumSkillUps);
-
-            _worldPacket.WriteUInt32(Info.PortraitGiver);
-            _worldPacket.WriteUInt32(Info.PortraitGiverMount);
-            _worldPacket.WriteUInt32(Info.PortraitTurnIn);
-
-            _worldPacket.WriteInt32(0); // Unk 2.5.2
-
-            for (uint i = 0; i < QuestConst.QuestRewardReputationsCount; ++i)
-            {
-                _worldPacket.WriteUInt32(Info.RewardFactionID[i]);
-                _worldPacket.WriteInt32(Info.RewardFactionValue[i]);
-                _worldPacket.WriteInt32(Info.RewardFactionOverride[i]);
-                _worldPacket.WriteInt32(Info.RewardFactionCapIn[i]);
-            }
-
-            _worldPacket.WriteUInt32(Info.RewardFactionFlags);
-
-            for (uint i = 0; i < QuestConst.QuestRewardCurrencyCount; ++i)
-            {
-                _worldPacket.WriteUInt32(Info.RewardCurrencyID[i]);
-                _worldPacket.WriteUInt32(Info.RewardCurrencyQty[i]);
-            }
-
-            _worldPacket.WriteUInt32(Info.AcceptedSoundKitID);
-            _worldPacket.WriteUInt32(Info.CompleteSoundKitID);
-
-            _worldPacket.WriteUInt32(Info.AreaGroupID);
-            _worldPacket.WriteUInt32(Info.TimeAllowed);
-
-            _worldPacket.WriteInt32(Info.Objectives.Count);
-            _worldPacket.WriteInt64(Info.AllowableRaces);
+        // Elements of the four u32 lists follow, in count order; only the first can be
+        // non-empty here.
+        if (treasureCount != 0)
             _worldPacket.WriteInt32(Info.TreasurePickerID);
-            _worldPacket.WriteInt32(Info.Expansion);
 
-            _worldPacket.WriteBits(Info.LogTitle.GetByteCount(), 9);
-            _worldPacket.WriteBits(Info.LogDescription.GetByteCount(), 12);
-            _worldPacket.WriteBits(Info.QuestDescription.GetByteCount(), 12);
-            _worldPacket.WriteBits(Info.AreaDescription.GetByteCount(), 9);
-            _worldPacket.WriteBits(Info.PortraitGiverText.GetByteCount(), 10);
-            _worldPacket.WriteBits(Info.PortraitGiverName.GetByteCount(), 8);
-            _worldPacket.WriteBits(Info.PortraitTurnInText.GetByteCount(), 10);
-            _worldPacket.WriteBits(Info.PortraitTurnInName.GetByteCount(), 8);
-            _worldPacket.WriteBits(Info.QuestCompletionLog.GetByteCount(), 11);
-            _worldPacket.WriteBit(Info.ReadyForTranslation);
+        _worldPacket.WriteBits(Info.LogTitle.GetByteCount(), 9);
+        _worldPacket.WriteBits(Info.LogDescription.GetByteCount(), 12);
+        _worldPacket.WriteBits(Info.QuestDescription.GetByteCount(), 12);
+        _worldPacket.WriteBits(Info.AreaDescription.GetByteCount(), 9);
+        _worldPacket.WriteBits(Info.PortraitGiverText.GetByteCount(), 10);
+        _worldPacket.WriteBits(Info.PortraitGiverName.GetByteCount(), 8);
+        _worldPacket.WriteBits(Info.PortraitTurnInText.GetByteCount(), 10);
+        _worldPacket.WriteBits(Info.PortraitTurnInName.GetByteCount(), 8);
+        _worldPacket.WriteBits(Info.QuestCompletionLog.GetByteCount(), 11);
+        _worldPacket.WriteBit(Info.ReadyForTranslation);
+        _worldPacket.FlushBits();
+
+        foreach (QuestObjective questObjective in Info.Objectives)
+        {
+            _worldPacket.WriteUInt32(questObjective.Id);
+            _worldPacket.WriteUInt32((uint)questObjective.Type); // u32 on 5.5.x, u8 on 2.5.2
+            _worldPacket.WriteInt8(questObjective.StorageIndex);
+            _worldPacket.WriteInt32(questObjective.ObjectID);
+            _worldPacket.WriteInt32(questObjective.Amount);
+            _worldPacket.WriteUInt32((uint)questObjective.Flags);
+            _worldPacket.WriteUInt32(questObjective.Flags2);
+            _worldPacket.WriteUInt32(0); // unknown u32 before ProgressBarWeight (+0x1c)
+            _worldPacket.WriteFloat(questObjective.ProgressBarWeight);
+
+            _worldPacket.WriteInt32(questObjective.VisualEffects.Length);
+            _worldPacket.WriteUInt32(0); // unknown u32 after the count, before the effects (+0x140)
+            foreach (var visualEffect in questObjective.VisualEffects)
+                _worldPacket.WriteInt32(visualEffect);
+
+            _worldPacket.WriteBits(questObjective.Description.GetByteCount(), 8);
+            _worldPacket.WriteBit(false); // unknown flag after the length bits (client stores +0x144)
             _worldPacket.FlushBits();
 
-            foreach (QuestObjective questObjective in Info.Objectives)
-            {
-                _worldPacket.WriteUInt32(questObjective.Id);
-                _worldPacket.WriteUInt8((byte)questObjective.Type);
-                _worldPacket.WriteInt8(questObjective.StorageIndex);
-                _worldPacket.WriteInt32(questObjective.ObjectID);
-                _worldPacket.WriteInt32(questObjective.Amount);
-                _worldPacket.WriteUInt32((uint)questObjective.Flags);
-                _worldPacket.WriteUInt32(questObjective.Flags2);
-                _worldPacket.WriteFloat(questObjective.ProgressBarWeight);
-
-                _worldPacket.WriteInt32(questObjective.VisualEffects.Length);
-                foreach (var visualEffect in questObjective.VisualEffects)
-                    _worldPacket.WriteInt32(visualEffect);
-
-                _worldPacket.WriteBits(questObjective.Description.GetByteCount(), 8);
-                _worldPacket.FlushBits();
-
-                _worldPacket.WriteString(questObjective.Description);
-            }
-
-            _worldPacket.WriteString(Info.LogTitle);
-            _worldPacket.WriteString(Info.LogDescription);
-            _worldPacket.WriteString(Info.QuestDescription);
-            _worldPacket.WriteString(Info.AreaDescription);
-            _worldPacket.WriteString(Info.PortraitGiverText);
-            _worldPacket.WriteString(Info.PortraitGiverName);
-            _worldPacket.WriteString(Info.PortraitTurnInText);
-            _worldPacket.WriteString(Info.PortraitTurnInName);
-            _worldPacket.WriteString(Info.QuestCompletionLog);
+            _worldPacket.WriteString(questObjective.Description);
         }
+
+        _worldPacket.WriteString(Info.LogTitle);
+        _worldPacket.WriteString(Info.LogDescription);
+        _worldPacket.WriteString(Info.QuestDescription);
+        _worldPacket.WriteString(Info.AreaDescription);
+        _worldPacket.WriteString(Info.PortraitGiverText);
+        _worldPacket.WriteString(Info.PortraitGiverName);
+        _worldPacket.WriteString(Info.PortraitTurnInText);
+        _worldPacket.WriteString(Info.PortraitTurnInName);
+        _worldPacket.WriteString(Info.QuestCompletionLog);
+
+        // Conditional-text loops omitted: both counts are written as 0 above.
+    }
+
+    // Pre-5.5 layout, byte-identical to the writer this method replaced (1.14 / 2.5.2 / 3.4.3).
+    private void WriteQuestInfo252()
+    {
+        _worldPacket.WriteUInt32(Info.QuestID);
+        _worldPacket.WriteInt32(Info.QuestType);
+        _worldPacket.WriteInt32(Info.QuestLevel);
+        _worldPacket.WriteInt32(Info.QuestScalingFactionGroup);
+        _worldPacket.WriteInt32(Info.QuestMaxScalingLevel);
+        _worldPacket.WriteUInt32(Info.QuestPackageID);
+        _worldPacket.WriteInt32(Info.MinLevel);
+        _worldPacket.WriteInt32(Info.QuestSortID);
+        _worldPacket.WriteUInt32(Info.QuestInfoID);
+        _worldPacket.WriteUInt32(Info.SuggestedGroupNum);
+        _worldPacket.WriteUInt32(Info.RewardNextQuest);
+        _worldPacket.WriteUInt32(Info.RewardXPDifficulty);
+
+        _worldPacket.WriteFloat(Info.RewardXPMultiplier);
+
+        _worldPacket.WriteInt32(Info.RewardMoney);
+        _worldPacket.WriteUInt32(Info.RewardMoneyDifficulty);
+        _worldPacket.WriteFloat(Info.RewardMoneyMultiplier);
+        _worldPacket.WriteUInt32(Info.RewardBonusMoney);
+
+        for (uint i = 0; i < QuestConst.QuestRewardDisplaySpellCount; ++i)
+            _worldPacket.WriteUInt32(Info.RewardDisplaySpell[i]);
+
+        _worldPacket.WriteUInt32(Info.RewardSpell);
+        _worldPacket.WriteUInt32(Info.RewardHonor);
+
+        _worldPacket.WriteFloat(Info.RewardKillHonor);
+
+        _worldPacket.WriteInt32(Info.RewardArtifactXPDifficulty);
+        _worldPacket.WriteFloat(Info.RewardArtifactXPMultiplier);
+        _worldPacket.WriteInt32(Info.RewardArtifactCategoryID);
+
+        _worldPacket.WriteUInt32(Info.StartItem);
+        _worldPacket.WriteUInt32(Info.Flags);
+        _worldPacket.WriteUInt32(Info.FlagsEx);
+        _worldPacket.WriteUInt32(Info.FlagsEx2);
+
+        for (uint i = 0; i < QuestConst.QuestRewardItemCount; ++i)
+        {
+            _worldPacket.WriteUInt32(Info.RewardItems[i]);
+            _worldPacket.WriteUInt32(Info.RewardAmount[i]);
+            _worldPacket.WriteInt32(Info.ItemDrop[i]);
+            _worldPacket.WriteInt32(Info.ItemDropQuantity[i]);
+        }
+
+        for (uint i = 0; i < QuestConst.QuestRewardChoicesCount; ++i)
+        {
+            _worldPacket.WriteUInt32(Info.UnfilteredChoiceItems[i].ItemID);
+            _worldPacket.WriteUInt32(Info.UnfilteredChoiceItems[i].Quantity);
+            _worldPacket.WriteUInt32(Info.UnfilteredChoiceItems[i].DisplayID);
+        }
+
+        _worldPacket.WriteUInt32(Info.POIContinent);
+        _worldPacket.WriteFloat(Info.POIx);
+        _worldPacket.WriteFloat(Info.POIy);
+        _worldPacket.WriteUInt32(Info.POIPriority);
+
+        _worldPacket.WriteUInt32(Info.RewardTitle);
+        _worldPacket.WriteInt32(Info.RewardArenaPoints);
+        _worldPacket.WriteUInt32(Info.RewardSkillLineID);
+        _worldPacket.WriteUInt32(Info.RewardNumSkillUps);
+
+        _worldPacket.WriteUInt32(Info.PortraitGiver);
+        _worldPacket.WriteUInt32(Info.PortraitGiverMount);
+        _worldPacket.WriteUInt32(Info.PortraitTurnIn);
+
+        _worldPacket.WriteInt32(0); // Unk 2.5.2
+
+        for (uint i = 0; i < QuestConst.QuestRewardReputationsCount; ++i)
+        {
+            _worldPacket.WriteUInt32(Info.RewardFactionID[i]);
+            _worldPacket.WriteInt32(Info.RewardFactionValue[i]);
+            _worldPacket.WriteInt32(Info.RewardFactionOverride[i]);
+            _worldPacket.WriteInt32(Info.RewardFactionCapIn[i]);
+        }
+
+        _worldPacket.WriteUInt32(Info.RewardFactionFlags);
+
+        for (uint i = 0; i < QuestConst.QuestRewardCurrencyCount; ++i)
+        {
+            _worldPacket.WriteUInt32(Info.RewardCurrencyID[i]);
+            _worldPacket.WriteUInt32(Info.RewardCurrencyQty[i]);
+        }
+
+        _worldPacket.WriteUInt32(Info.AcceptedSoundKitID);
+        _worldPacket.WriteUInt32(Info.CompleteSoundKitID);
+
+        _worldPacket.WriteUInt32(Info.AreaGroupID);
+        _worldPacket.WriteUInt32(Info.TimeAllowed);
+
+        _worldPacket.WriteInt32(Info.Objectives.Count);
+        _worldPacket.WriteInt64(Info.AllowableRaces);
+        _worldPacket.WriteInt32(Info.TreasurePickerID);
+        _worldPacket.WriteInt32(Info.Expansion);
+
+        _worldPacket.WriteBits(Info.LogTitle.GetByteCount(), 9);
+        _worldPacket.WriteBits(Info.LogDescription.GetByteCount(), 12);
+        _worldPacket.WriteBits(Info.QuestDescription.GetByteCount(), 12);
+        _worldPacket.WriteBits(Info.AreaDescription.GetByteCount(), 9);
+        _worldPacket.WriteBits(Info.PortraitGiverText.GetByteCount(), 10);
+        _worldPacket.WriteBits(Info.PortraitGiverName.GetByteCount(), 8);
+        _worldPacket.WriteBits(Info.PortraitTurnInText.GetByteCount(), 10);
+        _worldPacket.WriteBits(Info.PortraitTurnInName.GetByteCount(), 8);
+        _worldPacket.WriteBits(Info.QuestCompletionLog.GetByteCount(), 11);
+        _worldPacket.WriteBit(Info.ReadyForTranslation);
+        _worldPacket.FlushBits();
+
+        foreach (QuestObjective questObjective in Info.Objectives)
+        {
+            _worldPacket.WriteUInt32(questObjective.Id);
+            _worldPacket.WriteUInt8((byte)questObjective.Type);
+            _worldPacket.WriteInt8(questObjective.StorageIndex);
+            _worldPacket.WriteInt32(questObjective.ObjectID);
+            _worldPacket.WriteInt32(questObjective.Amount);
+            _worldPacket.WriteUInt32((uint)questObjective.Flags);
+            _worldPacket.WriteUInt32(questObjective.Flags2);
+            _worldPacket.WriteFloat(questObjective.ProgressBarWeight);
+
+            _worldPacket.WriteInt32(questObjective.VisualEffects.Length);
+            foreach (var visualEffect in questObjective.VisualEffects)
+                _worldPacket.WriteInt32(visualEffect);
+
+            _worldPacket.WriteBits(questObjective.Description.GetByteCount(), 8);
+            _worldPacket.FlushBits();
+
+            _worldPacket.WriteString(questObjective.Description);
+        }
+
+        _worldPacket.WriteString(Info.LogTitle);
+        _worldPacket.WriteString(Info.LogDescription);
+        _worldPacket.WriteString(Info.QuestDescription);
+        _worldPacket.WriteString(Info.AreaDescription);
+        _worldPacket.WriteString(Info.PortraitGiverText);
+        _worldPacket.WriteString(Info.PortraitGiverName);
+        _worldPacket.WriteString(Info.PortraitTurnInText);
+        _worldPacket.WriteString(Info.PortraitTurnInName);
+        _worldPacket.WriteString(Info.QuestCompletionLog);
     }
 
     public bool Allow;

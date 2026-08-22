@@ -23,6 +23,12 @@ public enum OriginalHash : uint
     AccountListener = 0x54DFDA17u,
     AuthenticationListener = 0x71240E35u,
     AuthenticationService = 0xDECFC01u,
+    // Version 2 of the authentication services. Modern clients (5.5.0-engine generation,
+    // e.g. TBC Classic Anniversary 2.5.6) drive login through these instead of the v1 pair.
+    AuthenticationListenerV2 = 0x9DA8116Bu,
+    AuthenticationServiceV2 = 0xC02F8216u,
+    AccountServiceV2 = 0x22DC2464u,
+    GameUtilitiesServiceV2 = 0x5DBB51C2u,
     ChallengeListener = 0xBBDA171Fu,
     ClubListener = 0x80909D73u,
     ClubMembershipListener = 0x2B34597Bu,

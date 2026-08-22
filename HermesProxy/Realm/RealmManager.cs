@@ -219,6 +219,12 @@ public sealed class RealmManager
                 realmEntry.CfgConfigsID = (int)realm.GetConfigId();
                 realmEntry.CfgLanguagesID = 1;
 
+                // FIXME(256-spike): temporary diagnostics. Remove before any PR.
+                Log.Print(LogType.Warn, $"[256-spike] realm entry: name={realmEntry.Name} addr=0x{realmEntry.WowRealmAddress:X8} " +
+                    $"version={version.Major}.{version.Minor}.{version.Revision}.{version.Build} flags={realmEntry.Flags} " +
+                    $"cfgRealmsID={realmEntry.CfgRealmsID} cfgCategoriesID={realmEntry.CfgCategoriesID} cfgConfigsID={realmEntry.CfgConfigsID} " +
+                    $"populationState={realmEntry.PopulationState}");
+
                 compressed = Json.Deflate("JamJSONRealmEntry", realmEntry);
             }
         }
@@ -293,6 +299,9 @@ public sealed class RealmManager
             addressFamily.Addresses.Add(address);
             serverAddresses.Families.Add(addressFamily);
 
+            // FIXME(256-spike): temporary diagnostics. Remove before any PR.
+            Log.Print(LogType.Warn, $"[256-spike] join -> telling client to connect to {address.Ip}:{address.Port} (realm.ExternalAddress={realm.ExternalAddress}, proxy external={_externalAddress}, realmPort={_realmPort})");
+
             byte[] compressed = Json.Deflate("JSONRealmListServerIPAddresses", serverAddresses);
 
             byte[] serverSecret = new byte[0].GenerateRandomKey(32);
@@ -302,7 +311,12 @@ public sealed class RealmManager
 
             globalSession.SessionKey = keyData;
 
-            response.Attribute.AddBlob("Param_RealmJoinTicket", ByteString.CopyFrom(accountName, Encoding.UTF8));
+            string joinTicket = BuildJoinTicket(globalSession, accountName);
+
+            // FIXME(256-spike): temporary diagnostics. Remove before any PR.
+            Log.Print(LogType.Warn, $"[256-spike] join ticket = {joinTicket}  (OS={globalSession.OS}, build={ModernVersion.Build})");
+
+            response.Attribute.AddBlob("Param_RealmJoinTicket", ByteString.CopyFrom(joinTicket, Encoding.UTF8));
             response.Attribute.AddBlob("Param_ServerAddresses", ByteString.CopyFrom(compressed));
             response.Attribute.AddBlob("Param_JoinSecret", ByteString.CopyFrom(serverSecret));
 
@@ -310,6 +324,49 @@ public sealed class RealmManager
         }
 
         return BattlenetRpcErrorCode.UtilServerUnknownRealm;
+    }
+
+    /// <summary>
+    /// Builds the Param_RealmJoinTicket payload for a client.
+    /// </summary>
+    /// <remarks>
+    /// Clients up to 3.4.3 take the bare game account name. The modern generation wants a JSON
+    /// ticket describing the build variant and rejects the plain name with "Join token mismatch",
+    /// silently refusing to open the world connection. Older builds keep the old form so their
+    /// working flow is untouched.
+    /// </remarks>
+    static string BuildJoinTicket(GlobalSessionData globalSession, string accountName)
+    {
+        if (ModernVersion.Build != HermesProxy.Enums.ClientVersionBuild.V2_5_6_69110)
+            return accountName;
+
+        // The client reports a combined platform+architecture code ("Wn64"); the ticket wants them
+        // as separate FourCCs, alongside the title.
+        (string platform, string arch) = globalSession.OS switch
+        {
+            "Wn64" => ("Win", "x64"),
+            "Mc64" => ("Mac", "x64"),
+            "MacA" => ("Mac", "A64"),
+            _      => ("Win", "x86"),
+        };
+
+        RealmJoinTicket ticket = new()
+        {
+            GameAccount = accountName,
+            Platform = FourCC(platform),
+            ClientArch = FourCC(arch),
+            Type = FourCC("WoW"),
+        };
+
+        return Json.CreateString(ticket);
+    }
+
+    static int FourCC(string text)
+    {
+        int value = 0;
+        foreach (char c in text)
+            value = (value << 8) | c;
+        return value;
     }
 
     public ICollection<Realm> GetRealms() { return _realms.Values; }

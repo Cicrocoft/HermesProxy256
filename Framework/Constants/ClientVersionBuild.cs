@@ -527,6 +527,10 @@ public enum ClientVersionBuild
     // WotLK Classic
     V3_4_3_54261 = 54261,
 
+    // TBC Classic Anniversary — rebased onto the modern (5.5.0-era) engine.
+    // 2.5.5 (68101) was the break away from the legacy TBC wire protocol; 2.5.6 sits past it.
+    V2_5_6_69110 = 69110,
+
     // Battle.net - should probably not mix this but oh well
     BattleNetV37165 = 37165,
 

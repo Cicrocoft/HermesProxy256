@@ -259,19 +259,47 @@ public class SellResponse : ServerPacket, ISpanWritable
 
     public override void Write()
     {
-        _worldPacket.WritePackedGuid128(VendorGUID);
-        _worldPacket.WritePackedGuid128(ItemGUID);
-        _worldPacket.WriteUInt8(Reason);
+        if (ModernVersion.Uses550Engine)
+        {
+            // 5.5.x body, verified against the client's own reader (RVA 0x5BA7C0, GetId-stub
+            // linked to 0x460173): VendorGUID, ItemGuidCount u32 (drives a vector resize),
+            // Reason u32 (stored to obj+0x48 — a full int, not the 9.x byte), then count
+            // packed guids. WowPacketParser 5.5.0's HandleSellResponse reads the same four
+            // fields in the same order. Our old 9.x body (guid, guid, u8) fed this reader
+            // 5 bytes where its second guid begins at byte 10 — the fatal pattern.
+            _worldPacket.WritePackedGuid128(VendorGUID);
+            _worldPacket.WriteInt32(ItemGUID != null ? 1 : 0);
+            _worldPacket.WriteUInt32(Reason);
+            if (ItemGUID != null)
+                _worldPacket.WritePackedGuid128(ItemGUID);
+        }
+        else
+        {
+            _worldPacket.WritePackedGuid128(VendorGUID);
+            _worldPacket.WritePackedGuid128(ItemGUID);
+            _worldPacket.WriteUInt8(Reason);
+        }
     }
 
-    public int MaxSize => PackedGuidHelper.MaxPackedGuid128Size * 2 + 1; // 2 GUIDs + byte
+    public int MaxSize => PackedGuidHelper.MaxPackedGuid128Size * 2 + 8; // 2 GUIDs + count + u32 reason
 
     public int WriteToSpan(Span<byte> buffer)
     {
         var writer = new SpanPacketWriter(buffer);
-        writer.WritePackedGuid128(VendorGUID.Low, VendorGUID.High);
-        writer.WritePackedGuid128(ItemGUID.Low, ItemGUID.High);
-        writer.WriteUInt8(Reason);
+        if (ModernVersion.Uses550Engine)
+        {
+            writer.WritePackedGuid128(VendorGUID.Low, VendorGUID.High);
+            writer.WriteInt32(ItemGUID != null ? 1 : 0);
+            writer.WriteUInt32(Reason);
+            if (ItemGUID != null)
+                writer.WritePackedGuid128(ItemGUID.Low, ItemGUID.High);
+        }
+        else
+        {
+            writer.WritePackedGuid128(VendorGUID.Low, VendorGUID.High);
+            writer.WritePackedGuid128(ItemGUID.Low, ItemGUID.High);
+            writer.WriteUInt8(Reason);
+        }
         return writer.Position;
     }
 
@@ -497,14 +525,34 @@ public class ItemMod
 
     public void Read(WorldPacket data)
     {
-        Value = data.ReadUInt32();
-        Type = (ItemModifier)data.ReadUInt8();
+        if (ModernVersion.Uses550Engine)
+        {
+            // 2.5.6 (69110): u8 Type then u32 Value, mirroring the client's own reader
+            // 0x6D2140 (entry stores Type at [entry+0], Value at [entry+4]). The read
+            // side is inferred from writer/reader symmetry in the client.
+            Type = (ItemModifier)data.ReadUInt8();
+            Value = data.ReadUInt32();
+        }
+        else
+        {
+            Value = data.ReadUInt32();
+            Type = (ItemModifier)data.ReadUInt8();
+        }
     }
 
     public void Write(WorldPacket data)
     {
-        data.WriteUInt32(Value);
-        data.WriteUInt8((byte)Type);
+        if (ModernVersion.Uses550Engine)
+        {
+            // 2.5.6 (69110): the client reader 0x6D2140 reads u8 Type then u32 Value.
+            data.WriteUInt8((byte)Type);
+            data.WriteUInt32(Value);
+        }
+        else
+        {
+            data.WriteUInt32(Value);
+            data.WriteUInt8((byte)Type);
+        }
     }
 }
 
@@ -514,7 +562,9 @@ public class ItemModList
 
     public void Read(WorldPacket data)
     {
-        var itemModListCount = data.ReadBits<uint>(6);
+        // 2.5.6 (69110) decodes the count as `byte >> 1` - a 7-bit count in the high
+        // bits (client reader 0x6D2140); pre-5.5 clients use 6 bits.
+        var itemModListCount = data.ReadBits<uint>(ModernVersion.Uses550Engine ? 7 : 6);
         data.ResetBitPos();
 
         for (var i = 0; i < itemModListCount; ++i)
@@ -527,7 +577,10 @@ public class ItemModList
 
     public void Write(WorldPacket data)
     {
-        data.WriteBits(Values.Count, 6);
+        // 2.5.6 (69110): 7-bit count, verified at instruction level in the client
+        // reader 0x6D2140 (`ReadU8; shr rdx, 1`). Pre-5.5 (1.14 / 2.5.2 / 3.4.3) keep
+        // the 6-bit count. An empty list serialises identically either way.
+        data.WriteBits(Values.Count, ModernVersion.Uses550Engine ? 7 : 6);
         data.FlushBits();
 
         foreach (ItemMod itemMod in Values)
@@ -779,6 +832,14 @@ public class OpenItem : ClientPacket
 
     public override void Read()
     {
+        // The client writes Slot then PackSlot for OPEN_ITEM - the opposite of READ_ITEM, which is
+        // already correct here. Verified against the client's own serialiser.
+        if (ModernVersion.Uses550Engine)
+        {
+            Slot = _worldPacket.ReadUInt8();
+            PackSlot = _worldPacket.ReadUInt8();
+            return;
+        }
         PackSlot = _worldPacket.ReadUInt8();
         Slot = _worldPacket.ReadUInt8();
     }
@@ -902,7 +963,7 @@ internal static class ItemPacketHelpers
     public const int MaxBonusListIDs = 8;
 
     // ItemInstance: 4+4+4 fixed + 1 bit flush + ItemModList + optional ItemBonuses
-    // ItemModList: 1 byte (6 bits count) + mods * 5
+    // ItemModList: 1 byte (6- or 7-bit count) + mods * 5
     // ItemBonuses: 1 + 4 + bonuses * 4
     public const int ItemInstanceMaxSize = 12 + 1 + 1 + MaxItemMods * 5 + 1 + 4 + MaxBonusListIDs * 4;
 
@@ -919,12 +980,23 @@ internal static class ItemPacketHelpers
         if (item.Modifications.Values.Count > MaxItemMods)
             return false;
 
-        writer.WriteBits((uint)item.Modifications.Values.Count, 6);
+        // Keep in sync with ItemModList.Write / ItemMod.Write above: 2.5.6 (69110) uses a
+        // 7-bit count and u8 Type before u32 Value (client reader 0x6D2140); older clients
+        // use a 6-bit count and Value-then-Type. Entry size is 5 bytes either way.
+        writer.WriteBits((uint)item.Modifications.Values.Count, ModernVersion.Uses550Engine ? 7 : 6);
         writer.FlushBits();
         foreach (ItemMod itemMod in item.Modifications.Values)
         {
-            writer.WriteUInt32(itemMod.Value);
-            writer.WriteUInt8((byte)itemMod.Type);
+            if (ModernVersion.Uses550Engine)
+            {
+                writer.WriteUInt8((byte)itemMod.Type);
+                writer.WriteUInt32(itemMod.Value);
+            }
+            else
+            {
+                writer.WriteUInt32(itemMod.Value);
+                writer.WriteUInt8((byte)itemMod.Type);
+            }
         }
 
         // ItemBonuses (optional)

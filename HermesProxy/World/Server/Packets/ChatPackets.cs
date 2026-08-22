@@ -422,8 +422,61 @@ public class ChatPkt : ServerPacket, ISpanWritable
         }
         return true;
     }
+    /// <summary>
+    /// The 5.5.0-engine layout, from TrinityCore master. PartyGUID is gone, ChatFlags moved out of
+    /// the bit block and became a uint16 after AchievementID, SpellID was added, and there is a
+    /// third optional field. Writing the older form leaves the client a packed guid short: the
+    /// extra PartyGUID shifts everything after it, the bit-packed string lengths decode to
+    /// garbage, and the trailing optional guid is read past the end of the packet — an
+    /// ACCESS_VIOLATION at RVA 0x2DF25BE inside the packed-guid reader.
+    /// </summary>
+    void WriteModern()
+    {
+        _worldPacket.WriteUInt8((byte)SlashCmd);
+        _worldPacket.WriteUInt32(_Language);
+        _worldPacket.WritePackedGuid128(SenderGUID);
+        _worldPacket.WritePackedGuid128(SenderGuildGUID);
+        _worldPacket.WritePackedGuid128(SenderAccountGUID);
+        _worldPacket.WritePackedGuid128(TargetGUID);
+        _worldPacket.WriteUInt32(TargetVirtualAddress);
+        _worldPacket.WriteUInt32(SenderVirtualAddress);
+        _worldPacket.WriteUInt32(AchievementID);
+        _worldPacket.WriteUInt16((ushort)_ChatFlags);
+        _worldPacket.WriteFloat(DisplayTime);
+        _worldPacket.WriteInt32(SpellID);
+
+        _worldPacket.WriteBits(SenderName.GetByteCount(), 11);
+        _worldPacket.WriteBits(TargetName.GetByteCount(), 11);
+        _worldPacket.WriteBits(Prefix.GetByteCount(), 5);
+        _worldPacket.WriteBits(Channel.GetByteCount(), 7);
+        _worldPacket.WriteBits(ChatText.GetByteCount(), 12);
+        _worldPacket.WriteBit(HideChatLog);
+        _worldPacket.WriteBit(FakeSenderName);
+        _worldPacket.WriteBit(Unused_801.HasValue);     // BroadcastTextID
+        _worldPacket.WriteBit(ChannelGUID != default);
+        _worldPacket.WriteBit(false);                   // EncounterEventID
+        _worldPacket.FlushBits();
+
+        _worldPacket.WriteString(SenderName);
+        _worldPacket.WriteString(TargetName);
+        _worldPacket.WriteString(Prefix);
+        _worldPacket.WriteString(Channel);
+        _worldPacket.WriteString(ChatText);
+
+        if (Unused_801.HasValue)
+            _worldPacket.WriteUInt32(Unused_801.Value);
+        if (ChannelGUID != default)
+            _worldPacket.WritePackedGuid128(ChannelGUID);
+    }
+
     public override void Write()
     {
+        if (ModernVersion.Uses550Engine)
+        {
+            WriteModern();
+            return;
+        }
+
         _worldPacket.WriteUInt8((byte)SlashCmd);
         _worldPacket.WriteUInt32((uint)_Language);
         _worldPacket.WritePackedGuid128(SenderGUID);
@@ -484,6 +537,10 @@ public class ChatPkt : ServerPacket, ISpanWritable
             prefixBytes > 31 || channelBytes > 127 || chatTextBytes > MaxChatTextBytes)
             return -1;
 
+        // The span writer only knows the pre-5.5.0 layout; fall back to Write() on that engine.
+        if (ModernVersion.Uses550Engine)
+            return -1;
+
         var writer = new SpanPacketWriter(buffer);
         writer.WriteUInt8((byte)SlashCmd);
         writer.WriteUInt32(_Language);
@@ -541,6 +598,9 @@ public class ChatPkt : ServerPacket, ISpanWritable
     public uint AchievementID;
     public ChatFlags _ChatFlags = 0;
     public float DisplayTime = 0.0f;
+
+    /// <summary>Added on the 5.5.0 engine; the legacy cores have nothing to put here.</summary>
+    public int SpellID;
     public uint? Unused_801;
     public bool HideChatLog = false;
     public bool FakeSenderName = false;

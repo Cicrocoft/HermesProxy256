@@ -17,6 +17,101 @@ namespace HermesProxy.World.Client;
 public partial class WorldClient
 {
     // Handlers for SMSG opcodes coming the legacy world server
+    /// <summary>
+    /// The 5.5.0 client wants its own object in a packet by itself, ahead of everything else.
+    /// CypherCore's Map.SendInitSelf builds a fresh UpdateData holding only the player, sends it,
+    /// and only then calls UpdateObjectVisibility for the rest — its comment notes that the client
+    /// answers the ThisIsYou block with CMSG_MOVE_INIT_ACTIVE_MOVER_COMPLETE, so it is a handshake
+    /// and not merely data. Bundling the player in with everything in view puts its create block
+    /// mid-packet, before the active mover exists.
+    /// </summary>
+    public void SendOwnObjectFirstIfNeeded(UpdateObject updateObject)
+    {
+        if (!ModernVersion.Uses550Engine)
+            return;
+
+        var mine = GetSession().GameState.CurrentPlayerGuid;
+        int selfIndex = updateObject.ObjectUpdates.FindIndex(
+            u => u.Guid == mine && u.Type != UpdateTypeModern.Values);
+        if (selfIndex < 0)
+            return;
+
+        var self = updateObject.ObjectUpdates[selfIndex];
+        updateObject.ObjectUpdates.RemoveAt(selfIndex);
+
+        UpdateObject selfPacket = new UpdateObject(GetSession().GameState);
+
+        // Item and container creates must reach the client BEFORE the player block that
+        // references their guids. TrinityCore's Player::BuildCreateUpdateBlockForPlayer does
+        // exactly this for the self target - equipment and bag item blocks first, the player
+        // block last, in the same UpdateData - and section 107 measured what happens when the
+        // order is wrong: ActivePlayerData.InvSlots resolved eagerly against objects the client
+        // had not been sent yet and a thread froze for sixty seconds (ERROR #109).
+        //
+        // HERMES_256_ITEMSFIRST=1 pulls the batch's item/container creates ahead of the self
+        // block (their relative order preserved, so bags still precede or follow their contents
+        // exactly as the legacy server ordered them). Default off = current behaviour: self
+        // first, items after. The measurement that flips the default: a session with
+        // HERMES_256_ITEMSFIRST=1 and HERMES_256_INVSLOTS=1 that enters the world without the
+        // ERROR #109 freeze and shows equipment in the character sheet.
+        if (s_itemsFirst)
+        {
+            for (int i = 0; i < updateObject.ObjectUpdates.Count; i++)
+            {
+                var u = updateObject.ObjectUpdates[i];
+                if (u.Type != UpdateTypeModern.Values && u.Guid.IsItem())
+                {
+                    selfPacket.ObjectUpdates.Add(u);
+                    updateObject.ObjectUpdates.RemoveAt(i);
+                    i--;
+                }
+            }
+        }
+
+        selfPacket.ObjectUpdates.Add(self);
+        SendPacketToClient(selfPacket);
+
+        // The client now knows which object is it, so it can be given the mover. Only once: a second
+        // one mid-session would re-run the handshake for a character that is already in control.
+        if (!_sentActiveMover && self.Type != UpdateTypeModern.Values)
+        {
+            _sentActiveMover = true;
+            SendPacketToClient(new MoveSetActiveMover { MoverGUID = mine });
+        }
+    }
+
+    bool _sentActiveMover;
+
+    /// <summary>
+    /// Root cause 4 (PLAN-256.md): item objects and the guids that reference them. One knob covers
+    /// the two halves that only make sense together - item/container creates ordered ahead of the
+    /// player block (SendOwnObjectFirstIfNeeded), and 0x4700 ItemContainer slot guids passed
+    /// through instead of blanked (GetSlotGuidValue). Default off = current behaviour, because
+    /// filling slots with unresolvable guids has already produced one crash class (ERROR #132 on
+    /// V3_4_3) and one hang (ERROR #109, section 107). Flipped by the measurement described at
+    /// each use site.
+    /// </summary>
+    static readonly bool s_itemsFirst =
+        System.Environment.GetEnvironmentVariable("HERMES_256_ITEMSFIRST") == "1";
+
+    /// <summary>
+    /// Route B (section 125). On the 2.5.6 build the modern per-fragment values-update wire
+    /// format (a changed-fragment bitmask + CGObject's own modern changes-mask, read by
+    /// vtable+0x1C8) is not yet encodable, so the legacy masked body the builder would write is
+    /// mis-parsed and never applied - in-combat health bars never move. When this is set, a
+    /// value update for an eligible world unit (a Creature we previously created; NOT a player)
+    /// is re-emitted as a full CreateObject2 rebuilt from the merged field cache, which the
+    /// byte-verified create path renders correctly. Ineligible value updates fall through to the
+    /// builder, which writes a clean empty update (no corruption) while this or VALUESNOOP is set.
+    /// Default off = current behaviour. Flip the default once a session confirms mob health and
+    /// state track in combat without the create re-emit snapping units or resetting animations.
+    /// The active player's own health still needs the real delta encoder (Route A) and is out of
+    /// scope here - re-creating the active player risks the WowCS::Archetype fault (section 32).
+    /// </summary>
+    static readonly bool s_valuesAsCreate256 =
+        System.Environment.GetEnvironmentVariable("HERMES_256_VALUESASCREATE") == "1";
+
+
     [PacketHandler(Opcode.SMSG_DESTROY_OBJECT)]
     void HandleDestroyObject(WorldPacket packet)
     {
@@ -25,6 +120,7 @@ public partial class WorldClient
         {
             GetSession().GameState.ObjectCacheLegacy.Remove(guid);
             GetSession().GameState.ObjectCacheModern.Remove(guid);
+            GetSession().GameState.CachedCreateMoveInfo.Remove(guid);
         }
         GetSession().GameState.LastAuraCasterOnTarget.Remove(guid);
 
@@ -100,6 +196,15 @@ public partial class WorldClient
                             Log.Print(LogType.Network, $"[Phase5aTrace] Skipping Values for Transport guid={guid}.");
                             break;
                         }
+                    }
+
+                    // Route B (section 125): on 2.5.6, replace the un-encodable masked value
+                    // update with a full create rebuilt from the merged cache for eligible
+                    // units. If it fires, the create was added in place of this delta.
+                    if (s_valuesAsCreate256 &&
+                        TryReemitValuesUpdateAsCreate(guid, updateObject))
+                    {
+                        break;
                     }
 
                     updateObject.ObjectUpdates.Add(updateData);
@@ -437,6 +542,8 @@ public partial class WorldClient
             return;
         }
 
+        SendOwnObjectFirstIfNeeded(updateObject);
+
         if (updateObject.ObjectUpdates.Count != 0 ||
             updateObject.DestroyedGuids.Count != 0 ||
             updateObject.OutOfRangeGuids.Count != 0)
@@ -474,6 +581,7 @@ public partial class WorldClient
             {
                 GetSession().GameState.ObjectCacheLegacy.Remove(guid);
                 GetSession().GameState.ObjectCacheModern.Remove(guid);
+                GetSession().GameState.CachedCreateMoveInfo.Remove(guid);
             }
             GetSession().GameState.LastAuraCasterOnTarget.Remove(guid);
 
@@ -1167,6 +1275,15 @@ public partial class WorldClient
             moveInfo.Flags = (uint)(((MovementFlagWotLK)moveInfo.Flags).CastFlags<MovementFlagModern>());
             moveInfo.ValidateMovementInfo();
             updateData.CreateData.MoveInfo = moveInfo;
+            // Route B (section 125): keep the create-time movement so a later value update for
+            // this unit can be re-emitted as a create on 2.5.6. Snapshot a copy - the create
+            // builder mutates MoveInfo via InitializePlaceholders. Only while the knob is on,
+            // so other builds and the default path incur no overhead.
+            if (s_valuesAsCreate256)
+            {
+                lock (GetSession().GameState.ObjectCacheLock)
+                    GetSession().GameState.CachedCreateMoveInfo[guid] = moveInfo.CopyFromMe();
+            }
         }
     }
 
@@ -1210,21 +1327,32 @@ public partial class WorldClient
             return GetGuidValue128(UpdateFields, field);
     }
 
-    // FIXME(phase5a-7c): cmangos packs equipped/container items with non-standard 0x4700
-    // (HighGuidTypeLegacy.ItemContainer). We skip CreateObject blocks for those items
-    // in the legacy→modern translation above. If we still write their guids into the
+    // cmangos packs equipped/container items with non-standard 0x4700
+    // (HighGuidTypeLegacy.ItemContainer). The V3_4_3 path skips CreateObject blocks for those
+    // items in the legacy→modern translation above; if we still write their guids into the
     // player's InvSlots/PackSlots/etc, the V3_4_3 client looks them up, finds nothing,
     // and dereferences a null object pointer → ERROR #132 ACCESS_VIOLATION on
     // world-enter. Returning Empty here makes the slot appear unequipped, which is
     // wrong but non-crashing — the proper fix is to actually serialize ItemContainer
-    // items via WriteCreateItemData. V3_4_3 only — V1_14/V2_5 paths must keep the
-    // original item guids so equipped items still render under Vanilla/TBC clients.
+    // items via WriteCreateItemData.
+    //
+    // On the 5.5.0 path (V2_5_6) item creates are NOT skipped: HighGuid.cs maps 0x4700 to a
+    // modern Item guid and the builder routes Item/Container create blocks (run log shows
+    // type=Item blocks on the wire), and To128 folds 0x4700 and 0x4000 onto the same modern
+    // guid, so a slot value of either kind resolves to the object we sent. Blanking the 0x4700
+    // ones there would silently unequip whatever cmangos happened to pack that way. Behind
+    // HERMES_256_ITEMSFIRST because the guid is only resolvable once the item objects actually
+    // precede the player block — same measurement flips both (see SendOwnObjectFirstIfNeeded).
     private WowGuid128 GetSlotGuidValue(Dictionary<int, UpdateField> updates, int field)
     {
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V6_0_2_19033))
             return GetGuidValue128(updates, field);
 
-        if (ModernVersion.Build == ClientVersionBuild.V3_4_3_54261)
+        // V3_4_3 and the 5.5.0 generation are both modern-engine clients and behave the same way
+        // here. The V1_14/V2_5 paths below still travel the old update-field route and must keep
+        // the original guids so equipped items render.
+        if (ModernVersion.Build == ClientVersionBuild.V3_4_3_54261 ||
+            (ModernVersion.Uses550Engine && !s_itemsFirst))
         {
             var legacyGuid = GetGuidValue64(updates, field);
             if (legacyGuid.GetHighGuidTypeLegacy() == HighGuidTypeLegacy.ItemContainer)
@@ -1380,6 +1508,61 @@ public partial class WorldClient
         }
 
         return flags;
+    }
+
+    /// <summary>
+    /// Route B (section 125): rebuild a full CreateObject2 for a unit whose value update we
+    /// cannot encode on 2.5.6, from the merged legacy field cache plus the cached create-time
+    /// movement. Returns true (and adds the create to <paramref name="updateObject"/>) only for
+    /// an eligible unit; false leaves the caller to emit the update normally.
+    /// </summary>
+    private bool TryReemitValuesUpdateAsCreate(WowGuid128 guid, UpdateObject updateObject)
+    {
+        if (ModernVersion.Build != ClientVersionBuild.V2_5_6_69110)
+            return false;
+
+        // Only a plain world unit (creature/NPC). Players and the active player are excluded:
+        // re-creating the active player risks the WowCS::Archetype fault (section 32).
+        ObjectType type = GetSession().GameState.GetOriginalObjectType(guid);
+        if (type != ObjectType.Unit)
+            return false;
+
+        // We must have created this unit before, so we hold its movement (position) and state.
+        MovementInfo? moveInfo;
+        lock (GetSession().GameState.ObjectCacheLock)
+            GetSession().GameState.CachedCreateMoveInfo.TryGetValue(guid, out moveInfo);
+        if (moveInfo == null)
+            return false;
+
+        Dictionary<int, UpdateField>? updates = GetSession().GameState.GetCachedObjectFieldsLegacy(guid);
+        if (updates == null || updates.Count == 0)
+            return false;
+
+        // A full mask over every cached field makes StoreObjectUpdateInternal repopulate the
+        // whole descriptor from the merged state, exactly as a real create would.
+        int unitEnd = LegacyVersion.GetUpdateField(UnitField.UNIT_END);
+        if (unitEnd <= 0)
+            return false;
+        var fullMask = new BitArray(unitEnd);
+        foreach (var key in updates.Keys)
+        {
+            if (key >= 0 && key < unitEnd)
+                fullMask.Set(key, true);
+        }
+
+        ObjectUpdate createUpdate = new ObjectUpdate(guid, UpdateTypeModern.CreateObject2, GetSession());
+        createUpdate.CreateData.ObjectType = type;
+        // Copy again: the create builder mutates MoveInfo via InitializePlaceholders, and this
+        // unit's cached snapshot must survive for the next tick.
+        createUpdate.CreateData.MoveInfo = moveInfo.CopyFromMe();
+
+        // isCreate:true reproduces create-time descriptor population; the AuraUpdate is a
+        // throwaway (auras were already parsed and sent) and there is no power update.
+        AuraUpdate throwawayAuras = new AuraUpdate(guid, true);
+        StoreObjectUpdateInternal(guid, type, fullMask, updates, throwawayAuras, null, true, createUpdate);
+
+        updateObject.ObjectUpdates.Add(createUpdate);
+        return true;
     }
 
     public void StoreObjectUpdate(WowGuid128 guid, ObjectType objectType, BitArray updateMaskArray, Dictionary<int, UpdateField> updates, AuraUpdate auraUpdate, PowerUpdate? powerUpdate, bool isCreate, ObjectUpdate updateData, BitArray actuallyChangedValuesMaskArray)

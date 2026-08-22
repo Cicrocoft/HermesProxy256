@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
@@ -119,6 +119,9 @@ public class Program
         builder.Services.AddOptions<DiagnosticsOptions>()
             .Bind(builder.Configuration.GetSection(nameof(DiagnosticsOptions)))
             .ValidateOnStart();
+        builder.Services.AddOptions<AccountOptions>()
+            .Bind(builder.Configuration.GetSection(nameof(AccountOptions)))
+            .ValidateOnStart();
 
         builder.Services.AddSingleton<IPostConfigureOptions<ClientOptions>, ClientSeedParser>();
         builder.Services.AddSingleton<IPostConfigureOptions<LegacyServerOptions>, LegacyServerBuildResolver>();
@@ -163,6 +166,11 @@ public class Program
         [nameof(ProxyNetworkOptions.InstancePort)] = $"{nameof(ProxyNetworkOptions)}:{nameof(ProxyNetworkOptions.InstancePort)}",
         [nameof(ProxyNetworkOptions.CertificatePfxPath)]     = $"{nameof(ProxyNetworkOptions)}:{nameof(ProxyNetworkOptions.CertificatePfxPath)}",
         [nameof(ProxyNetworkOptions.CertificatePfxPassword)] = $"{nameof(ProxyNetworkOptions)}:{nameof(ProxyNetworkOptions.CertificatePfxPassword)}",
+        [nameof(ProxyNetworkOptions.RestPlaintext)] = $"{nameof(ProxyNetworkOptions)}:{nameof(ProxyNetworkOptions.RestPlaintext)}",
+
+        ["AccountUsername"] = $"{nameof(AccountOptions)}:{nameof(AccountOptions.Username)}",
+        ["AccountPassword"] = $"{nameof(AccountOptions)}:{nameof(AccountOptions.Password)}",
+        ["SrpVersion"]      = $"{nameof(AccountOptions)}:{nameof(AccountOptions.SrpVersion)}",
 
         [nameof(DiagnosticsOptions.PacketsLog)]    = $"{nameof(DiagnosticsOptions)}:{nameof(DiagnosticsOptions.PacketsLog)}",
 

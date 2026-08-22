@@ -1,0 +1,51 @@
+// Battle.net account service, version 2 — how modern clients learn what their game account is
+// called. The name matters: it is what the client checks the realm join ticket against, and a
+// client that never learned it rejects the join with "Join token mismatch".
+//
+// Reconstructed from CypherCore's generated bindings.
+// Service hash: 0x22DC2464. Methods: 101 GetAccountInfo, 104 GetRestriction,
+// 201 GetGameAccountInfo, 203 GetGameAccountRestriction.
+//
+// GameAccountHandle is imported rather than redeclared so both services put the same bytes on the
+// wire; note its id is a varint, unlike the fixed32 of the v1 handle.
+//
+// Generate with:  protoc -I . --csharp_out=. AccountServiceV2.proto
+
+syntax = "proto2";
+
+package bgs.protocol.account.v2.client;
+
+import "AuthenticationV2.proto";
+
+option csharp_namespace = "Bgs.Protocol.Account.V2.Client";
+
+message AccountInfo {
+    optional uint64 account_id = 1;
+    optional uint32 home_region = 2;
+    optional string email = 3;
+    optional string full_name = 4;
+    optional string battle_tag = 5;
+    optional string phone_number = 6;
+    optional string country = 7;
+}
+
+message GameAccountInfo {
+    optional uint64 account_id = 1;
+    optional string name = 2;
+}
+
+message GetAccountInfoRequest {
+    optional AccountInfo info = 1;
+}
+
+message GetAccountInfoResponse {
+    optional AccountInfo info = 1;
+}
+
+message GetGameAccountInfoRequest {
+    optional bgs.protocol.authentication.v2.client.GameAccountHandle game_account = 1;
+}
+
+message GetGameAccountInfoResponse {
+    optional GameAccountInfo info = 1;
+}

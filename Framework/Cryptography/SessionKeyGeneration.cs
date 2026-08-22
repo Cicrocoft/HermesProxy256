@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Copyright (C) 2012-2020 CypherCore <http://github.com/CypherCore>
  *
  * This program is free software: you can redistribute it and/or modify
@@ -22,22 +22,42 @@ namespace Framework.Cryptography;
 
 public sealed class SessionKeyGenerator
 {
-    private const int HashSize = 32; // SHA-256
+    private readonly int HashSize;
+    private readonly HashAlgorithmName _algorithm;
 
-    private readonly byte[] _o0 = new byte[HashSize];
-    private readonly byte[] _o1 = new byte[HashSize];
-    private readonly byte[] _o2 = new byte[HashSize];
+    private readonly byte[] _o0;
+    private readonly byte[] _o1;
+    private readonly byte[] _o2;
     private int _taken;
 
-    public SessionKeyGenerator(ReadOnlySpan<byte> buff)
+    /// <param name="sha512">
+    /// The 5.5.0-generation engine builds the session key with SHA-512 instead of SHA-256. The
+    /// construction is otherwise identical, so only the hash and its output size change.
+    /// </param>
+    public SessionKeyGenerator(ReadOnlySpan<byte> buff, bool sha512 = false)
     {
+        HashSize = sha512 ? 64 : 32;
+        _algorithm = sha512 ? HashAlgorithmName.SHA512 : HashAlgorithmName.SHA256;
+        _o0 = new byte[HashSize];
+        _o1 = new byte[HashSize];
+        _o2 = new byte[HashSize];
+
         int halfSize = buff.Length / 2;
-        SHA256.HashData(buff[..halfSize], _o1);
-        SHA256.HashData(buff[halfSize..], _o2);
+        if (sha512)
+        {
+            SHA512.HashData(buff[..halfSize], _o1);
+            SHA512.HashData(buff[halfSize..], _o2);
+        }
+        else
+        {
+            SHA256.HashData(buff[..halfSize], _o1);
+            SHA256.HashData(buff[halfSize..], _o2);
+        }
         FillUp();
     }
 
-    public SessionKeyGenerator(byte[] buff, int size) : this(buff.AsSpan(0, size)) { }
+    public SessionKeyGenerator(byte[] buff, int size, bool sha512 = false)
+        : this(buff.AsSpan(0, size), sha512) { }
 
     public void Generate(Span<byte> buf)
     {
@@ -55,14 +75,14 @@ public sealed class SessionKeyGenerator
 
     private void FillUp()
     {
-        using var ih = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        using var ih = IncrementalHash.CreateHash(_algorithm);
         ih.AppendData(_o1);
         ih.AppendData(_o0);
         ih.AppendData(_o2);
 
         // Hash directly into _o0 to avoid the byte[] allocation that GetHashAndReset would produce.
         if (!ih.TryGetHashAndReset(_o0, out int written) || written != HashSize)
-            throw new CryptographicException("SessionKeyGenerator.FillUp: SHA-256 produced unexpected output size.");
+            throw new CryptographicException($"SessionKeyGenerator.FillUp: {_algorithm} produced unexpected output size.");
 
         _taken = 0;
     }

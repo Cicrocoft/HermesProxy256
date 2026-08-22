@@ -53,6 +53,81 @@ public class QuestGiverQuestDetails : ServerPacket
 
     public override void Write()
     {
+        if (ModernVersion.Uses550Engine)
+        {
+            // 2.5.6 (69110) layout, confirmed against the client's own reader (function 0x63A430,
+            // called from dispatcher case 0x64043D): guid, guid, 12 u32 (incl. FlagsEx2/FlagsEx3),
+            // 3 counts, StartItem, QuestInfoID, SessionBonus, QuestGiverCreatureID, conditional
+            // text count, the three arrays (objectives are 4 x u32: Id, Type, ObjectID, Amount),
+            // a 75-bit block (7 string lengths + 6 flag bits), rewards, 7 strings, conditional
+            // texts. WPP V5_5_0_61735 QuestHandler.cs agrees field for field.
+            _worldPacket.WritePackedGuid128(QuestGiverGUID);
+            _worldPacket.WritePackedGuid128(InformUnit);
+            _worldPacket.WriteUInt32(QuestID);
+            _worldPacket.WriteInt32(QuestPackageID);
+            _worldPacket.WriteUInt32(PortraitGiver);
+            _worldPacket.WriteUInt32(PortraitGiverMount);
+            _worldPacket.WriteUInt32(PortraitGiverModelSceneID);
+            _worldPacket.WriteUInt32(PortraitTurnIn);
+            _worldPacket.WriteUInt32(QuestFlags[0]); // Flags
+            _worldPacket.WriteUInt32(QuestFlags[1]); // FlagsEx
+            _worldPacket.WriteUInt32(0);             // FlagsEx2 - no legacy source
+            _worldPacket.WriteUInt32(0);             // FlagsEx3 - no legacy source
+            _worldPacket.WriteUInt32(SuggestedPartyMembers);
+            _worldPacket.WriteInt32(LearnSpells.Count);
+            _worldPacket.WriteInt32(DescEmotes.Length);
+            _worldPacket.WriteInt32(Objectives.Count);
+            _worldPacket.WriteInt32(QuestStartItemID);
+            _worldPacket.WriteInt32(QuestInfoID);
+            _worldPacket.WriteInt32(QuestSessionBonus);
+            _worldPacket.WriteUInt32(QuestGiverGUID != null ? QuestGiverGUID.GetEntry() : 0); // QuestGiverCreatureID
+            _worldPacket.WriteUInt32(0);             // ConditionalDescriptionText count
+
+            foreach (uint spell in LearnSpells)
+                _worldPacket.WriteUInt32(spell);
+
+            foreach (QuestDescEmote emote in DescEmotes)
+            {
+                _worldPacket.WriteUInt32(emote.Type);
+                _worldPacket.WriteUInt32(emote.Delay);
+            }
+
+            foreach (QuestObjectiveSimple obj in Objectives)
+            {
+                _worldPacket.WriteUInt32(obj.Id);
+                _worldPacket.WriteUInt32(obj.Type);     // widened to u32 and moved before ObjectID
+                _worldPacket.WriteInt32(obj.ObjectID);
+                _worldPacket.WriteInt32(obj.Amount);
+            }
+
+            _worldPacket.WriteBits(QuestTitle.GetByteCount(), 9);
+            _worldPacket.WriteBits(DescriptionText.GetByteCount(), 12);
+            _worldPacket.WriteBits(LogDescription.GetByteCount(), 12);
+            _worldPacket.WriteBits(PortraitGiverText.GetByteCount(), 10);
+            _worldPacket.WriteBits(PortraitGiverName.GetByteCount(), 8);
+            _worldPacket.WriteBits(PortraitTurnInText.GetByteCount(), 10);
+            _worldPacket.WriteBits(PortraitTurnInName.GetByteCount(), 8);
+            _worldPacket.WriteBit(AutoLaunched);
+            _worldPacket.WriteBit(false);   // FromContentPush
+            _worldPacket.WriteBit(false);   // Unused
+            _worldPacket.WriteBit(false);   // ResetByScheduler
+            _worldPacket.WriteBit(StartCheat);
+            _worldPacket.WriteBit(DisplayPopup);
+            _worldPacket.FlushBits();
+
+            Rewards.Write(_worldPacket);
+
+            _worldPacket.WriteString(QuestTitle);
+            _worldPacket.WriteString(DescriptionText);
+            _worldPacket.WriteString(LogDescription);
+            _worldPacket.WriteString(PortraitGiverText);
+            _worldPacket.WriteString(PortraitGiverName);
+            _worldPacket.WriteString(PortraitTurnInText);
+            _worldPacket.WriteString(PortraitTurnInName);
+            // No conditional description texts (count written as 0 above).
+            return;
+        }
+
         _worldPacket.WritePackedGuid128(QuestGiverGUID);
         _worldPacket.WritePackedGuid128(InformUnit);
         _worldPacket.WriteUInt32(QuestID);
@@ -84,7 +159,7 @@ public class QuestGiverQuestDetails : ServerPacket
             _worldPacket.WriteUInt32(obj.Id);
             _worldPacket.WriteInt32(obj.ObjectID);
             _worldPacket.WriteInt32(obj.Amount);
-            _worldPacket.WriteUInt8(obj.Type);
+            _worldPacket.WriteUInt8((byte)obj.Type);
         }
 
         _worldPacket.WriteBits(QuestTitle.GetByteCount(), 9);
@@ -126,6 +201,7 @@ public class QuestGiverQuestDetails : ServerPacket
     public uint PortraitGiverMount;
     public uint PortraitGiverModelSceneID;
     public int QuestStartItemID;
+    public int QuestInfoID;      // QuestInfo.db2 type (group/dungeon/raid/pvp); 0 when the legacy side has no source
     public int QuestSessionBonus;
     public string PortraitGiverText = "";
     public string PortraitGiverName = "";
@@ -173,6 +249,69 @@ public class QuestRewards
 
     public void Write(WorldPacket data)
     {
+        if (ModernVersion.Uses550Engine)
+        {
+            // 2.5.6 (69110) reward block, confirmed against the client's own reader (function
+            // 0x58A620, shared by QUEST_DETAILS and OFFER_REWARD): 4x(ItemID,Qty),
+            // 4x(CurrencyID,Qty,BonusQty), ChoiceItemCount, ItemCount, Money, XP, u64 ArtifactXP,
+            // ArtifactCategoryID, Honor, Title, FactionFlags, 5x faction quad, 3x display spell,
+            // SpellCompletionID, SkillLineID, NumSkillUps, treasure picker count + ids,
+            // 6x choice item, IsBoostSpell bit. WPP V5_5_0_61735 ReadQuestRewards agrees.
+            for (int i = 0; i < QuestConst.QuestRewardItemCount; ++i)
+            {
+                data.WriteUInt32(ItemID[i]);
+                data.WriteUInt32(ItemQty[i]);
+            }
+
+            for (int i = 0; i < QuestConst.QuestRewardCurrencyCount; ++i)
+            {
+                data.WriteUInt32(CurrencyID[i]);
+                data.WriteUInt32(CurrencyQty[i]);
+                data.WriteUInt32(0); // CurrencyBonusQty - no legacy source
+            }
+
+            data.WriteUInt32(ChoiceItemCount);
+            data.WriteUInt32(ItemCount);
+            data.WriteUInt32(Money);
+            data.WriteUInt32(XP);
+            data.WriteUInt64(ArtifactXP);
+            data.WriteUInt32(ArtifactCategoryID);
+            data.WriteUInt32(Honor);
+            data.WriteUInt32(Title);
+            data.WriteUInt32(FactionFlags);
+
+            for (int i = 0; i < QuestConst.QuestRewardReputationsCount; ++i)
+            {
+                data.WriteUInt32(FactionID[i]);
+                data.WriteInt32(FactionValue[i]);
+                data.WriteInt32(FactionOverride[i]);
+                data.WriteInt32(FactionCapIn[i]);
+            }
+
+            foreach (var id in SpellCompletionDisplayID)
+                data.WriteInt32(id);
+
+            data.WriteUInt32(SpellCompletionID);
+            data.WriteUInt32(SkillLineID);
+            data.WriteUInt32(NumSkillUps);
+
+            // Dynamic treasure picker list replaces the single u32 of the 9.x layout.
+            if (TreasurePickerID != 0)
+            {
+                data.WriteUInt32(1);
+                data.WriteUInt32(TreasurePickerID);
+            }
+            else
+                data.WriteUInt32(0);
+
+            foreach (var choice in ChoiceItems)
+                choice.Write(data);
+
+            data.WriteBit(IsBoostSpell);
+            data.FlushBits();
+            return;
+        }
+
         data.WriteUInt32(ChoiceItemCount);
         data.WriteUInt32(ItemCount);
 
@@ -305,6 +444,54 @@ public class QuestGiverStatusMultipleQuery : ClientPacket
     public override void Read() { }
 }
 
+/// <summary>
+/// Translates the 9.x-era <see cref="QuestGiverStatusModern"/> flags into the 5.5.x u64 flag set
+/// the 2.5.6 (69110) client reads.
+///
+/// The wire WIDTH is confirmed against the client's own reader: the SMSG_QUEST_GIVER_STATUS
+/// dispatcher case (0x64001B, case RVA 0x6408CD) reads packed guid + u64, and the
+/// SMSG_QUEST_GIVER_STATUS_MULTIPLE case (0x640011) reads u32 count then guid + u64 per entry.
+/// The VALUE mapping below is inferred from TrinityCore master / WPP V5_5_0_61735 enum usage:
+/// "Quest" (0x400000) is the available '!', "RewardCompletePOI" (0x400000000) the turn-in '?',
+/// "Reward" (0x2000) the incomplete grey '?'. If a marker glyph renders wrong in game, adjust
+/// this table - the u64 width is not in question.
+/// </summary>
+public static class QuestGiverStatus550
+{
+    public static ulong Convert(QuestGiverStatusModern status)
+    {
+        ulong result = 0;
+        void Map(QuestGiverStatusModern from, ulong to)
+        {
+            if (status.HasAnyFlag(from))
+                result |= to;
+        }
+
+        Map(QuestGiverStatusModern.Unavailable,               0x000000000002); // Future
+        Map(QuestGiverStatusModern.LowLevelAvailable,         0x000000000040); // Trivial
+        Map(QuestGiverStatusModern.LowLevelRewardRep,         0x000000000020); // TrivialRepeatableTurnin
+        Map(QuestGiverStatusModern.LowLevelAvailableRep,      0x000000000100); // TrivialRepeatableQuest
+        Map(QuestGiverStatusModern.Incomplete,                0x000000002000); // Reward (incomplete grey '?')
+        Map(QuestGiverStatusModern.IncompleteJourney,         0x000000010000); // JourneyReward
+        Map(QuestGiverStatusModern.IncompleteCovenantCalling, 0x000000020000); // CovenantCallingReward
+        Map(QuestGiverStatusModern.RewardRep,                 0x000000100000); // RepeatableTurnin
+        Map(QuestGiverStatusModern.AvailableRep,              0x000001000000); // RepeatableQuest
+        Map(QuestGiverStatusModern.Available,                 0x000000400000); // Quest ('!')
+        Map(QuestGiverStatusModern.Reward2,                   0x000200000000); // RewardCompleteNoPOI
+        Map(QuestGiverStatusModern.Reward,                    0x000400000000); // RewardCompletePOI ('?')
+        Map(QuestGiverStatusModern.AvailableLegendaryQuest,   0x000040000000); // LegendaryQuest
+        Map(QuestGiverStatusModern.Reward2Legendary,          0x080000000000); // LegendaryRewardCompleteNoPOI
+        Map(QuestGiverStatusModern.RewardLegendary,           0x100000000000); // LegendaryRewardCompletePOI
+        Map(QuestGiverStatusModern.AvailableJourney,          0x000010000000); // JourneyQuest
+        Map(QuestGiverStatusModern.Reward2Journey,            0x020000000000); // JourneyRewardCompleteNoPOI
+        Map(QuestGiverStatusModern.RewardJourney,             0x040000000000); // JourneyRewardCompletePOI
+        Map(QuestGiverStatusModern.AvailableCovenantCalling,  0x000004000000); // CovenantCallingQuest
+        Map(QuestGiverStatusModern.Reward2CovenantCalling,    0x008000000000); // CovenantCallingRewardCompleteNoPOI
+        Map(QuestGiverStatusModern.RewardCovenantCalling,     0x010000000000); // CovenantCallingRewardCompletePOI
+        return result;
+    }
+}
+
 public class QuestGiverStatusPkt : ServerPacket, ISpanWritable
 {
     public QuestGiverStatusPkt() : base(Opcode.SMSG_QUEST_GIVER_STATUS, ConnectionType.Instance)
@@ -315,17 +502,25 @@ public class QuestGiverStatusPkt : ServerPacket, ISpanWritable
     public override void Write()
     {
         _worldPacket.WritePackedGuid128(QuestGiver.Guid);
-        _worldPacket.WriteUInt32((uint)QuestGiver.Status);
+        // 2.5.6 (5.5.0 engine) reads Status as u64 - confirmed against the client's own reader
+        // (dispatcher case 0x64001B: packed guid + u64). Older moderns read u32.
+        if (ModernVersion.Uses550Engine)
+            _worldPacket.WriteUInt64(QuestGiverStatus550.Convert(QuestGiver.Status));
+        else
+            _worldPacket.WriteUInt32((uint)QuestGiver.Status);
     }
 
-    // GUID(18) + uint(4) = 22 bytes
-    public int MaxSize => PackedGuidHelper.MaxPackedGuid128Size + 4;
+    // GUID(18) + up to ulong(8) = 26 bytes
+    public int MaxSize => PackedGuidHelper.MaxPackedGuid128Size + 8;
 
     public int WriteToSpan(Span<byte> buffer)
     {
         var writer = new SpanPacketWriter(buffer);
         writer.WritePackedGuid128(QuestGiver.Guid.Low, QuestGiver.Guid.High);
-        writer.WriteUInt32((uint)QuestGiver.Status);
+        if (ModernVersion.Uses550Engine)
+            writer.WriteUInt64(QuestGiverStatus550.Convert(QuestGiver.Status));
+        else
+            writer.WriteUInt32((uint)QuestGiver.Status);
         return writer.Position;
     }
 
@@ -342,14 +537,19 @@ public class QuestGiverStatusMultiple : ServerPacket, ISpanWritable
         foreach (QuestGiverInfo questGiver in QuestGivers)
         {
             _worldPacket.WritePackedGuid128(questGiver.Guid);
-            _worldPacket.WriteUInt32((uint)questGiver.Status);
+            // Same u64 widening as SMSG_QUEST_GIVER_STATUS - confirmed by the client's
+            // STATUS_MULTIPLE case (0x640011): u32 count, then guid + u64 per entry.
+            if (ModernVersion.Uses550Engine)
+                _worldPacket.WriteUInt64(QuestGiverStatus550.Convert(questGiver.Status));
+            else
+                _worldPacket.WriteUInt32((uint)questGiver.Status);
         }
     }
 
     // Cap for quest givers in view - typically only a handful visible at once
     private const int MaxQuestGivers = 32;
-    // Each entry: PackedGuid128 (18) + uint (4) = 22 bytes
-    public int MaxSize => 4 + MaxQuestGivers * (PackedGuidHelper.MaxPackedGuid128Size + 4);
+    // Each entry: PackedGuid128 (18) + up to ulong (8) = 26 bytes
+    public int MaxSize => 4 + MaxQuestGivers * (PackedGuidHelper.MaxPackedGuid128Size + 8);
 
     public int WriteToSpan(Span<byte> buffer)
     {
@@ -361,7 +561,10 @@ public class QuestGiverStatusMultiple : ServerPacket, ISpanWritable
         foreach (QuestGiverInfo questGiver in QuestGivers)
         {
             writer.WritePackedGuid128(questGiver.Guid.Low, questGiver.Guid.High);
-            writer.WriteUInt32((uint)questGiver.Status);
+            if (ModernVersion.Uses550Engine)
+                writer.WriteUInt64(QuestGiverStatus550.Convert(questGiver.Status));
+            else
+                writer.WriteUInt32((uint)questGiver.Status);
         }
         return writer.Position;
     }
@@ -426,6 +629,60 @@ public class QuestGiverRequestItems : ServerPacket
 
     public override void Write()
     {
+        if (ModernVersion.Uses550Engine)
+        {
+            // 2.5.6 (69110) layout, confirmed against the client's own reader (function 0x58AB40
+            // + case tail 0x63ABC0, dispatcher case 0x6404A5): CollectCount and CurrencyCount
+            // FIRST, then guid, FOUR flag u32s, StatusFlags, QuestGiverCreatureID, QuestID,
+            // EmoteDelay, EmoteType, SuggestPartyMembers, MoneyToGet, QuestInfoID, the two
+            // arrays, a 2-bit block, then QuestGiverCreatureID again, conditional text count,
+            // 9+12 bit lengths, conditional texts, title, completion text.
+            // WPP V5_5_0_61735 HandleQuestGiverRequestItems agrees field for field.
+            _worldPacket.WriteInt32(Collect.Count);
+            _worldPacket.WriteInt32(Currency.Count);
+            _worldPacket.WritePackedGuid128(QuestGiverGUID);
+            _worldPacket.WriteUInt32(QuestFlags[0]);
+            _worldPacket.WriteUInt32(QuestFlags[1]);
+            _worldPacket.WriteUInt32(0); // FlagsEx2 - no legacy source
+            _worldPacket.WriteUInt32(0); // FlagsEx3 - no legacy source
+            _worldPacket.WriteUInt32(StatusFlags);
+            _worldPacket.WriteUInt32(QuestGiverCreatureID);
+            _worldPacket.WriteUInt32(QuestID);
+            _worldPacket.WriteUInt32(CompEmoteDelay);
+            _worldPacket.WriteUInt32(CompEmoteType);
+            _worldPacket.WriteUInt32(SuggestPartyMembers);
+            _worldPacket.WriteInt32(MoneyToGet);
+            _worldPacket.WriteInt32(0); // QuestInfoID - no legacy source
+
+            foreach (QuestObjectiveCollect obj in Collect)
+            {
+                _worldPacket.WriteUInt32(obj.ObjectID);
+                _worldPacket.WriteUInt32(obj.Amount);
+                _worldPacket.WriteUInt32(obj.Flags);
+            }
+            foreach (QuestCurrency cur in Currency)
+            {
+                _worldPacket.WriteUInt32(cur.CurrencyID);
+                _worldPacket.WriteInt32(cur.Amount);
+            }
+
+            _worldPacket.WriteBit(AutoLaunched);
+            _worldPacket.WriteBit(false); // ResetByScheduler
+            _worldPacket.FlushBits();
+
+            _worldPacket.WriteUInt32(QuestGiverCreatureID); // repeated for conditional text selection
+            _worldPacket.WriteUInt32(0);                    // ConditionalCompletionText count
+
+            _worldPacket.WriteBits(QuestTitle.GetByteCount(), 9);
+            _worldPacket.WriteBits(CompletionText.GetByteCount(), 12);
+            _worldPacket.FlushBits();
+
+            // No conditional texts (count written as 0 above).
+            _worldPacket.WriteString(QuestTitle);
+            _worldPacket.WriteString(CompletionText);
+            return;
+        }
+
         _worldPacket.WritePackedGuid128(QuestGiverGUID);
         _worldPacket.WriteUInt32(QuestGiverCreatureID);
         _worldPacket.WriteUInt32(QuestID);
@@ -510,6 +767,40 @@ public class QuestGiverOfferRewardMessage : ServerPacket
 
     public override void Write()
     {
+        if (ModernVersion.Uses550Engine)
+        {
+            // 2.5.6 (69110) outer layout, confirmed against the client's own reader (function
+            // 0x63AD90, dispatcher case 0x6404DE): inner data block (see QuestGiverOfferReward),
+            // then QuestPackageID, the four portrait ids, QuestGiverCreatureID, conditional text
+            // count, a 57-bit length block, conditional texts, six strings.
+            // WPP V5_5_0_61735 QuestGiverOfferReward agrees field for field.
+            QuestData.Write(_worldPacket);
+            _worldPacket.WriteUInt32(QuestPackageID);
+            _worldPacket.WriteUInt32(PortraitGiver);
+            _worldPacket.WriteUInt32(PortraitGiverMount);
+            _worldPacket.WriteUInt32(PortraitGiverModelSceneID);
+            _worldPacket.WriteUInt32(PortraitTurnIn);
+            _worldPacket.WriteUInt32(QuestData.QuestGiverCreatureID); // repeated for conditional text selection
+            _worldPacket.WriteUInt32(0);                              // ConditionalRewardText count
+
+            _worldPacket.WriteBits(QuestTitle.GetByteCount(), 9);
+            _worldPacket.WriteBits(RewardText.GetByteCount(), 12);
+            _worldPacket.WriteBits(PortraitGiverText.GetByteCount(), 10);
+            _worldPacket.WriteBits(PortraitGiverName.GetByteCount(), 8);
+            _worldPacket.WriteBits(PortraitTurnInText.GetByteCount(), 10);
+            _worldPacket.WriteBits(PortraitTurnInName.GetByteCount(), 8);
+            _worldPacket.FlushBits();
+
+            // No conditional texts (count written as 0 above).
+            _worldPacket.WriteString(QuestTitle);
+            _worldPacket.WriteString(RewardText);
+            _worldPacket.WriteString(PortraitGiverText);
+            _worldPacket.WriteString(PortraitGiverName);
+            _worldPacket.WriteString(PortraitTurnInText);
+            _worldPacket.WriteString(PortraitTurnInName);
+            return;
+        }
+
         QuestData.Write(_worldPacket);
         _worldPacket.WriteUInt32(QuestPackageID);
         _worldPacket.WriteUInt32(PortraitGiver);
@@ -550,6 +841,37 @@ public class QuestGiverOfferReward
 {
     public void Write(WorldPacket data)
     {
+        if (ModernVersion.Uses550Engine)
+        {
+            // 2.5.6 (69110) inner layout, confirmed against the client's own reader (0x63AD90):
+            // the REWARDS BLOCK comes first, then EmotesCount, guid, Flags, FlagsEx, FlagsEx2,
+            // FlagsEx3, QuestGiverCreatureID, QuestID, SuggestedPartyMembers, QuestInfoID, the
+            // emote array, and a 3-bit block. WPP ReadQuestGiverOfferRewardData agrees.
+            Rewards.Write(data);
+            data.WriteInt32(Emotes.Count);
+            data.WritePackedGuid128(QuestGiverGUID);
+            data.WriteUInt32(QuestFlags[0]); // Flags
+            data.WriteUInt32(QuestFlags[1]); // FlagsEx
+            data.WriteUInt32(0);             // FlagsEx2 - no legacy source
+            data.WriteUInt32(0);             // FlagsEx3 - no legacy source
+            data.WriteUInt32(QuestGiverCreatureID);
+            data.WriteUInt32(QuestID);
+            data.WriteUInt32(SuggestedPartyMembers);
+            data.WriteInt32(0);              // QuestInfoID - no legacy source
+
+            foreach (QuestDescEmote emote in Emotes)
+            {
+                data.WriteUInt32(emote.Type);
+                data.WriteUInt32(emote.Delay);
+            }
+
+            data.WriteBit(AutoLaunched);
+            data.WriteBit(false);   // Unused
+            data.WriteBit(false);   // ResetByScheduler
+            data.FlushBits();
+            return;
+        }
+
         data.WritePackedGuid128(QuestGiverGUID);
         data.WriteUInt32(QuestGiverCreatureID);
         data.WriteUInt32(QuestID);

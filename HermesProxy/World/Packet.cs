@@ -204,13 +204,20 @@ public class WorldPacket : ByteBuffer
         System.Diagnostics.Trace.Assert(this.opcode != 0);
     }
 
+    /// Read-mode ctor for a packet received from the modern client, whose opcode width follows
+    /// the client build.
     public WorldPacket(byte[] data) : base(data)
     {
-        opcode = ReadUInt16();
+        opcode = ReadModernOpcode();
     }
 
-    /// Read-mode ctor for a possibly-oversized backing buffer with an explicit payload length.
-    /// Pass isPooled=true when `data` came from ArrayPool<byte>.Shared so Dispose returns it.
+    /// Read-mode ctor for a packet received from the legacy server, for a possibly-oversized
+    /// backing buffer with an explicit payload length. Pass isPooled=true when `data` came from
+    /// ArrayPool&lt;byte&gt;.Shared so Dispose returns it.
+    ///
+    /// The opcode here is always 16 bits. The emulator speaks its own build's protocol no matter
+    /// which client is on the other side of the proxy, so this must not follow the modern build:
+    /// WorldClient copies exactly two opcode bytes into the buffer ahead of the payload.
     public WorldPacket(byte[] data, int length, bool isPooled) : base(data, length, isPooled)
     {
         opcode = ReadUInt16();
@@ -346,13 +353,30 @@ public class WorldPacket : ByteBuffer
         WriteBytes(data.GetData());
     }
 
+    /// <summary>
+    /// Reads the opcode a modern client put at the start of a world packet. Only for packets from
+    /// the client — see the legacy read-mode constructor above.
+    /// </summary>
+    /// <remarks>
+    /// Builds up to 3.4.3 use a 16-bit opcode. The 5.5.0-engine generation widened it: an opcode
+    /// there is (group &lt;&lt; 16) | index, and the first world packet from a 2.5.6 client decoded as
+    /// 07 00 45 00 = 0x00450007, which reads as a meaningless 7 through a 16-bit lens.
+    /// </remarks>
+    private uint ReadModernOpcode()
+    {
+        if (ModernVersion.Build == ClientVersionBuild.V2_5_6_69110)
+            return ReadUInt32();
+
+        return ReadUInt16();
+    }
+
     public uint GetOpcode() { return opcode; }
     public Opcode GetUniversalOpcode(bool isModern)
     {
         if (isModern)
             return ModernVersion.GetUniversalOpcode(GetOpcode());
-        else
-            return LegacyVersion.GetUniversalOpcode(GetOpcode());
+
+        return LegacyVersion.GetUniversalOpcode(GetOpcode());
     }
 
     public long GetReceivedTime() { return m_receivedTime; }

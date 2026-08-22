@@ -19,7 +19,7 @@ public partial class WorldClient
         QueryTimeResponse response = new QueryTimeResponse();
         response.CurrentTime = packet.ReadInt32();
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180) && packet.CanRead())
-            packet.ReadInt32(); // Next Daily Quest Reset Time
+            response.DailyReset = (uint)packet.ReadInt32();   // the 69110 client has a field for it
         SendPacketToClient(response);
     }
     [PacketHandler(Opcode.SMSG_QUERY_QUEST_INFO_RESPONSE)]
@@ -532,6 +532,11 @@ public partial class WorldClient
 
         foreach (var entry in toFlush)
         {
+            // Same rule as the direct path: the player's own object goes out alone and first.
+            // Object updates that had to wait for an item template come through here instead of
+            // HandleUpdateObject, and at login that is the packet carrying the player.
+            SendOwnObjectFirstIfNeeded(entry.UpdateObject);
+
             if (entry.UpdateObject.ObjectUpdates.Count != 0 ||
                 entry.UpdateObject.DestroyedGuids.Count != 0 ||
                 entry.UpdateObject.OutOfRangeGuids.Count != 0)

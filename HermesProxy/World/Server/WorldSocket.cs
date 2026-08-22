@@ -48,6 +48,9 @@ namespace HermesProxy.World.Server;
 
 public partial class WorldSocket : SocketBase, BnetServices.INetwork
 {
+    static readonly int s_dumpLen =
+        int.TryParse(System.Environment.GetEnvironmentVariable("HERMES_256_DUMPLEN"), out var dl) && dl > 0 ? dl : 128;
+
     // Source-generated [LoggerMessage] methods use this MEL logger. SourceFile and NetDir are
     // passed per-call but resolve to the same cached strings, so they compile to const loads.
     private static readonly Microsoft.Extensions.Logging.ILogger _melLog = Log.CreateMelLogger(Log.CategoryPacket);
@@ -62,6 +65,30 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
     static readonly byte[] SessionKeySeed = { 0x58, 0xCB, 0xCF, 0x40, 0xFE, 0x2E, 0xCE, 0xA6, 0x5A, 0x90, 0xB8, 0x01, 0x68, 0x6C, 0x28, 0x0B };
     static readonly byte[] ContinuedSessionSeed = { 0x16, 0xAD, 0x0C, 0xD4, 0x46, 0xF9, 0x4F, 0xB2, 0xEF, 0x7D, 0xEA, 0x2A, 0x17, 0x66, 0x4D, 0x2F };
     static readonly byte[] EncryptionKeySeed = { 0xE9, 0x75, 0x3C, 0x50, 0x90, 0x93, 0x61, 0xDA, 0x3B, 0x07, 0xEE, 0xFA, 0xFF, 0x9D, 0x41, 0xB8 };
+
+    // The 5.5.0-generation engine replaced the whole key schedule: SHA-512 throughout, a 32-byte
+    // encryption key, and these four seeds in place of the 16-byte ones above. Values from current
+    // CypherCore, which tracks retail.
+    static readonly byte[] AuthCheckSeed512 =
+    {
+        0xDE, 0x3A, 0x2A, 0x8E, 0x6B, 0x89, 0x52, 0x66, 0x88, 0x9D, 0x7E, 0x7A, 0x77, 0x1D, 0x5D, 0x1F,
+        0x4E, 0xD9, 0x0C, 0x23, 0x9B, 0xCD, 0x0E, 0xDC, 0xD2, 0xE8, 0x04, 0x3A, 0x68, 0x64, 0xC7, 0xB0
+    };
+    static readonly byte[] SessionKeySeed512 =
+    {
+        0xE8, 0x1E, 0x8B, 0x59, 0x27, 0x62, 0x1E, 0xAA, 0x86, 0x15, 0x18, 0xEA, 0xC0, 0xBF, 0x66, 0x8C,
+        0x6D, 0xBF, 0x83, 0x93, 0xBC, 0xAA, 0x80, 0x52, 0x5B, 0x1E, 0xDC, 0x23, 0xA0, 0x12, 0xB7, 0x50
+    };
+    static readonly byte[] ContinuedSessionSeed512 =
+    {
+        0x56, 0x5C, 0x61, 0x9C, 0x48, 0x3A, 0x52, 0x1F, 0x61, 0x5D, 0x05, 0x49, 0xB2, 0x9A, 0x39, 0xBF,
+        0x4B, 0x97, 0xB0, 0x1B, 0xF9, 0x6C, 0xDE, 0xD6, 0x80, 0x1D, 0xAB, 0x26, 0x02, 0xA9, 0x9B, 0x9D
+    };
+    static readonly byte[] EncryptionKeySeed512 =
+    {
+        0x71, 0xC9, 0xED, 0x5A, 0xA7, 0x0E, 0x4D, 0xFF, 0x4C, 0x36, 0xA6, 0x5A, 0x3E, 0x46, 0x8A, 0x4A,
+        0x5D, 0xA1, 0x48, 0xC8, 0x30, 0x47, 0x4A, 0xDE, 0xF6, 0x0D, 0x6C, 0xBE, 0x6F, 0xE4, 0x55, 0x73
+    };
 
     static readonly int HeaderSize = 16;
 
@@ -97,10 +124,14 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
         _instancePort = networkOptions.Value.InstancePort;
 
         _connectType = ConnectionType.Realm;
-        _serverChallenge = Array.Empty<byte>().GenerateRandomKey(16);
+        // 16 bytes up to 3.4.3, 32 on the 5.5.0-generation engine — the same widening the client's
+        // own LocalChallenge got. A short challenge leaves the client reading past the end of
+        // SMSG_AUTH_CHALLENGE, and every HMAC below hashes this in full, so the length has to be
+        // right in both places.
+        _serverChallenge = Array.Empty<byte>().GenerateRandomKey(ModernVersion.Uses550Engine ? 32 : 16);
         _worldCrypt = new WorldCrypt();
 
-        _encryptKey = new byte[16];
+        _encryptKey = new byte[ModernVersion.Uses550Engine ? 32 : 16];
 
         _headerBuffer = new SocketBuffer(HeaderSize);
         _packetBuffer = new SocketBuffer(0);
@@ -269,6 +300,17 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
             return ReadDataHandlerResult.Error;
         }
 
+        // FIXME(256-spike): temporary diagnostics. The 5.5.0-engine client's opcodes do not look
+        // like anything in the table we borrowed, so dump the raw bytes to work out the actual
+        // on-the-wire encoding rather than guessing at field widths. Remove before any PR.
+        {
+            byte[] raw = _packetBuffer.GetData();
+            int dumpLength = System.Math.Min(raw.Length, 256);
+            Log.Print(LogType.Warn,
+                $"[256-spike] world packet in: declaredSize={header.Size} payloadLen={raw.Length} " +
+                $"tag={System.Convert.ToHexString(header.Tag)} first{dumpLength}={System.Convert.ToHexString(raw, 0, dumpLength)}");
+        }
+
         WorldPacket packet = new(_packetBuffer.GetData());
         _packetBuffer.Reset();
 
@@ -307,6 +349,15 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
             case Opcode.CMSG_LOG_DISCONNECT:
                 uint reason = packet.ReadUInt32();
                 Log.Print(LogType.Server, $"Client disconnected with reason {reason}.");
+                // A client that gives up during the world handshake sends this before it has a
+                // session, and the code below assumed one existed. Previously unreachable because
+                // the opcode did not decode; now that it does, an early disconnect would take the
+                // whole proxy down with a NullReferenceException.
+                if (GetSession() == null)
+                {
+                    CloseSocket();
+                    break;
+                }
                 if (_connectType == ConnectionType.Realm)
                 {
                     if (GetSession().AuthClient != null)
@@ -350,15 +401,30 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
         var handler = GetHandler(universalOpcode);
         if (handler != null)
         {
-            if (HermesProxy.Server.MetricsEnabled)
+            // A handler that reads past the end of a packet must not take the session with it.
+            // That happens whenever an opcode in a per-build table points at the wrong message:
+            // the reader runs out of bytes, throws, and the exception propagates out of the socket
+            // read loop and drops the connection. Log it and carry on — one unknown packet is not
+            // worth a disconnect, and on a build whose opcode table is still being verified it is
+            // the difference between playing and being kicked.
+            try
             {
-                long startTimestamp = Stopwatch.GetTimestamp();
-                handler.Invoke(this, packet);
-                HermesProxy.Server.Metrics.RecordClientToServerLatency(universalOpcode, Stopwatch.GetElapsedTime(startTimestamp).Ticks);
+                if (HermesProxy.Server.MetricsEnabled)
+                {
+                    long startTimestamp = Stopwatch.GetTimestamp();
+                    handler.Invoke(this, packet);
+                    HermesProxy.Server.Metrics.RecordClientToServerLatency(universalOpcode, Stopwatch.GetElapsedTime(startTimestamp).Ticks);
+                }
+                else
+                {
+                    handler.Invoke(this, packet);
+                }
             }
-            else
+            catch (Exception ex)
             {
-                handler.Invoke(this, packet);
+                Log.Print(LogType.Error,
+                    $"Handler for {universalOpcode} (0x{packet.GetOpcode():X}) threw {ex.GetType().Name}: {ex.Message}. " +
+                    "Packet dropped; session kept alive.");
             }
         }
         else
@@ -379,8 +445,19 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
     }
 
     // C<P S: Sends data to modern client
-    public void SendPacket(ServerPacket packet)
+    // FIXME(256-spike): the override exists only for the encrypted-mode opcode probe below.
+    // Remove along with the probe.
+    /// <summary>
+    /// BISECT: combat and spell-visual packets held back on the 5.5.0 engine.
+    ///
+    /// These fire during login — the legacy core sends a login visual and the proxy forwards it —
+    /// and every one of them is a dense bit-packed structure whose 11.x layout has never been
+    /// checked. None is needed to stay connected. Removing whole objects made things worse, but a
+    /// malformed packet is a different failure from a missing one.
+    /// </summary>
+    public void SendPacket(ServerPacket packet, uint wireOpcodeOverride = 0)
     {
+
         if (!IsOpen())
         {
             Log.PrintNet(LogType.Error, LogNetDir.P2C, $"Can't send {packet.GetUniversalOpcode()}, socket is closed!");
@@ -403,36 +480,90 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
         {
             var data = packet.GetData()!;
             Opcode universalOpcode = packet.GetUniversalOpcode();
-            ushort opcode = (ushort)packet.GetOpcode();
+
+            // 2.5.6 runs on the 5.5.0-generation engine, whose opcodes are (group << 16) | index
+            // and travel as 32 bits. Older builds keep the 16-bit form.
+            bool wideOpcode = ModernVersion.Build == ClientVersionBuild.V2_5_6_69110;
+            uint opcode = wireOpcodeOverride != 0 ? wireOpcodeOverride : packet.GetOpcode();
+
+            // An opcode of 0 means the build's table has no number for this message. 2.5.6's table
+            // is derived from the client binary and is deliberately incomplete: it only carries
+            // messages the client actually has, so retail-only packets resolve to nothing here.
+            // Putting a 0 on the wire would make the client treat it as an unknown message and
+            // drop the connection, which is far harder to diagnose than skipping the send.
+            // Opcode 0 is never valid on the wire, so drop the packet whatever its universal
+            // opcode says. The earlier form of this guard also required the universal opcode to be
+            // something other than MSG_NULL_ACTION, which let a 688-byte SMSG_AVAILABLE_HOTFIXES go
+            // out as opcode 0 — the client read an unknown message with a large body in the middle
+            // of the glue-screen sequence.
+            if (opcode == 0)
+            {
+                Log.Print(LogType.Debug,
+                    $"WorldSocket.SendPacket: {universalOpcode} has no opcode in build " +
+                    $"{ModernVersion.Build} ({data.Length} byte body); not sent.");
+                return;
+            }
+
+            // Under-sending is what crashes this client: its reader runs off the end of our body and
+            // the packed-guid assembler dereferences a null buffer (REFERENCE-256-CLIENT.md 118).
+            // These four are the ones we provably send shorter than the client's own reader consumes
+            // and that go out during a normal session. Over-sending is harmless and is not listed.
+            if (ModernVersion.Uses550Engine && !s_noSendGuard && s_underSized.Contains(universalOpcode))
+            {
+                Log.Print(LogType.Warn,
+                    $"[256-spike] holding back {universalOpcode}: our body is shorter than the " +
+                    $"client's reader for that opcode. See REFERENCE-256-CLIENT.md section 118.");
+                return;
+            }
 
             WorldSocketLogMessages.PacketSent(_melLog, _sourceFile, _netDirSend, universalOpcode, (uint)opcode);
+
+            // FIXME(256-spike): temporary diagnostics, mirroring the inbound dump above, so the
+            // bytes the client actually receives can be compared against a known-good build.
+            // Remove before any PR.
+            {
+                // HERMES_256_DUMPLEN raises the cap so a whole create block can be decoded
+                // against our own field map. 128 bytes stops inside the movement block and
+                // never reaches UnitData, which is where every remaining fault lives.
+                int dumpLength = System.Math.Min(data.Length, s_dumpLen);
+                Log.Print(LogType.Warn,
+                    $"[256-spike] world packet out: {universalOpcode} opcode=0x{opcode:X} " +
+                    $"bodyLen={data.Length} first{dumpLength}={System.Convert.ToHexString(data, 0, dumpLength)}");
+            }
 
             ByteBuffer buffer = new();
 
             int packetSize = data.Length;
             if (packetSize > 0x400 && _worldCrypt.IsInitialized)
             {
-                buffer.WriteInt32(packetSize + 2);
-                Span<byte> opcodeBytes = stackalloc byte[2];
-                System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(opcodeBytes, opcode);
+                buffer.WriteInt32(packetSize + (wideOpcode ? 4 : 2));
+                Span<byte> opcodeBytes = stackalloc byte[4];
+                if (wideOpcode)
+                    System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(opcodeBytes, opcode);
+                else
+                    System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(opcodeBytes, (ushort)opcode);
+                opcodeBytes = opcodeBytes[..(wideOpcode ? 4 : 2)];
                 buffer.WriteUInt32(Adler32.Update(Adler32.Update(0x9827D8F1, opcodeBytes), data.AsSpan(0, packetSize)));
 
                 byte[] compressedData;
-                uint compressedSize = CompressPacket(data, opcode, out compressedData);
+                uint compressedSize = CompressPacket(data, opcode, wideOpcode, out compressedData);
                 buffer.WriteUInt32(Adler32.Update(0x9827D8F1, compressedData.AsSpan(0, (int)compressedSize)));
                 buffer.WriteBytes(compressedData, compressedSize);
 
                 packetSize = (int)(compressedSize + 12);
-                opcode = (ushort)ModernVersion.GetCurrentOpcode(Opcode.SMSG_COMPRESSED_PACKET);
+                opcode = ModernVersion.GetCurrentOpcode(Opcode.SMSG_COMPRESSED_PACKET);
                 System.Diagnostics.Trace.Assert(opcode != 0);
 
                 data = buffer.GetData();
             }
 
             buffer = new ByteBuffer();
-            buffer.WriteUInt16(opcode);
+            if (wideOpcode)
+                buffer.WriteUInt32(opcode);
+            else
+                buffer.WriteUInt16((ushort)opcode);
             buffer.WriteBytes(data);
-            packetSize += 2 /*opcode*/;
+            packetSize += wideOpcode ? 4 : 2 /*opcode*/;
 
             data = buffer.GetData();
 
@@ -448,7 +579,7 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
         }
     }
 
-    public uint CompressPacket(byte[] data, ushort opcode, out byte[] outData)
+    public uint CompressPacket(byte[] data, uint opcode, bool wideOpcode, out byte[] outData)
     {
         // Drain the prior packet's output, then push opcode + body and flush. Flush()
         // on a compress-mode DeflateStream emits a Z_SYNC_FLUSH boundary (00 00 FF FF)
@@ -458,9 +589,12 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
         _compressBuffer!.SetLength(0);
         _compressBuffer.Position = 0;
 
-        Span<byte> hdr = stackalloc byte[2];
-        System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(hdr, opcode);
-        _deflater!.Write(hdr);
+        Span<byte> hdr = stackalloc byte[4];
+        if (wideOpcode)
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(hdr, opcode);
+        else
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(hdr, (ushort)opcode);
+        _deflater!.Write(hdr[..(wideOpcode ? 4 : 2)]);
         _deflater.Write(data);
         _deflater.Flush();
 
@@ -494,7 +628,19 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
 
     void HandleAuthSession(AuthSession authSession)
     {
-        _globalSession = BnetSessionTicketStorage.SessionsByName[authSession.RealmJoinTicket];
+        // A ticket the storage cannot resolve used to throw KeyNotFoundException here, which took
+        // down the whole proxy rather than just this connection.
+        if (!BnetSessionTicketStorage.TryGetSessionByJoinTicket(authSession.RealmJoinTicket, out var resolvedSession))
+        {
+            Log.Print(LogType.Error,
+                $"WorldSocket.HandleAuthSession: no session for realm join ticket " +
+                $"'{authSession.RealmJoinTicket}' (length {authSession.RealmJoinTicket.Length}). " +
+                $"Known tickets: [{string.Join(", ", BnetSessionTicketStorage.SessionsByName.Keys)}]");
+            CloseSocket();
+            return;
+        }
+
+        _globalSession = resolvedSession!;
         _bnetRpc = new BnetServices.ServiceManager("WorldSocket", this, _globalSession);
         HandleAuthSessionCallback(authSession);
     }
@@ -514,18 +660,48 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
         // For hook purposes, we get Remoteaddress at this point.
         var address = GetRemoteIpAddress();
 
+        // FIXME(256-spike): temporary diagnostics. Remove before any PR. Prints key material for
+        // the same reason as the capture in AuthenticationV2 — these are the four inputs to the
+        // client's Digest, and with them the build auth key can be recovered offline by searching
+        // the client binary. Recovering it turns Digest into an oracle that decides whether
+        // keyData is built correctly, without having to guess and re-login.
+        Log.Print(LogType.Warn,
+            $"[256-spike] CAPTURE keyData={System.Convert.ToHexString(GetSession().SessionKey)}");
+        Log.Print(LogType.Warn,
+            $"[256-spike] CAPTURE serverChallenge={System.Convert.ToHexString(_serverChallenge)}");
+        Log.Print(LogType.Warn,
+            $"[256-spike] CAPTURE localChallenge={System.Convert.ToHexString(authSession.LocalChallenge)}");
+        Log.Print(LogType.Warn,
+            $"[256-spike] CAPTURE digest={System.Convert.ToHexString(authSession.Digest)}");
+
         bool TrySeed(byte[] seed)
         {
-            Sha256 digestKeyHash = new();
-            digestKeyHash.Process(GetSession().SessionKey, GetSession().SessionKey.Length);
-            digestKeyHash.Finish(seed);
-            HmacSha256 hmac = new(digestKeyHash.Digest!);
-            hmac.Process(authSession.LocalChallenge, authSession.LocalChallenge.Length);
-            hmac.Process(_serverChallenge, 16);
-            hmac.Finish(AuthCheckSeed, 16);
+            byte[] digest;
+            if (ModernVersion.Uses550Engine)
+            {
+                Sha512 digestKeyHash = new();
+                digestKeyHash.Process(GetSession().SessionKey, GetSession().SessionKey.Length);
+                digestKeyHash.Finish(seed);
+                HmacSha512 hmac = new(digestKeyHash.Digest!);
+                hmac.Process(authSession.LocalChallenge, authSession.LocalChallenge.Length);
+                hmac.Process(_serverChallenge, _serverChallenge.Length);
+                hmac.Finish(AuthCheckSeed512, AuthCheckSeed512.Length);
+                digest = hmac.Digest!;
+            }
+            else
+            {
+                Sha256 digestKeyHash = new();
+                digestKeyHash.Process(GetSession().SessionKey, GetSession().SessionKey.Length);
+                digestKeyHash.Finish(seed);
+                HmacSha256 hmac = new(digestKeyHash.Digest!);
+                hmac.Process(authSession.LocalChallenge, authSession.LocalChallenge.Length);
+                hmac.Process(_serverChallenge, _serverChallenge.Length);
+                hmac.Finish(AuthCheckSeed, 16);
+                digest = hmac.Digest!;
+            }
 
-            // Check that Key and account name are the same on client and server
-            return hmac.Digest!.Compare(authSession.Digest);
+            // The client truncates its digest to 24 bytes; compare only what it sent.
+            return digest.AsSpan(0, authSession.Digest.Length).SequenceEqual(authSession.Digest);
         }
 
         if (GetSession().OS != "Wn64" && GetSession().OS != "Mc64" && GetSession().OS != "MacA" /*TODO what is windows arm?*/)
@@ -564,25 +740,122 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
             }
         }
 
-        Sha256 keyData = new();
-        keyData.Finish(GetSession().SessionKey);
+        // FIXME(256-spike): decisive keyData probe. The digest check above is bypassed for lack of a
+        // per-build auth key, so we never actually confirm our keyData matches the client's. But
+        // encryptKey — the value the client verifies our signature over — depends ONLY on keyData +
+        // the two challenges, never on the build key. So if this build appends an EMPTY per-build key
+        // (i.e. digest keyed on SHA512(keyData) alone), the client's digest will match on emptyKey
+        // below, proving keyData is correct and pointing the ack failure at the signing itself rather
+        // than the key. A miss on every variant points back at keyData (handoff H2).
+        if (ModernVersion.Uses550Engine)
+        {
+            // Recompute the client's digest for an arbitrary keyData candidate with an EMPTY per-build
+            // key, and test both challenge orderings. A match identifies the true world keyData.
+            bool TryKeyData(byte[] keyData, bool localFirst)
+            {
+                Sha512 dk = new();
+                dk.Process(keyData, keyData.Length);
+                dk.Finish(Array.Empty<byte>());
+                HmacSha512 h = new(dk.Digest!);
+                if (localFirst)
+                {
+                    h.Process(authSession.LocalChallenge, authSession.LocalChallenge.Length);
+                    h.Process(_serverChallenge, _serverChallenge.Length);
+                }
+                else
+                {
+                    h.Process(_serverChallenge, _serverChallenge.Length);
+                    h.Process(authSession.LocalChallenge, authSession.LocalChallenge.Length);
+                }
+                h.Finish(AuthCheckSeed512, AuthCheckSeed512.Length);
+                return h.Digest!.AsSpan(0, authSession.Digest.Length).SequenceEqual(authSession.Digest);
+            }
 
-        HmacSha256 sessionKeyHmac = new(keyData.Digest!);
-        sessionKeyHmac.Process(_serverChallenge, 16);
-        sessionKeyHmac.Process(authSession.LocalChallenge, authSession.LocalChallenge.Length);
-        sessionKeyHmac.Finish(SessionKeySeed, 16);
+            byte[] joinKey = GetSession().BnetSessionKeyFromJoin ?? Array.Empty<byte>();
+            Log.Print(LogType.Warn,
+                $"[256-spike] digest probe: emptyKey={TrySeed(Array.Empty<byte>())}, " +
+                $"platformSeed={(platformSeed != null && TrySeed(platformSeed))}, " +
+                $"fallback={TrySeed(buildInfo.FallbackStaticSeed)}");
+            Log.Print(LogType.Warn,
+                $"[256-spike] keyData candidates vs clientDigest: " +
+                $"secretPair(LF)={TryKeyData(GetSession().SessionKey, true)}, " +
+                $"secretPair(SF)={TryKeyData(GetSession().SessionKey, false)}, " +
+                $"bnetKey(LF)={(joinKey.Length > 0 && TryKeyData(joinKey, true))}, " +
+                $"bnetKey(SF)={(joinKey.Length > 0 && TryKeyData(joinKey, false))}");
 
+            // Raw input dump for offline brute-force (local private server, debug only).
+            Log.Print(LogType.Warn,
+                $"[256-spike] RAW keyData={Convert.ToHexString(GetSession().SessionKey)} " +
+                $"bnetKey={Convert.ToHexString(joinKey)} " +
+                $"serverChallenge={Convert.ToHexString(_serverChallenge)} " +
+                $"localChallenge={Convert.ToHexString(authSession.LocalChallenge)} " +
+                $"clientDigest={Convert.ToHexString(authSession.Digest)}");
+        }
+
+        // The 5.5.0-generation engine runs the same schedule on SHA-512, seeded differently, and
+        // ends with a 32-byte AES key instead of 16.
         _sessionKey = new byte[40];
-        var sessionKeyGenerator = new SessionKeyGenerator(sessionKeyHmac.Digest!, 32);
-        sessionKeyGenerator.Generate(_sessionKey, 40);
+        byte[] encryptKeyDigest;
+        if (ModernVersion.Uses550Engine)
+        {
+            Sha512 keyData = new();
+            keyData.Finish(GetSession().SessionKey);
 
-        HmacSha256 encryptKeyGen = new(_sessionKey);
-        encryptKeyGen.Process(authSession.LocalChallenge, authSession.LocalChallenge.Length);
-        encryptKeyGen.Process(_serverChallenge, 16);
-        encryptKeyGen.Finish(EncryptionKeySeed, 16);
+            HmacSha512 sessionKeyHmac = new(keyData.Digest!);
+            sessionKeyHmac.Process(_serverChallenge, _serverChallenge.Length);
+            sessionKeyHmac.Process(authSession.LocalChallenge, authSession.LocalChallenge.Length);
+            sessionKeyHmac.Finish(SessionKeySeed512, SessionKeySeed512.Length);
 
-        // only first 16 bytes of the hmac are used
-        Buffer.BlockCopy(encryptKeyGen.Digest!, 0, _encryptKey, 0, 16);
+            new SessionKeyGenerator(sessionKeyHmac.Digest!, sessionKeyHmac.Digest!.Length, sha512: true)
+                .Generate(_sessionKey, 40);
+
+            HmacSha512 encryptKeyGen = new(_sessionKey);
+            encryptKeyGen.Process(authSession.LocalChallenge, authSession.LocalChallenge.Length);
+            encryptKeyGen.Process(_serverChallenge, _serverChallenge.Length);
+            encryptKeyGen.Finish(EncryptionKeySeed512, EncryptionKeySeed512.Length);
+            encryptKeyDigest = encryptKeyGen.Digest!;
+        }
+        else
+        {
+            Sha256 keyData = new();
+            keyData.Finish(GetSession().SessionKey);
+
+            HmacSha256 sessionKeyHmac = new(keyData.Digest!);
+            sessionKeyHmac.Process(_serverChallenge, _serverChallenge.Length);
+            sessionKeyHmac.Process(authSession.LocalChallenge, authSession.LocalChallenge.Length);
+            sessionKeyHmac.Finish(SessionKeySeed, 16);
+
+            new SessionKeyGenerator(sessionKeyHmac.Digest!, 32).Generate(_sessionKey, 40);
+
+            HmacSha256 encryptKeyGen = new(_sessionKey);
+            encryptKeyGen.Process(authSession.LocalChallenge, authSession.LocalChallenge.Length);
+            encryptKeyGen.Process(_serverChallenge, _serverChallenge.Length);
+            encryptKeyGen.Finish(EncryptionKeySeed, 16);
+            encryptKeyDigest = encryptKeyGen.Digest!;
+        }
+
+        // Only the leading bytes of the hmac are used.
+        Buffer.BlockCopy(encryptKeyDigest, 0, _encryptKey, 0, _encryptKey.Length);
+
+        // FIXME(256-spike): dump encryptKey so the Ed25519 signature over it can be verified offline
+        // against the client's baked-in public key. Confirms our signing is internally consistent;
+        // if it verifies, the ack failure is a keyData/model mismatch, not a signing bug.
+        if (ModernVersion.Uses550Engine)
+            Log.Print(LogType.Warn, $"[256-spike] encryptKey={Convert.ToHexString(_encryptKey)}");
+
+        // FIXME(256-spike): temporary diagnostics. Remove before any PR. Lengths and a zero-check
+        // only — never the key material. The client verifies a signature over the encryption key,
+        // so a wrong length or an all-zero input here explains a silent refusal to ack.
+        {
+            byte[] keyData = GetSession().SessionKey;
+            bool keyDataZero = true;
+            foreach (byte b in keyData)
+                if (b != 0) { keyDataZero = false; break; }
+            Log.Print(LogType.Warn,
+                $"[256-spike] key schedule: keyData={keyData.Length} bytes (allZero={keyDataZero}), " +
+                $"serverChallenge={_serverChallenge.Length}, localChallenge={authSession.LocalChallenge.Length}, " +
+                $"digest={authSession.Digest.Length}, sessionKey={_sessionKey.Length}, encryptKey={_encryptKey.Length}");
+        }
 
         GetSession().SessionKey = _sessionKey;
 
@@ -600,7 +873,118 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
             return;
         }
 
-        SendPacket(new EnterEncryptedMode(_encryptKey, true));
+        // FIXME(256-spike): temporary probe. Remove before any PR.
+        //
+        // The client resolves RegionGroup against an internal table before it will even check the
+        // signature, and a miss is silent — it keeps pinging and never acknowledges. Which ids are
+        // valid is not knowable from the binary (the table is built at runtime), so walk a range
+        // and let the client tell us: the ack stops the walk, and the last value sent is the
+        // answer. Safe to send repeatedly precisely because a miss is a no-op for the client.
+        // FIXME(256-spike): temporary probe. Remove before any PR.
+        //
+        // 0x4D0003 for SMSG_ENTER_ENCRYPTED_MODE is derived from 12.0.0's table, not measured. The
+        // client's own handler table puts the encrypted-mode handler seven slots from the
+        // SMSG_AUTH_CHALLENGE handler, and AUTH_CHALLENGE is confirmed to be index 0 — so index 3
+        // is unlikely to be right. A wrong opcode looks exactly like everything else we have seen:
+        // the client neither answers nor disconnects. Walk the group and let it tell us.
+        // FIXME(256-spike): temporary probe. Remove before any PR.
+        //
+        // Opcodes 0x4D0000-3 leave the connection alive while 4-7 drop it, which reads as "the
+        // client knows these four and rejects the rest". Silence on an opcode it knows points at
+        // the packet being discarded before dispatch — most likely on size, since 69 bytes is the
+        // only body we have ever sent. So walk opcode x layout instead: the surviving opcodes let
+        // several variants go out in a single session.
+        string? matrix = Environment.GetEnvironmentVariable("HERMES_ENC_MATRIX");
+        if (!string.IsNullOrEmpty(matrix))
+        {
+            var wires = new System.Collections.Generic.List<uint>();
+            foreach (var part in matrix.Split(','))
+                wires.Add(System.Convert.ToUInt32(part.Trim(), 16));
+            string[] layouts = { "before", "after", "none" };
+            int region = int.TryParse(Environment.GetEnvironmentVariable("HERMES_ENC_REGION"), out var mr) ? mr : 0;
+
+            _ = System.Threading.Tasks.Task.Run(async () =>
+            {
+                foreach (uint wire in wires)
+                {
+                    foreach (string layout in layouts)
+                    {
+                        if (_encryptedModeAcked) return;
+                        Log.Print(LogType.Warn,
+                            $"[256-spike] probing opcode 0x{wire:X6} layout={layout} " +
+                            $"({(layout == "none" ? 65 : 69)} bytes)");
+                        SendPacket(new EnterEncryptedMode(_encryptKey, true, region, layout), wire);
+                        await System.Threading.Tasks.Task.Delay(900);
+                    }
+                }
+
+                if (!_encryptedModeAcked)
+                    Log.Print(LogType.Warn, "[256-spike] matrix finished with no acknowledgement");
+            });
+            return;
+        }
+
+        string? opcodeSweep = Environment.GetEnvironmentVariable("HERMES_ENC_OPCODE_SWEEP");
+        if (!string.IsNullOrEmpty(opcodeSweep))
+        {
+            // A comma-separated list, not a range: one opcode in this group is already known to
+            // close the socket, which would end the walk before the untested ones are reached.
+            var candidates = new System.Collections.Generic.List<uint>();
+            foreach (var part in opcodeSweep.Split(','))
+                candidates.Add(System.Convert.ToUInt32(part.Trim(), 16));
+            int region = int.TryParse(Environment.GetEnvironmentVariable("HERMES_ENC_REGION"), out var rg) ? rg : 0;
+            _ = System.Threading.Tasks.Task.Run(async () =>
+            {
+                foreach (uint wire in candidates)
+                {
+                    if (_encryptedModeAcked) break;
+                    Log.Print(LogType.Warn, $"[256-spike] probing opcode 0x{wire:X6} (RegionGroup={region})");
+                    SendPacket(new EnterEncryptedMode(_encryptKey, true, region), wire);
+                    await System.Threading.Tasks.Task.Delay(900);
+                }
+
+                if (!_encryptedModeAcked)
+                    Log.Print(LogType.Warn, "[256-spike] opcode sweep finished with no acknowledgement");
+            });
+            return;
+        }
+
+        string? sweep = Environment.GetEnvironmentVariable("HERMES_ENC_REGION_SWEEP");
+        if (!string.IsNullOrEmpty(sweep))
+        {
+            var bounds = sweep.Split('-');
+            int from = int.Parse(bounds[0]);
+            int to = bounds.Length > 1 ? int.Parse(bounds[1]) : from;
+            _ = System.Threading.Tasks.Task.Run(async () =>
+            {
+                for (int region = from; region <= to && !_encryptedModeAcked; region++)
+                {
+                    // The opcode is the other unknown, and the two are coupled: the region lookup
+                    // happens inside the handler, so probing one while the other is wrong can never
+                    // succeed. Pin the opcode here so this sweep varies exactly one thing.
+                    uint wire = uint.TryParse(Environment.GetEnvironmentVariable("HERMES_ENC_OPCODE"),
+                        System.Globalization.NumberStyles.HexNumber, null, out var w) ? w : 0;
+                    Log.Print(LogType.Warn, $"[256-spike] probing RegionGroup={region} (opcode 0x{(wire != 0 ? wire : 0x4D0003):X6})");
+                    SendPacket(new EnterEncryptedMode(_encryptKey, true, region), wire);
+                    await System.Threading.Tasks.Task.Delay(900);
+                }
+
+                if (!_encryptedModeAcked)
+                    Log.Print(LogType.Warn, "[256-spike] region sweep finished with no acknowledgement");
+            });
+            return;
+        }
+
+        int single = int.TryParse(Environment.GetEnvironmentVariable("HERMES_ENC_REGION"), out var r) ? r : 0;
+
+        // FIXME(256-spike): temporary. Remove before any PR.
+        //
+        // The client verifies the signature, then — only when Enabled is set — makes a virtual call
+        // and disconnects with reason 3 if it returns 1. With Enabled clear it skips that check
+        // entirely and falls through to the normal continuation, so this tells us whether anything
+        // past the signature is still wrong.
+        bool enabled = Environment.GetEnvironmentVariable("HERMES_ENC_ENABLED") != "0";
+        SendPacket(new EnterEncryptedMode(_encryptKey, enabled, single));
     }
 
     public struct ConnectToKey
@@ -648,26 +1032,53 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
         string login = GetSession().AccountInfo.Login;
         _sessionKey = GetSession().SessionKey;
 
-        HmacSha256 hmac = new(_sessionKey);
-        hmac.Process(BitConverter.GetBytes(authSession.Key), 8);
-        hmac.Process(authSession.LocalChallenge, authSession.LocalChallenge.Length);
-        hmac.Process(_serverChallenge, 16);
-        hmac.Finish(ContinuedSessionSeed, 16);
+        byte[] continuedDigest;
+        if (ModernVersion.Uses550Engine)
+        {
+            HmacSha512 hmac512 = new(_sessionKey);
+            hmac512.Process(BitConverter.GetBytes(authSession.Key), 8);
+            hmac512.Process(authSession.LocalChallenge, authSession.LocalChallenge.Length);
+            hmac512.Process(_serverChallenge, _serverChallenge.Length);
+            hmac512.Finish(ContinuedSessionSeed512, ContinuedSessionSeed512.Length);
+            continuedDigest = hmac512.Digest!;
+        }
+        else
+        {
+            HmacSha256 hmac = new(_sessionKey);
+            hmac.Process(BitConverter.GetBytes(authSession.Key), 8);
+            hmac.Process(authSession.LocalChallenge, authSession.LocalChallenge.Length);
+            hmac.Process(_serverChallenge, _serverChallenge.Length);
+            hmac.Finish(ContinuedSessionSeed, 16);
+            continuedDigest = hmac.Digest!;
+        }
 
-        if (!hmac.Digest!.Compare(authSession.Digest))
+        if (!continuedDigest.AsSpan(0, authSession.Digest.Length).SequenceEqual(authSession.Digest))
         {
             Log.Print(LogType.Error, $"WorldSocket.HandleAuthContinuedSession: Authentication failed for account: {accountId} ('{login}') address: {GetRemoteIpAddress()}");
             CloseSocket();
             return;
         }
 
-        HmacSha256 encryptKeyGen = new(_sessionKey);
-        encryptKeyGen.Process(authSession.LocalChallenge, authSession.LocalChallenge.Length);
-        encryptKeyGen.Process(_serverChallenge, 16);
-        encryptKeyGen.Finish(EncryptionKeySeed, 16);
+        byte[] continuedKeyDigest;
+        if (ModernVersion.Uses550Engine)
+        {
+            HmacSha512 encryptKeyGen512 = new(_sessionKey);
+            encryptKeyGen512.Process(authSession.LocalChallenge, authSession.LocalChallenge.Length);
+            encryptKeyGen512.Process(_serverChallenge, _serverChallenge.Length);
+            encryptKeyGen512.Finish(EncryptionKeySeed512, EncryptionKeySeed512.Length);
+            continuedKeyDigest = encryptKeyGen512.Digest!;
+        }
+        else
+        {
+            HmacSha256 encryptKeyGen = new(_sessionKey);
+            encryptKeyGen.Process(authSession.LocalChallenge, authSession.LocalChallenge.Length);
+            encryptKeyGen.Process(_serverChallenge, _serverChallenge.Length);
+            encryptKeyGen.Finish(EncryptionKeySeed, 16);
+            continuedKeyDigest = encryptKeyGen.Digest!;
+        }
 
-        // only first 16 bytes of the hmac are used
-        Buffer.BlockCopy(encryptKeyGen.Digest!, 0, _encryptKey, 0, 16);
+        // Only the leading bytes of the hmac are used.
+        Buffer.BlockCopy(continuedKeyDigest, 0, _encryptKey, 0, _encryptKey.Length);
 
         SendPacket(new EnterEncryptedMode(_encryptKey, true));
     }
@@ -688,6 +1099,7 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
         connectTo.Serial = serial;
         connectTo.Payload.Port = (ushort)_instancePort;
         connectTo.Con = (byte)ConnectionType.Instance;
+        connectTo.NativeRealmAddress = GetSession().RealmId.GetAddress();
 
         if (instanceAddress.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
         {
@@ -748,19 +1160,81 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
         }
     }
 
+    volatile bool _encryptedModeAcked;
+
     void HandleEnterEncryptedModeAck()
     {
+        // FIXME(256-spike): temporary, paired with the region probe above. Remove before any PR.
+        _encryptedModeAcked = true;
+        Log.Print(LogType.Warn, "[256-spike] client acknowledged encrypted mode");
+
         _worldCrypt.Initialize(_encryptKey);
         if (_connectType == ConnectionType.Realm)
         {
             SendAuthResponse(BattlenetRpcErrorCode.Ok, GetSession().WorldClient!.GetQueuePosition());
-            SendSetTimeZoneInformation();
+
+            // FIXME(256-spike): the glue-screen extras are suppressed on the 5.5.0 generation until
+            // each one's body is verified against that generation's layout. They are optional —
+            // they carry store/feature flags and a cache version, none of which the character list
+            // depends on — but several of them contain array counts, and a count read from the
+            // wrong offset makes the client allocate against a garbage length and abort. Send only
+            // what character select actually needs, then reinstate them one at a time.
+            // FIXME(256-spike): the glue-screen feature block is off again. Bisected: with it the
+            // client dies on a null dereference, without it the character list arrives intact and
+            // the screen merely stays black — and an empty character list crashes identically, so
+            // the per-character record is not involved. Its 5.5.0 body still has a wrong field
+            // somewhere among ~44 gated bits.
+            //
+            // The two trivial ones are back on: a lone uint32 and a lone byte cannot carry a
+            // mis-sized length, so they are safe to test and may be what the glue screen was
+            // actually waiting for.
+            // Every glue-screen extra tried so far — the feature block, the cache version, the
+            // Battle.net connection state — produces the same null dereference at RVA 0x2DF25DA,
+            // while sending none of them does not. The last two are a bare uint32 and a bare byte,
+            // so their bodies cannot be at fault: their opcodes are derived, never verified, and a
+            // wrong one lands the message in a handler that expects something else.
+            // The glue-screen feature block is sent again. It crashed the client before, but that
+            // was the wrong opcode (0x460063 is the in-game variant on this build) combined with a
+            // guessed body; both now come from the client's own parser. The character list arrives
+            // intact without it and the screen still stays black, which is what a client that never
+            // received its glue-screen configuration looks like.
             SendFeatureSystemStatusGlueScreen();
-            SendClientCacheVersion(0);
-            SendAvailableHotfixes();
+
+            // Without this the client's in-game Battle.net link never comes up. Its own glue log
+            // shows "Connected to Back", then exactly 30 seconds later "Session with Battle.net
+            // destroyed" followed by "Disconnected from WoW" — which is the disconnect we kept
+            // seeing, and it is unrelated to the world socket.
             SendBnetConnectionState(1);
+
+            // The client stages its startup around hotfixes ("Initial Hotfixes: Requested /
+            // Received / Applied" in its own strings) and CypherCore sends this too. An empty list
+            // is a valid answer and lets that stage complete.
+            SendAvailableHotfixes();
+
+            // ...but an empty list also means the client never sends CMSG_HOTFIX_REQUEST, so it
+            // never receives hotfix data, never runs "ApplyingHotfixes from Cache", and never logs
+            // "Done applying initial hotfixes". That last step is what advances the client's state
+            // machine to 3, which is the only thing that flips the two flags the glue callback at
+            // RVA 0x1EFAE0 tests before it will hand the character list to the UI. Sending an empty
+            // hotfix set unprompted closes that loop.
+            SendEmptyHotfixConnect();
+
+            // Next in CypherCore's glue sequence, and its opcode and body are now both read from
+            // the client rather than derived.
+            SendSetTimeZoneInformation();
+
+            if (!ModernVersion.Uses550Engine)
+            {
+                SendClientCacheVersion(0);
+            }
             GetSession().AccountDataMgr = new AccountDataManager(GetSession().Username, GetSession().RealmManager.GetRealm(_realmId)!.Name);
             GetSession().RealmSocket = this;
+
+            // CypherCore sends this at the glue screen, before any character is chosen, and the
+            // client has a "Store Account Data request %d finished" log line right next to its glue
+            // code. We only ever sent it reactively, when the legacy core happened to.
+            if (ModernVersion.Uses550Engine)
+                SendAccountDataTimes();
 
             // Flush any Realm-destined packets the legacy WorldClient queued before this
             // socket was ready. See WorldClient.SendPacketToClientDirect for the producer.
@@ -942,6 +1416,7 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
         SetTimeZoneInformation packet = new();
         packet.ServerTimeTZ = "Europe/Paris";
         packet.GameTimeTZ = "Europe/Paris";
+        packet.ServerRegionalTimeTZ = "Europe/Paris";
 
         SendPacket(packet);//enabled it
     }
@@ -973,8 +1448,48 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
         SendPacket(features);
     }
 
+    /// <summary>
+    /// Messages whose body we build shorter than this build's client reads for that opcode. Each is
+    /// a crash waiting to happen, and two of them already fired today. Holding them back loses the
+    /// feature and keeps the session. HERMES_256_NOGUARD=1 sends them anyway.
+    /// </summary>
+    static readonly System.Collections.Frozen.FrozenSet<Opcode> s_underSized =
+        System.Collections.Frozen.FrozenSet.ToFrozenSet(new[]
+        {
+            // Released once their numbers were corrected: SMSG_ATTACK_START (0x4C001B) and
+            // SMSG_AI_REACTION (0x460163) both over-send at the right slot, and over-sending cannot
+            // fault. They were never too short - they were pointed at the wrong reader.
+            // Gate rates this FATAL: a packed guid at token 29 cannot complete against the captured
+            // body. The capture is from the old writer at the old opcode, so it is very likely a
+            // stale row - but the criterion is the one that has predicted every crash so far, and
+            // this fires 153x a session. Remove once one session's capture clears it.
+            Opcode.SMSG_SPELL_START,
+            Opcode.SMSG_MAIL_QUERY_NEXT_TIME_RESULT,   // number known (0x460205) but the body is 8
+                                                       // bytes against a 26-byte minimum; move both
+                                                       // together or the gate stays red
+            Opcode.SMSG_SET_DUNGEON_DIFFICULTY,        // no known correct number; 5.5.0's +15 slot
+                                                       // reads u8,u8,string and this is one int32
+        });
+
+    static readonly bool s_noSendGuard =
+        System.Environment.GetEnvironmentVariable("HERMES_256_NOGUARD") == "1";
+
     public void SendFeatureSystemStatus()
     {
+        // The 5.5.0 body in FeatureSystemStatus.Write550 is now derived from the client binary
+        // itself (reader at RVA 0x5A7830, both derivations in REFERENCE-256-CLIENT.md sections
+        // 89/106 agree), not from WowPacketParser - the parser-transcribed bodies are what
+        // crashed the client three times. It goes out by default; HERMES_256_NOFEATURES=1
+        // restores the suppression if it misbehaves. A successful test: unset the variable,
+        // log in with the 2.5.6 client, and enter the world - the client must neither crash
+        // during loading (wrong size -> null deref in the packed-guid assembler at RVA
+        // 0x2DF25DA) nor hang or drop features visibly worse than with the packet withheld.
+        if (ModernVersion.Uses550Engine
+            && System.Environment.GetEnvironmentVariable("HERMES_256_NOFEATURES") == "1")
+        {
+            return;
+        }
+
         FeatureSystemStatus features = new();
         features.ComplaintStatus = 2;
         features.ScrollOfResurrectionRequestsRemaining = 1;
@@ -1063,6 +1578,16 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
         SendPacket(cache);
     }
 
+    /// <summary>
+    /// Sends SMSG_HOTFIX_CONNECT with no records, to complete the client's initial hotfix stage
+    /// even though there is nothing to apply. Normally this is only sent in reply to
+    /// CMSG_HOTFIX_REQUEST, which the client never sends when the available-hotfix list is empty.
+    /// </summary>
+    public void SendEmptyHotfixConnect()
+    {
+        SendPacket(new HotfixConnect());
+    }
+
     public void SendAvailableHotfixes()
     {
         AvailableHotfixes hotfixes = new AvailableHotfixes();
@@ -1100,6 +1625,8 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
     {
         System.Diagnostics.Trace.Assert(_connectType == ConnectionType.Realm);
 
+        // At the glue screen no character is selected yet, so this runs with an empty guid —
+        // which is what CypherCore sends there too.
         WowGuid128 guid = GetSession().GameState.CurrentPlayerGuid;
         GetSession().AccountDataMgr.LoadAllData(guid);
 

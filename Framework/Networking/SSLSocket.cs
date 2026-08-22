@@ -22,6 +22,7 @@ using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Authentication;
 using System.Security.Cryptography.X509Certificates;
+using System.IO;
 using System.Threading.Tasks;
 
 namespace Framework.Networking;
@@ -29,7 +30,10 @@ namespace Framework.Networking;
 public abstract class SSLSocket : ISocket, IDisposable
 {
     Socket _socket;
-    internal SslStream _stream;
+    // Active transport. Starts out as the raw NetworkStream and is swapped for an SslStream by
+    // AsyncHandshake. Connections that serve plaintext (see AcceptPlaintext) keep the raw stream.
+    internal Stream _stream;
+    NetworkStream _networkStream;
     IPEndPoint? _remoteEndPoint;
     byte[]? _receiveBuffer;
 
@@ -39,7 +43,8 @@ public abstract class SSLSocket : ISocket, IDisposable
         _remoteEndPoint = _socket.RemoteEndPoint as IPEndPoint;
         _receiveBuffer = new byte[ushort.MaxValue];
 
-        _stream = new SslStream(new NetworkStream(socket), false);
+        _networkStream = new NetworkStream(socket);
+        _stream = _networkStream;
     }
 
     public virtual void Dispose()
@@ -83,11 +88,23 @@ public abstract class SSLSocket : ISocket, IDisposable
         }
     }
 
+    /// <summary>
+    /// Begins reading without a TLS handshake. Used by endpoints that must be reachable by
+    /// clients which refuse a self-signed certificate.
+    /// </summary>
+    public Task AcceptPlaintext()
+    {
+        return AsyncRead();
+    }
+
     public async Task AsyncHandshake(X509Certificate2 certificate)
     {
+        var sslStream = new SslStream(_networkStream, false);
+        _stream = sslStream;
+
         try
         {
-            await _stream.AuthenticateAsServerAsync(certificate, false, SslProtocols.Tls12, false);
+            await sslStream.AuthenticateAsServerAsync(certificate, false, SslProtocols.Tls12, false);
         }
         catch(Exception ex)
         {

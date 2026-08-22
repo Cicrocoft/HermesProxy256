@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Copyright (C) 2012-2020 CypherCore <http://github.com/CypherCore>
  * Copyright (C) 2012-2014 Arctium Emulation <http://arctium.org>
  *
@@ -44,6 +44,55 @@ public sealed class Sha256 : IDisposable
     }
 
     public void Finish(byte[] finalBlock) => Finish(finalBlock.AsSpan());
+
+    public byte[]? Digest { get; private set; }
+
+    public void Dispose() => _hash.Dispose();
+}
+
+public sealed class Sha512 : IDisposable
+{
+    private readonly IncrementalHash _hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA512);
+
+    public void Process(ReadOnlySpan<byte> data) => _hash.AppendData(data);
+
+    public void Process(byte[] data, int length) => _hash.AppendData(data.AsSpan(0, length));
+
+    public void Finish(ReadOnlySpan<byte> finalBlock)
+    {
+        _hash.AppendData(finalBlock);
+        Digest = _hash.GetHashAndReset();
+    }
+
+    public void Finish(byte[] finalBlock) => Finish(finalBlock.AsSpan());
+
+    public byte[]? Digest { get; private set; }
+
+    public void Dispose() => _hash.Dispose();
+}
+
+public sealed class HmacSha512 : IDisposable
+{
+    private readonly IncrementalHash _hash;
+
+    public HmacSha512(ReadOnlySpan<byte> key)
+    {
+        _hash = IncrementalHash.CreateHMAC(HashAlgorithmName.SHA512, key);
+    }
+
+    public HmacSha512(byte[] key) : this(key.AsSpan()) { }
+
+    public void Process(ReadOnlySpan<byte> data) => _hash.AppendData(data);
+
+    public void Process(byte[] data, int length) => _hash.AppendData(data.AsSpan(0, length));
+
+    public void Finish(ReadOnlySpan<byte> finalBlock)
+    {
+        _hash.AppendData(finalBlock);
+        Digest = _hash.GetHashAndReset();
+    }
+
+    public void Finish(byte[] finalBlock, int length) => Finish(finalBlock.AsSpan(0, length));
 
     public byte[]? Digest { get; private set; }
 

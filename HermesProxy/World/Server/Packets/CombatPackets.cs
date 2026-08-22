@@ -133,9 +133,14 @@ class AttackerStateUpdate : ServerPacket
         attackRoundInfo.WriteInt32(Damage);
         attackRoundInfo.WriteInt32(OriginalDamage);
         attackRoundInfo.WriteInt32(OverDamage);
-        attackRoundInfo.WriteUInt8((byte)SubDmg.Count);
+        // 5.5.x reads this as a bool followed by at most one sub-damage entry
+        // (WowPacketParser 5.5.0 ReadAttackRoundInfo: ReadBool("HasSubDmg")). A count of
+        // two or more would desync everything after the first entry, so the 550 path caps
+        // it; multi-school white hits are a legacy rarity and lose only their extra rows.
+        var subDmgCount = ModernVersion.Uses550Engine ? Math.Min(SubDmg.Count, 1) : SubDmg.Count;
+        attackRoundInfo.WriteUInt8((byte)subDmgCount);
 
-        foreach (var subDmg in SubDmg)
+        foreach (var subDmg in SubDmg.GetRange(0, subDmgCount))
         {
             attackRoundInfo.WriteUInt32(subDmg.SchoolMask);
             attackRoundInfo.WriteFloat(subDmg.FloatDamage);
@@ -158,29 +163,63 @@ class AttackerStateUpdate : ServerPacket
 
         if (HitInfo.HasAnyFlag(HitInfo.Unk0))
         {
-            attackRoundInfo.WriteUInt32(UnkState.State1);
-            attackRoundInfo.WriteFloat(UnkState.State2);
-            attackRoundInfo.WriteFloat(UnkState.State3);
-            attackRoundInfo.WriteFloat(UnkState.State4);
-            attackRoundInfo.WriteFloat(UnkState.State5);
-            attackRoundInfo.WriteFloat(UnkState.State6);
-            attackRoundInfo.WriteFloat(UnkState.State7);
-            attackRoundInfo.WriteFloat(UnkState.State8);
-            attackRoundInfo.WriteFloat(UnkState.State9);
-            attackRoundInfo.WriteFloat(UnkState.State10);
-            attackRoundInfo.WriteFloat(UnkState.State11);
-            attackRoundInfo.WriteUInt32(UnkState.State12);
+            if (ModernVersion.Uses550Engine)
+            {
+                // 5.5.x debug block (WowPacketParser 5.5.0 ReadAttackRoundInfo): s32, eight
+                // floats, then five float pairs, then s32 — 20 values against 9.x's 12. The
+                // legacy translator only fills twelve, so the extra pair slots go out as zero.
+                attackRoundInfo.WriteUInt32(UnkState.State1);
+                attackRoundInfo.WriteFloat(UnkState.State2);
+                attackRoundInfo.WriteFloat(UnkState.State3);
+                attackRoundInfo.WriteFloat(UnkState.State4);
+                attackRoundInfo.WriteFloat(UnkState.State5);
+                attackRoundInfo.WriteFloat(UnkState.State6);
+                attackRoundInfo.WriteFloat(UnkState.State7);
+                attackRoundInfo.WriteFloat(UnkState.State8);
+                attackRoundInfo.WriteFloat(UnkState.State9);
+                attackRoundInfo.WriteFloat(UnkState.State10);
+                attackRoundInfo.WriteFloat(UnkState.State11);
+                for (int i = 0; i < 8; i++)
+                    attackRoundInfo.WriteFloat(0.0f);
+                attackRoundInfo.WriteUInt32(UnkState.State12);
+            }
+            else
+            {
+                attackRoundInfo.WriteUInt32(UnkState.State1);
+                attackRoundInfo.WriteFloat(UnkState.State2);
+                attackRoundInfo.WriteFloat(UnkState.State3);
+                attackRoundInfo.WriteFloat(UnkState.State4);
+                attackRoundInfo.WriteFloat(UnkState.State5);
+                attackRoundInfo.WriteFloat(UnkState.State6);
+                attackRoundInfo.WriteFloat(UnkState.State7);
+                attackRoundInfo.WriteFloat(UnkState.State8);
+                attackRoundInfo.WriteFloat(UnkState.State9);
+                attackRoundInfo.WriteFloat(UnkState.State10);
+                attackRoundInfo.WriteFloat(UnkState.State11);
+                attackRoundInfo.WriteUInt32(UnkState.State12);
+            }
         }
 
         if (HitInfo.HasAnyFlag(HitInfo.Block | HitInfo.Unk12))
             attackRoundInfo.WriteFloat(Unk);
 
-        attackRoundInfo.WriteUInt8((byte)ContentTuning.TuningType);
-        attackRoundInfo.WriteUInt8(ContentTuning.TargetLevel);
-        attackRoundInfo.WriteUInt8(ContentTuning.Expansion);
-        attackRoundInfo.WriteInt16(ContentTuning.PlayerLevelDelta);
-        attackRoundInfo.WriteFloat(ContentTuning.PlayerItemLevel);
-        attackRoundInfo.WriteFloat(ContentTuning.TargetItemLevel);
+        if (ModernVersion.Uses550Engine)
+        {
+            // 5.5.x ContentTuningParams: u16 PlayerItemLevel, s16 PlayerLevelDelta,
+            // u32 TargetItemLevel, five scaling bytes, then Type:4 + ScalesWithItemLevel:1
+            // bits — the shape ContentTuningParams.Write emits on this engine. The 9.x
+            // float-pair tail below does not exist in the 5.5.x reader.
+            ContentTuning.Write(attackRoundInfo);
+        }
+        else
+        {
+            attackRoundInfo.WriteUInt8((byte)ContentTuning.TuningType);
+            attackRoundInfo.WriteUInt8(ContentTuning.TargetLevel);
+            attackRoundInfo.WriteUInt8(ContentTuning.Expansion);
+            attackRoundInfo.WriteInt16(ContentTuning.PlayerLevelDelta);
+            attackRoundInfo.WriteFloat(ContentTuning.PlayerItemLevel);
+            attackRoundInfo.WriteFloat(ContentTuning.TargetItemLevel);
+        }
 
         _worldPacket.WriteBit(LogData != null);
         if (LogData != null)
@@ -242,6 +281,25 @@ public class SpellCastLogData
         data.WriteInt32(AttackPower);
         data.WriteInt32(SpellPower);
         data.WriteUInt32(Armor);
+
+        if (ModernVersion.Uses550Engine)
+        {
+            // 5.5.x (WowPacketParser 5.5.0 ReadSpellCastLogData): two extra int32s after
+            // Armor, and each power entry leads with a one-byte power type, not an int32.
+            data.WriteInt32(0);              // Unknown_1105_1
+            data.WriteInt32(0);              // Unknown_1105_2
+            data.WriteBits(PowerData.Count, 9);
+            data.FlushBits();
+
+            foreach (SpellLogPowerData powerData in PowerData)
+            {
+                data.WriteUInt8((byte)powerData.PowerType);
+                data.WriteInt32(powerData.Amount);
+                data.WriteInt32(powerData.Cost);
+            }
+            return;
+        }
+
         data.WriteBits(PowerData.Count, 9);
         data.FlushBits();
 

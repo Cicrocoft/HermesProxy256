@@ -69,6 +69,24 @@ public class MonsterMove : ServerPacket, ISpanWritable
     // If exceeded, WriteToSpan returns -1 to trigger fallback to Write()
     private const int MaxSplinePoints = 16;
 
+    /// <summary>
+    /// Emit SMSG_ON_MONSTER_MOVE in the 5.5.3 shape that the 69110 client actually reads, instead
+    /// of the current 5.5.0/9.x shape. Verified against the client's own reader: the group-0x5E
+    /// case at RVA 0x6F05BD -> spline body sub_66C220 reads Face as a full byte early (before
+    /// Elapsed), does the facing switch before the point count, reads PointsCount as two bytes
+    /// (Hi&lt;&lt;8 | Lo), carries an extra "SplineBitsUnused" bit, and has NO Destination Vector3.
+    /// This is an exact match for WowPacketParser V5_5_0_61735 ReadMovementSpline553, gated in WPP
+    /// on V5_5_3_64802 (69110 &gt; 64802). The current path emits Face as 2 bits, PointsCount as 16
+    /// bits, a spurious 12-byte Destination, and omits the turn/anim-tier bits. Default off (current
+    /// behaviour) because it is unverified on the wire; flip the default once one session with the
+    /// knob on loads the world and NPCs move without desync (this is the single most frequent
+    /// packet, ~32k/session, so a wrong field order breaks world entry). Only affects Uses550Engine.
+    /// </summary>
+    static readonly bool s_monsterMove553 =
+        System.Environment.GetEnvironmentVariable("HERMES_256_MONSTERMOVE") != "0";
+
+    private bool Use553Spline => ModernVersion.Uses550Engine && s_monsterMove553;
+
     public MonsterMove(WowGuid128 guid, ServerSideMovement moveSpline) : base(Opcode.SMSG_ON_MONSTER_MOVE, ConnectionType.Instance)
     {
         if (moveSpline.SplineFlags.HasFlag(SplineFlagModern.UncompressedPath))
@@ -109,6 +127,12 @@ public class MonsterMove : ServerPacket, ISpanWritable
 
     public override void Write()
     {
+        if (Use553Spline)
+        {
+            Write553(_worldPacket);
+            return;
+        }
+
         _worldPacket.WritePackedGuid128(MoverGUID);
         _worldPacket.WriteVector3(MoveSpline.StartPosition);
 
@@ -182,6 +206,77 @@ public class MonsterMove : ServerPacket, ISpanWritable
                 $"wire={_worldPacket.GetSize()}B");
     }
 
+    // SMSG_ON_MONSTER_MOVE in the 5.5.3 shape, verified field-for-field against the client's own
+    // reader (group-0x5E case 0x6F05BD -> spline body sub_66C220, == WPP V5_5_0_61735
+    // ReadMovementSpline553). Reached only through Write() when HERMES_256_MONSTERMOVE=1 and
+    // Uses550Engine; the span writer returns -1 to fall back here so the field order lives once.
+    private void Write553(WorldPacket data)
+    {
+        data.WritePackedGuid128(MoverGUID);
+        data.WriteVector3(MoveSpline.StartPosition);            // Position
+
+        // ReadMovementMonsterSpline: Id then the preamble bits. No Destination Vector3 on this arm.
+        data.WriteUInt32(MoveSpline.SplineId);                  // Id
+        data.WriteBit(false);                                   // CrzTeleport
+        data.WriteBit(false);                                   // StopUseFaceDirection
+        data.WriteBits(Points.Count == 0 ? 2 : 0, 3);          // StopDistanceTolerance
+        // The client reads these 5 bits as one byte (its next read is a u32, which byte-aligns).
+
+        // ReadMovementSpline553 body.
+        data.WriteUInt32((uint)MoveSpline.SplineFlags);         // Flags
+        data.WriteUInt8((byte)MoveSpline.SplineType);          // Face — a full byte on 5.5.3, read before Elapsed
+        data.WriteInt32(0);                                     // Elapsed
+        data.WriteUInt32(MoveSpline.SplineTimeFull);            // MoveTime
+        data.WriteUInt32(0);                                    // FadeObjectTime
+        data.WriteUInt8(MoveSpline.SplineMode);                 // Mode
+        data.WritePackedGuid128(MoveSpline.TransportGuid);      // TransportGUID
+        data.WriteInt8(MoveSpline.TransportSeat);               // VehicleSeat
+
+        // Facing switch is emitted before the point count on 5.5.3.
+        switch (MoveSpline.SplineType)
+        {
+            case SplineTypeModern.FacingSpot:
+                data.WriteVector3(MoveSpline.FinalFacingSpot);
+                break;
+            case SplineTypeModern.FacingTarget:
+                data.WriteFloat(MoveSpline.FinalOrientation);
+                data.WritePackedGuid128(MoveSpline.FinalFacingGuid);
+                break;
+            case SplineTypeModern.FacingAngle:
+                data.WriteFloat(MoveSpline.FinalOrientation);
+                break;
+        }
+
+        // PointsCount as two bytes: pointsCount = (Hi << 8) | Lo.
+        data.WriteUInt8((byte)((Points.Count >> 8) & 0xFF));   // PointsCountHi
+        data.WriteUInt8((byte)(Points.Count & 0xFF));          // PointsCountLo
+
+        data.WriteBit(false);                                   // VehicleExitVoluntary
+        data.WriteBit(false);                                   // Interpolate
+        data.WriteBits(PackedDeltas.Count, 16);                 // PackedDeltasCount
+        data.WriteBit(false);                                   // HasSplineFilter
+        data.WriteBit(false);                                   // HasSpellEffectExtraData
+        data.WriteBit(false);                                   // HasJumpExtraData
+        data.WriteBit(false);                                   // HasTurnData
+        data.WriteBit(false);                                   // HasAnimTier
+        data.WriteBit(false);                                   // SplineBitsUnused (5.5.3 only)
+        data.FlushBits();
+
+        foreach (Vector3 pos in Points)
+            data.WriteVector3(pos);
+
+        foreach (Vector3 pos in PackedDeltas)
+            data.WritePackXYZ(pos);
+
+        if (MovementTrace.Enabled)
+            Log.Print(LogType.Server,
+                $"[MonsterMove/553  ] v{ModernVersion.ExpansionVersion} mover=0x{MoverGUID.Low:X} entry={MoverGUID.GetEntry()} " +
+                $"face={MoveSpline.SplineType} flags=0x{(uint)MoveSpline.SplineFlags:X8} mode={MoveSpline.SplineMode} " +
+                $"pts={Points.Count} deltas={PackedDeltas.Count} " +
+                $"orient={MoveSpline.FinalOrientation:F3} faceGuid=0x{MoveSpline.FinalFacingGuid.Low:X} " +
+                $"wire={data.GetSize()}B");
+    }
+
     // MaxSize computed from MaxSplinePoints:
     // Fixed: GUID(18) + StartPos(12) + SplineId(4) + Dest(12) + flags/times(36) + bits(6) = 88
     // SplineType FacingTarget (worst case, V2_5+): float(4) + GUID(18) = 22
@@ -192,6 +287,11 @@ public class MonsterMove : ServerPacket, ISpanWritable
 
     public int WriteToSpan(Span<byte> buffer)
     {
+        // The 5.5.3 shape (HERMES_256_MONSTERMOVE) is implemented only in Write(); returning -1
+        // makes the framework fall back to it, keeping the 553 field order in one place.
+        if (Use553Spline)
+            return -1;
+
         // Check if we exceed the cap - if so, return -1 to trigger fallback
         if (Points.Count > MaxSplinePoints || PackedDeltas.Count > MaxSplinePoints)
             return -1;
@@ -899,4 +999,22 @@ class MoveTimeSkipped : ClientPacket
 
     public WowGuid128 MoverGUID;
     public uint TimeSkipped;
+}
+
+/// <summary>
+/// Hands the client control of its own character. Older clients volunteer CMSG_SET_ACTIVE_MOVER
+/// after login, so the proxy never had to send this; the 5.5.0 engine waits to be told instead and
+/// replies with CMSG_MOVE_INIT_ACTIVE_MOVER_COMPLETE. Without it the world renders but nothing in
+/// it responds, because the client has no mover to apply input to.
+/// </summary>
+public class MoveSetActiveMover : ServerPacket
+{
+    public MoveSetActiveMover() : base(Opcode.SMSG_MOVE_SET_ACTIVE_MOVER) { }
+
+    public override void Write()
+    {
+        _worldPacket.WritePackedGuid128(MoverGUID);
+    }
+
+    public WowGuid128 MoverGUID = WowGuid128.Empty;
 }

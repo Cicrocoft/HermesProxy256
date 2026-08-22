@@ -1,0 +1,92 @@
+// Battle.net authentication service/listener, version 2.
+//
+// Modern clients (the 5.5.0-engine generation, which includes TBC Classic Anniversary
+// 2.5.6.69110) drive login through these v2 services instead of the v1 ones this repo
+// already implements. Message shapes were reconstructed from the generated headers in
+// TrinityCore (src/server/proto/Client/api/client/v2/authentication_{service,listener,
+// types}.pb.h), which ships no .proto sources for them.
+//
+// Service hashes: AuthenticationService = 0xC02F8216, AuthenticationListener = 0x9DA8116B.
+// Listener methods: 1 OnLogonComplete, 2 OnLogonQueueUpdate, 3 OnLogonQueueEnd,
+// 4 OnExternalChallenge.
+//
+// The adjacent AuthenticationV2.cs is protoc output from this file; regenerate with:
+//   protoc --csharp_out=. AuthenticationV2.proto
+
+syntax = "proto2";
+
+package bgs.protocol.authentication.v2.client;
+
+option csharp_namespace = "Bgs.Protocol.Authentication.V2.Client";
+
+message LogonOptions {
+    optional bytes auth_token = 1;
+    optional string user_agent = 2;
+    optional string device_id = 3;
+    optional string email = 10;
+    optional string phone_number = 11;
+    optional string auth_platform = 12;
+}
+
+message LogonRequest {
+    optional uint32 title_id = 1;
+    optional string platform = 2;
+    optional string locale = 3;
+    optional uint32 application_version = 4;
+    optional LogonOptions logon_options = 10;
+}
+
+message VerifyAuthTokenRequest {
+    optional bytes auth_token = 1;
+}
+
+message GenerateAuthTokenRequest {
+    optional uint32 title_id = 1;
+}
+
+message GenerateAuthTokenResponse {
+    optional bytes auth_token = 1;
+}
+
+message ExternalChallengeNotification {
+    optional string request_token = 1;
+    optional string payload_type = 2;
+    optional bytes payload = 3;
+}
+
+message LogonQueueState {
+    optional uint32 position = 1;
+    optional uint64 estimated_queue_exit_time_s = 2;
+    optional uint64 exit_time_deviation_s = 3;
+}
+
+message LogonQueueUpdateNotification {
+    optional LogonQueueState state = 1;
+}
+
+// Account handle as it appears in a v2 logon record. Wire-compatible with
+// bgs.protocol.account.v1.GameAccountHandle (fixed32 id, fixed32 program/title, varint region);
+// v2 renames the middle field to title_id.
+message GameAccountHandle {
+    // Varint, not the fixed32 the v1 handle uses. A client expecting a varint here skips a
+    // fixed32-encoded field as unknown and keeps the default 0, which then travels on into the
+    // realm list ticket as "gameAccountID":0 and fails the game account lookup.
+    optional uint64 id = 1;
+    optional uint32 title_id = 2;
+    optional uint32 region = 3;
+}
+
+message LogonRecord {
+    optional uint64 account_id = 1;
+    repeated GameAccountHandle game_account = 2;
+    optional string battle_tag = 3;
+    optional string geoip_country = 4;
+    optional bytes session_key = 5;
+    optional bool employee_only_mode = 6;
+    optional string login_ticket = 7;
+}
+
+message LogonCompleteNotification {
+    optional uint32 error_code = 1;
+    optional LogonRecord record = 2;
+}

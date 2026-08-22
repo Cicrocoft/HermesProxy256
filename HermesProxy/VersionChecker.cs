@@ -102,7 +102,8 @@ public static class VersionChecker
                 or ClientVersionBuild.V1_14_2_42082
                 or ClientVersionBuild.V1_14_2_42214
                 or ClientVersionBuild.V1_14_2_42597
-                or ClientVersionBuild.V3_4_3_54261 => true,
+                or ClientVersionBuild.V3_4_3_54261
+                or ClientVersionBuild.V2_5_6_69110 => true,
             _ => false,
         };
 
@@ -434,6 +435,28 @@ public static class ModernVersion
     public static int BuildInt => (int)Build;
     public static string VersionString => Build.ToString();
 
+    /// <summary>
+    /// True when the client runs on the 3.4.3-generation engine or newer.
+    /// </summary>
+    /// <remarks>
+    /// Several packet bodies changed shape with that engine rather than with an expansion, so the
+    /// gate has to follow the engine. ExpansionVersion is the wrong thing to test: 2.5.6 reports
+    /// expansion 2 like every other TBC build, but was rebased onto the modern engine and speaks
+    /// its formats.
+    /// </remarks>
+    public static bool UsesModernEngine =>
+        ExpansionVersion >= 3 || Build == ClientVersionBuild.V2_5_6_69110;
+
+    /// <summary>
+    /// True for the 5.5.0-generation engine specifically, as opposed to the 3.4.3 generation.
+    /// </summary>
+    /// <remarks>
+    /// A second round of wire changes landed with this generation — wider fields, extra bits, a
+    /// different HMAC — which 3.4.3 does not have. Gates for those must use this and not
+    /// UsesModernEngine, or they would break 3.4.3, which works today.
+    /// </remarks>
+    public static bool Uses550Engine => Build == ClientVersionBuild.V2_5_6_69110;
+
     // Same direct-indexed array scheme as LegacyVersion — see LegacyVersion for the rationale.
     private static readonly Opcode[] _currentToUniversal;
     private static readonly uint[]   _universalToCurrent;
@@ -548,6 +571,11 @@ public static class ModernVersion
                 or ClientVersionBuild.V2_5_3_42328
                 or ClientVersionBuild.V2_5_3_42598 => ClientVersionBuild.V2_5_3_41750,
             ClientVersionBuild.V3_4_3_54261 => ClientVersionBuild.V3_4_3_54261,
+            // 2.5.6 has its own builder now — see World/Objects/Version/V2_5_6_69110. It runs the
+            // WowCS entity-fragment framing the 11.x engine introduced, over field indices still
+            // borrowed from 2.5.3 (same expansion's content, so the closest existing set). The
+            // indices are the next thing to verify against the client.
+            ClientVersionBuild.V2_5_6_69110 => ClientVersionBuild.V2_5_6_69110,
             _ => ClientVersionBuild.Zero,
         };
 
@@ -628,6 +656,10 @@ public static class ModernVersion
             ClientVersionBuild.V2_5_3_41750
                 or ClientVersionBuild.V1_14_1_40688 => typeof(World.Enums.V1_14_1_40688.ResponseCodes),
             ClientVersionBuild.V3_4_3_54261 => typeof(World.Enums.V3_4_3_54261.ResponseCodes),
+            // 2.5.6 has no table of its own yet; 3.4.3's is the closest modern one. The conversion
+            // matches by name rather than by value, so this is safe for every code both enums
+            // share, and ConvertResponseCodesValue below no longer throws for the rest.
+            ClientVersionBuild.V2_5_6_69110 => typeof(World.Enums.V3_4_3_54261.ResponseCodes),
             _ => null,
         };
 
@@ -736,6 +768,12 @@ public static class ModernVersion
 
     public static int GetAccountDataCount()
     {
+        // The 5.5.0-generation client reads a fixed run of twenty int64s after ServerTime — the
+        // count is baked into its constructor, not sent. Anything shorter leaves the stream out of
+        // data, and the reader silently zero-fills instead of reporting an error.
+        if (Uses550Engine)
+            return 20;
+
         if (ExpansionVersion == 1 && MajorVersion >= 14)
         {
             if (AddedInVersion(1, 14, 1))
@@ -794,6 +832,10 @@ public static class ModernVersion
             return 1672;
         if (IsVersion(3, 4, 3))
             return 1772;
+        // FIXME(256-spike): unverified — reusing 2.5.3's id until the real value is read out
+        // of build 69110. Only affects GameObject state animation, not connection.
+        if (IsVersion(2, 5, 6))
+            return 1672;
         return 0;
     }
 
@@ -923,9 +965,27 @@ public static class ModernVersion
 
     public static byte ConvertResponseCodesValue(byte legacyValue)
     {
-        string legacyName = Enum.ToObject(LegacyVersion.GetResponseCodesEnum()!, legacyValue).ToString()!;
-        byte modernValue = (byte)Enum.Parse(GetResponseCodesEnum()!, legacyName);
-        return modernValue;
+        // This used to dereference both enums unconditionally. On a build with no table it threw,
+        // and the exception travelled up through the legacy receive loop and tore the connection
+        // down — creating a character produced a disconnect rather than an error message.
+        Type? legacyEnum = LegacyVersion.GetResponseCodesEnum();
+        Type? modernEnum = GetResponseCodesEnum();
+        if (legacyEnum == null || modernEnum == null)
+        {
+            Framework.Logging.Log.Print(Framework.Logging.LogType.Warn,
+                $"ConvertResponseCodesValue: no response-code table for this build pair, " +
+                $"passing 0x{legacyValue:X2} through unchanged.");
+            return legacyValue;
+        }
+
+        string legacyName = Enum.ToObject(legacyEnum, legacyValue).ToString()!;
+        if (Enum.TryParse(modernEnum, legacyName, out object? modern) && modern != null)
+            return (byte)modern;
+
+        Framework.Logging.Log.Print(Framework.Logging.LogType.Warn,
+            $"ConvertResponseCodesValue: '{legacyName}' (0x{legacyValue:X2}) has no counterpart " +
+            $"in {modernEnum.Name}; passing it through unchanged.");
+        return legacyValue;
     }
 
     public static byte ConvertSocketColor(byte legacyValue)

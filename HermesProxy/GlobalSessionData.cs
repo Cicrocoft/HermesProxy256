@@ -126,6 +126,24 @@ public sealed class GameSessionData
     public Dictionary<WowGuid128, Dictionary<int, UpdateField>> ObjectCacheLegacy = [];
     public Dictionary<WowGuid128, UpdateFieldsArray> ObjectCacheModern = [];
     public Dictionary<WowGuid128, ObjectType> OriginalObjectTypes = [];
+
+    // Route B (section 125): last create-time MovementInfo per world unit, so a value update
+    // can be re-emitted as a full CreateObject on the 2.5.6 build - whose modern per-fragment
+    // values-update format is not yet encodable - without inventing a position. Populated when
+    // we build a create block and refreshed from SMSG_ON_MONSTER_MOVE; keyed under ObjectCacheLock.
+    public Dictionary<WowGuid128, MovementInfo> CachedCreateMoveInfo = [];
+
+    /// <summary>Updates the cached create-time position for a unit we re-emit as a create, if one exists.</summary>
+    public void RefreshCachedCreatePosition(WowGuid128 guid, System.Numerics.Vector3 position)
+    {
+        lock (ObjectCacheLock)
+        {
+            if (CachedCreateMoveInfo.TryGetValue(guid, out var mi) && mi != null)
+            {
+                mi.Position = position;
+            }
+        }
+    }
     public Dictionary<WowGuid128, uint[]> ItemGems = [];
     public Dictionary<uint, Class> CreatureClasses = [];
     public Dictionary<string, int> ChannelIds = [];
@@ -1096,6 +1114,10 @@ public class GlobalSessionData
     public string Username = null!;
     public string LoginTicket = null!;
     public byte[] SessionKey = null!;
+    // FIXME(256-spike): the 64-byte Param_BnetSessionKey the client sends on RealmJoinRequest.
+    // Captured to test whether this build derives the world key schedule from it rather than from
+    // clientSecret||serverSecret. Remove with the rest of the 256-spike diagnostics.
+    public byte[]? BnetSessionKeyFromJoin;
     public string Locale = null!;
     public string OS = null!;
     public uint Build;

@@ -17,4 +17,15 @@ public class FormInputs
 
     [DataMember(Name = "inputs")]
     public List<FormInput> Inputs { get; set; } = new List<FormInput>();
+
+    /// <summary>
+    /// Where a client should POST its SRP challenge. Modern clients read this instead of posting
+    /// the password to the form URL, and abandon login outright when it is missing.
+    /// </summary>
+    [DataMember(Name = "srp_url")]
+    public string? SrpUrl { get; set; }
+
+    /// <summary>Optional script the client may fetch to perform SRP. Unused here.</summary>
+    [DataMember(Name = "srp_js")]
+    public string? SrpJs { get; set; }
 }

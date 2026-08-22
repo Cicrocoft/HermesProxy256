@@ -46,6 +46,62 @@ public class GossipMessagePkt : ServerPacket
 
     public override void Write()
     {
+        if (ModernVersion.Uses550Engine)
+        {
+            // 2.5.6 (69110) layout, confirmed against the client's own readers (top level
+            // 0x63F120, per-option 0x589C80, treasure list 0x66A3C0, per-quest 0x63EFA0):
+            // guid, GossipID, LfgDungeonsID, FriendshipFactionID, two counts, a 2-bit block
+            // (HasTextID, HasBroadcastTextID), the options, then the OPTIONAL TextID and
+            // BroadcastTextID, then the quests. The per-option OptionNPC field is a u32 - the
+            // client takes the V5_5_3_64802+ arm of WPP's reader, settled by the disassembly
+            // (0x589C80 reads u32 GossipOptionID, u32 OptionNPC, u8 OptionFlags, u64 OptionCost).
+            _worldPacket.WritePackedGuid128(GossipGUID);
+            _worldPacket.WriteInt32(GossipID);
+            _worldPacket.WriteInt32(0); // LfgDungeonsID - no legacy source
+            _worldPacket.WriteInt32(FriendshipFactionID);
+
+            _worldPacket.WriteInt32(GossipOptions.Count);
+            _worldPacket.WriteInt32(GossipQuests.Count);
+
+            _worldPacket.WriteBit(true);  // HasTextID - the legacy message always carries one
+            _worldPacket.WriteBit(false); // HasBroadcastTextID
+            _worldPacket.FlushBits();
+
+            foreach (ClientGossipOption options in GossipOptions)
+            {
+                _worldPacket.WriteInt32(options.OptionIndex);      // GossipOptionID
+                _worldPacket.WriteUInt32(options.OptionIcon);      // OptionNPC (u32 on 69110; legacy icon ids 0-10 coincide)
+                _worldPacket.WriteUInt8(options.OptionFlags);
+                _worldPacket.WriteUInt64((ulong)options.OptionCost);
+                _worldPacket.WriteUInt32(options.Language);
+                _worldPacket.WriteInt32(0);                        // Flags - no legacy source
+                _worldPacket.WriteInt32(options.OptionIndex);      // OrderIndex
+
+                _worldPacket.WriteBits(options.Text.GetByteCount(), 12);
+                _worldPacket.WriteBits(options.Confirm.GetByteCount(), 12);
+                _worldPacket.WriteBits((byte)options.Status, 2);
+                _worldPacket.WriteBit(options.SpellID.HasValue);
+                _worldPacket.WriteBit(false);                      // HasOverrideIconID
+                _worldPacket.WriteBits(0, 8);                      // FailureDescription length
+                _worldPacket.FlushBits();
+
+                options.Treasure.Write(_worldPacket);
+
+                _worldPacket.WriteString(options.Text);
+                _worldPacket.WriteString(options.Confirm);
+
+                if (options.SpellID.HasValue)
+                    _worldPacket.WriteInt32(options.SpellID.Value);
+                // No OverrideIconID, no FailureDescription (flags/length written as 0 above).
+            }
+
+            _worldPacket.WriteInt32(TextID);
+
+            foreach (ClientGossipQuest quest in GossipQuests)
+                quest.Write(_worldPacket);
+            return;
+        }
+
         _worldPacket.WritePackedGuid128(GossipGUID);
         _worldPacket.WriteInt32(GossipID);
         _worldPacket.WriteInt32(FriendshipFactionID);
@@ -127,6 +183,10 @@ public struct TreasureItem
         data.WriteBits((byte)Type, 1);
         data.WriteInt32(ID);
         data.WriteInt32(Quantity);
+        // 69110's treasure item carries a trailing ItemContext byte (client reader 0x66A3C0:
+        // u8 bit byte, u32 ID, u32 Quantity, u8 ItemContext).
+        if (ModernVersion.Uses550Engine)
+            data.WriteUInt8(0); // ItemContext - no legacy source
     }
 }
 
@@ -144,6 +204,35 @@ public class ClientGossipQuest
 
     public void Write(WorldPacket data)
     {
+        if (ModernVersion.Uses550Engine)
+        {
+            // 2.5.6 (69110) gossip quest entry, confirmed against the client's own struct reader
+            // (0x63EFA0, shared by SMSG_GOSSIP_MESSAGE and SMSG_QUEST_GIVER_QUEST_LIST_MESSAGE):
+            // ten u32s (QuestID, ContentTuningID, QuestType, QuestLevel, QuestMaxScalingLevel,
+            // Unused1102, Flags, FlagsEx, FlagsEx2, FlagsEx3), then a 13-bit block (4 flag bits
+            // + 9-bit title length), then the title. WPP ReadGossipQuestTextData agrees.
+            data.WriteUInt32(QuestID);
+            data.WriteUInt32(ContentTuningID);
+            data.WriteInt32(QuestType);
+            data.WriteInt32(QuestLevel);
+            data.WriteInt32(QuestMaxLevel); // QuestMaxScalingLevel
+            data.WriteInt32(0);             // Unused1102
+            data.WriteUInt32(QuestFlags);
+            data.WriteUInt32(QuestFlagsEx);
+            data.WriteUInt32(0);            // FlagsEx2 - no legacy source
+            data.WriteUInt32(0);            // FlagsEx3 - no legacy source
+
+            data.WriteBit(Repeatable);
+            data.WriteBit(false);           // ResetByScheduler
+            data.WriteBit(false);           // Important
+            data.WriteBit(false);           // Meta
+            data.WriteBits(QuestTitle.GetByteCount(), 9);
+            data.FlushBits();
+
+            data.WriteString(QuestTitle);
+            return;
+        }
+
         data.WriteUInt32(QuestID);
         data.WriteUInt32(ContentTuningID);
         data.WriteInt32(QuestType);
@@ -237,6 +326,24 @@ public class VendorInventory : ServerPacket
 
     public override void Write()
     {
+        if (ModernVersion.Uses550Engine)
+        {
+            // 69110's own reader, 0x5A6B60, GetId-linked to opcode 0x46005C by stub_reader_link.py
+            // (case 0x61DC6B calls 0x5A6B60 = stub 0x5A6B50 + 0x10) and walked with pdwalk.py
+            // (119 instructions, sync verified): guid, u32 Reason, u32 Count, then per item
+            // u64 Price FIRST, six u32, one flushed bits byte, ItemInstance LAST. The jump-table
+            // derivation (opcode_bodies_jt.txt 0x46005C) gives the identical token sequence, and
+            // WowPacketParser's V5_5_0 arm reads the same order. Note Reason is a u32 here, not
+            // the u8 of the 3.4.3/10.x shape below, and Durability is not on the wire at all.
+            _worldPacket.WritePackedGuid128(VendorGUID);
+            _worldPacket.WriteUInt32(Reason);
+            _worldPacket.WriteInt32(Items.Count);
+
+            foreach (VendorItem item in Items)
+                item.Write550(_worldPacket);
+            return;
+        }
+
         _worldPacket.WritePackedGuid128(VendorGUID);
         _worldPacket.WriteUInt8(Reason);
         _worldPacket.WriteInt32(Items.Count);
@@ -268,6 +375,27 @@ public class VendorItem
         data.FlushBits();
     }
 
+    // The 5.5.x per-item body — see the evidence note in VendorInventory.Write. The widths and
+    // positions (u64 then six u32 then bits then ItemInstance) are client-confirmed; the NAMES of
+    // the six u32 are inferred from WowPacketParser's V5_5_0_61735 arm (Muid, Type, StackCount,
+    // Quantity, ExtendedCostID, PlayerConditionFailed — StackCount before Quantity, unlike 10.x).
+    // All six are plain fixed-width reads, so a wrong name cannot desync the parse.
+    public void Write550(WorldPacket data)
+    {
+        data.WriteUInt64(Price);
+        data.WriteInt32(Slot);              // Muid
+        data.WriteInt32(Type);
+        data.WriteUInt32(StackCount);
+        data.WriteInt32(Quantity);
+        data.WriteInt32(ExtendedCostID);
+        data.WriteInt32(PlayerConditionFailed);
+        data.WriteBit(Locked);
+        data.WriteBit(DoNotFilterOnVendor);
+        data.WriteBit(Refundable);
+        data.FlushBits();
+        Item.Write(data);
+    }
+
     public int Slot;
     public int Type = 1;
     public ItemInstance Item = new();
@@ -277,6 +405,7 @@ public class VendorItem
     public uint StackCount;
     public int ExtendedCostID;
     public int PlayerConditionFailed;
+    public bool Locked;
     public bool DoNotFilterOnVendor;
     public bool Refundable;
 }

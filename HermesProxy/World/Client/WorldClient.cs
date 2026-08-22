@@ -267,7 +267,22 @@ public partial class WorldClient
                     using WorldPacket packet = new WorldPacket(buffer, packetSize, isPooled: true);
                     packetOwnsBuffer = true;
                     packet.SetReceiveTime(Environment.TickCount);
-                    HandlePacket(packet);
+                    try
+                    {
+                        HandlePacket(packet);
+                    }
+                    catch (Exception handlerError)
+                    {
+                        // One bad packet must not end the session. Without this, a throw in any
+                        // handler under World/Client/PacketHandlers reaches the outer catch below
+                        // and disconnects - the modern side already catches per packet
+                        // (WorldSocket.cs), and this mirrors it. Socket-level failures are raised
+                        // outside this try and still disconnect, which is what the outer catch is
+                        // for. See REFERENCE-256-CLIENT.md section 99.
+                        WorldClientLogMessages.PacketReadError(
+                            _melLog, handlerError, _sourceFile, _netDirRecv,
+                            $"handler for {packet.GetUniversalOpcode(false)} threw: {handlerError.Message}");
+                    }
                 }
                 finally
                 {
@@ -330,8 +345,32 @@ public partial class WorldClient
         }
     }
 
+    static readonly bool s_splitUpdateBlocks =
+        Environment.GetEnvironmentVariable("HERMES_256_SPLIT") == "1";
+
     public void SendPacketToClient(ServerPacket packet, Opcode delayUntilOpcode = Opcode.MSG_NULL_ACTION)
     {
+        // One update block per packet. The client loops BlockCount times and rejects the whole
+        // packet unless every block's leading type byte is 0, 1 or 2 (RVA 0x23B6E5..0x23B6FB), and
+        // a rejected handler is what raises the reason-7 disconnect. A block of the wrong length
+        // therefore poisons the type byte of every block after it. Splitting here rather than at
+        // the call sites covers all of them — the large world-entry batch comes through the
+        // deferred queue in QueryHandler, not through UpdateHandler.
+        if (s_splitUpdateBlocks && ModernVersion.Uses550Engine
+            && packet is Server.Packets.UpdateObject uo && uo.ObjectUpdates.Count > 1)
+        {
+            var blocks = uo.ObjectUpdates;
+            foreach (var one in blocks)
+            {
+                var single = new Server.Packets.UpdateObject(GetSession().GameState);
+                single.ObjectUpdates.Add(one);
+                SendPacketToClient(single, delayUntilOpcode);
+            }
+            if (uo.DestroyedGuids.Count == 0 && uo.OutOfRangeGuids.Count == 0)
+                return;
+            blocks.Clear();
+        }
+
         Opcode opcode = packet.GetUniversalOpcode();
         if (delayUntilOpcode != Opcode.MSG_NULL_ACTION)
         {

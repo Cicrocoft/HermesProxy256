@@ -23,6 +23,13 @@ public class LogonResult
     [DataMember(Name = "support_error_code")]
     public string? SupportErrorCode { get; set; }
 
+    /// <summary>
+    /// Server's half of the SRP proof (M2), uppercase hex. Sent only for SRP logins; the client
+    /// checks it to confirm the server also knew the password.
+    /// </summary>
+    [DataMember(Name = "server_evidence_M2")]
+    public string? ServerEvidenceM2 { get; set; }
+
     [DataMember(Name = "authenticator_form")]
     public FormInputs AuthenticatorForm { get; set; } = new FormInputs();
 }

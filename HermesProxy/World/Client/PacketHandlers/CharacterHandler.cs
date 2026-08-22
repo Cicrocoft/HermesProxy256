@@ -70,10 +70,9 @@ public partial class WorldClient
             GetSession().GameState.StorePlayerGuildId(char1.Guid, guildId);
             char1.GuildGuid = guildId != 0 ? WowGuid128.Create(HighGuidType703.Guild, guildId) : WowGuid128.Empty;
             char1.Flags = (CharacterFlags)packet.ReadUInt32();
-            // Phase 5a diagnostic: log what flags cmangos set, then zero them out for 3.4.3.
-            // If the character now renders, one of cmangos's CharacterFlags (RenameRequired,
-            // DeclineRequired, LockedForTransfer, etc.) is being treated as "hide me" by the
-            // 3.4.3 client. We'll then look up the specific flag and translate it correctly.
+            // Zeroing these on 2.5.6 was tried and made things worse: the glue screen's Create
+            // Character button went from enabled to greyed out, so the client does read them. Only
+            // 3.4.3 keeps the override.
             if (ClientVersionBuild.V3_4_3_54261 == ModernVersion.Build)
             {
                 Log.Print(LogType.Network, $"[CharFlags] legacy flags=0x{(uint)char1.Flags:X8} — overriding to 0 for diagnostic");
@@ -257,6 +256,13 @@ public partial class WorldClient
         SendPacketToClient(verify);
 
         GetSession().GameState.IsInWorld = true;
+
+        // The client's 256-bit feature-enable bitmap is built only by the handler for 0x460272, and
+        // nothing has ever sent it - so the table pointer at RVA 0x42C03D0 stays null and the camera
+        // faults on the first movement-flag change. Ten crash reports over two days are that fault.
+        // See CameraFeatureBitmap and REFERENCE-256-CLIENT.md section 111.
+        if (ModernVersion.Uses550Engine && CameraFeatureBitmap.Enabled)
+            SendPacketToClient(new CameraFeatureBitmap());
 
         WorldServerInfo info = new();
         if (verify.MapID > 1)

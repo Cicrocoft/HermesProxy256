@@ -1,4 +1,4 @@
-// Copyright (c) CypherCore <http://github.com/CypherCore> All rights reserved.
+﻿// Copyright (c) CypherCore <http://github.com/CypherCore> All rights reserved.
 // Licensed under the GNU GENERAL PUBLIC LICENSE. See LICENSE file in the project root for full license information.
 
 using Framework.Constants;
@@ -32,6 +32,13 @@ public sealed class LoginServiceManager
         _networkOptions = networkOptions;
         formInputs = new FormInputs();
     }
+
+    /// <summary>
+    /// Scheme clients must use to reach the login endpoint. Follows
+    /// <see cref="ProxyNetworkOptions.RestPlaintext"/> so the advertised URL always matches what
+    /// the REST listener actually speaks.
+    /// </summary>
+    public string LoginUrlScheme => _networkOptions.Value.RestPlaintext ? "http" : "https";
 
     public void Initialize()
     {
@@ -91,9 +98,25 @@ public sealed class LoginServiceManager
         return externalAddress;
     }
 
-    public FormInputs GetFormInput()
+    /// <summary>
+    /// Login form for one client. Copied per request because <see cref="FormInputs.SrpUrl"/>
+    /// depends on which address that client reaches us on.
+    /// </summary>
+    public FormInputs GetFormInput(IPAddress clientAddress)
     {
-        return formInputs;
+        var endpoint = GetAddressForClient(clientAddress);
+        return new FormInputs
+        {
+            Type = formInputs.Type,
+            Prompt = formInputs.Prompt,
+            Inputs = formInputs.Inputs,
+            // Only advertised to the client that actually performs SRP. Older clients post the
+            // password to the form URL and have no use for it, and their login form has not
+            // carried this member until now.
+            SrpUrl = HermesProxy.ModernVersion.Build == HermesProxy.Enums.ClientVersionBuild.V2_5_6_69110
+                ? $"{LoginUrlScheme}://{endpoint.Address}:{endpoint.Port}/bnetserver/login/srp/"
+                : null,
+        };
     }
 }
 

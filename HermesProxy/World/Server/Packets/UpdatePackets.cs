@@ -303,23 +303,54 @@ public class UpdateObject : ServerPacket
         NumObjUpdates = (uint)ObjectUpdates.Count;
         MapID = (ushort)_gameState.CurrentMapId!;
 
-        _worldPacket.WriteUInt32(NumObjUpdates);
-        _worldPacket.WriteUInt16(MapID);
-
         WorldPacket buffer = new();
-        if (buffer.WriteBit(!OutOfRangeGuids.Empty() || !DestroyedGuids.Empty()))
+
+        if (ModernVersion.Uses550Engine)
         {
-            buffer.WriteUInt16((ushort)DestroyedGuids.Count);
-            buffer.WriteInt32(DestroyedGuids.Count + OutOfRangeGuids.Count);
+            // The 5.5.0 envelope, from TrinityCore master's UpdateData::BuildPacket. Two changes
+            // from the older form: MapID comes first and the block count second, and there is an
+            // extra bit before the destroyed-guid bit. Writing the old order hands the client the
+            // low half of the count as its map id, so nothing after that can line up.
+            _worldPacket.WriteUInt16(MapID);
+            _worldPacket.WriteUInt32(NumObjUpdates);
 
-            foreach (var destroyGuid in DestroyedGuids)
-                buffer.WritePackedGuid128(destroyGuid);
+            buffer.WriteBit(true);
+            bool hasRemovals = !OutOfRangeGuids.Empty() || !DestroyedGuids.Empty();
+            buffer.WriteBit(hasRemovals);
+            buffer.FlushBits();
 
-            foreach (var outOfRangeGuid in OutOfRangeGuids)
-                buffer.WritePackedGuid128(outOfRangeGuid);
+            if (hasRemovals)
+            {
+                buffer.WriteUInt16((ushort)DestroyedGuids.Count);
+                buffer.WriteUInt32((uint)(DestroyedGuids.Count + OutOfRangeGuids.Count));
+
+                foreach (var destroyGuid in DestroyedGuids)
+                    buffer.WritePackedGuid128(destroyGuid);
+
+                foreach (var outOfRangeGuid in OutOfRangeGuids)
+                    buffer.WritePackedGuid128(outOfRangeGuid);
+            }
+        }
+        else
+        {
+            _worldPacket.WriteUInt32(NumObjUpdates);
+            _worldPacket.WriteUInt16(MapID);
+
+            if (buffer.WriteBit(!OutOfRangeGuids.Empty() || !DestroyedGuids.Empty()))
+            {
+                buffer.WriteUInt16((ushort)DestroyedGuids.Count);
+                buffer.WriteInt32(DestroyedGuids.Count + OutOfRangeGuids.Count);
+
+                foreach (var destroyGuid in DestroyedGuids)
+                    buffer.WritePackedGuid128(destroyGuid);
+
+                foreach (var outOfRangeGuid in OutOfRangeGuids)
+                    buffer.WritePackedGuid128(outOfRangeGuid);
+            }
         }
 
         WorldPacket data = new();
+
         foreach (var update in ObjectUpdates)
         {
             update.InitializePlaceholders();
@@ -352,6 +383,12 @@ public class UpdateObject : ServerPacket
                 case ClientVersionBuild.V3_4_3_54261:
                 {
                     Objects.Version.V3_4_3_54261.ObjectUpdateBuilder builder = new Objects.Version.V3_4_3_54261.ObjectUpdateBuilder(update, _gameState);
+                    builder.WriteToPacket(data);
+                    break;
+                }
+                case ClientVersionBuild.V2_5_6_69110:
+                {
+                    Objects.Version.V2_5_6_69110.ObjectUpdateBuilder builder = new Objects.Version.V2_5_6_69110.ObjectUpdateBuilder(update, _gameState);
                     builder.WriteToPacket(data);
                     break;
                 }

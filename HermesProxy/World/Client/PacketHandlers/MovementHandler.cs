@@ -397,6 +397,11 @@ public partial class WorldClient
             packet.ReadBool(); // "Toggle AnimTierInTrans"
 
         moveSpline.StartPosition = packet.ReadVector3();
+        // Route B (section 125): keep the cached create-time position current so a value
+        // update re-emitted as a create (2.5.6) does not snap a moving unit back to spawn.
+        // Gated on the knob; also a no-op unless this unit is in CachedCreateMoveInfo.
+        if (s_valuesAsCreate256)
+            GetSession().GameState.RefreshCachedCreatePosition(guid, moveSpline.StartPosition);
         moveSpline.SplineId = packet.ReadUInt32();
         SplineTypeLegacy type = (SplineTypeLegacy)packet.ReadUInt8();
         switch (type)

@@ -13,6 +13,41 @@ namespace HermesProxy.World.Objects;
 
 public sealed class MovementInfo
 {
+    static readonly bool s_gravity =
+        System.Environment.GetEnvironmentVariable("HERMES_256_GRAVITY") != "0";
+    /// <summary>
+    /// Whether splines are sent on the 5.5.0 engine. The flag bit here and the spline data
+    /// block in ObjectUpdateBuilder are written by different code, and the client rejects the
+    /// packet if they disagree - which is what the original reason-7 disconnect was. They must
+    /// therefore be driven from one place; this is it.
+    /// </summary>
+    public static readonly bool SendSplines =
+        System.Environment.GetEnvironmentVariable("HERMES_256_SPLINE") == "1";
+
+    /// <summary>
+    /// Whether the inbound (CMSG) MovementInfo reader uses the 5.5.0/69110 field set that the
+    /// outbound writer already emits: a GravityModifier float after MoveIndex, a leading
+    /// HasStandingOnGameObjectGUID bit, and trailing HasAdvFlying/HasDriveStatus bits (plus their
+    /// optional bodies). The writer (WriteMovementInfoModern) is byte-verified against the client
+    /// (REFERENCE-256-CLIENT.md section 97) and removing GravityModifier disconnects the client,
+    /// so the client's movement layout on 69110 has these fields — but the reader never got the
+    /// matching branch, so every inbound CMSG_MOVE_* body misparses from GravityModifier onward.
+    /// The full field set is now verified byte-for-byte against the client's own CMSG movement
+    /// serialiser (shared function RVA 0x66AF00, reached by every group-0x42 CMSG_MOVE_* writer):
+    /// GravityModifier is a float right after MoveIndex, the has-bit block is exactly the nine bits
+    /// below in this order, and the optional-body order is transport, standing-guid, inertia,
+    /// adv-flying, fall, drive-status. Confirmed in game: walking, turning, jumping and falling all
+    /// behave and position is stable, so this is now the default. HERMES_256_MOVEREADER=0 restores
+    /// the old reader.
+    ///
+    /// Low risk by construction, and the reason is worth keeping: this is the *read* side. A reader
+    /// error can mis-set the movement values we forward to the legacy core, but it can never make
+    /// the client read a short buffer, so it cannot cause the packed-guid null dereference that has
+    /// produced every crash of that class. That risk lives only on the write side.
+    /// </summary>
+    static readonly bool s_moveReader550 =
+        System.Environment.GetEnvironmentVariable("HERMES_256_MOVEREADER") != "0";
+
     public const float DEFAULT_WALK_SPEED = 2.5f;
     public const float DEFAULT_RUN_SPEED = 7.0f;
     public const float DEFAULT_RUN_BACK_SPEED = 4.5f;
@@ -28,6 +63,9 @@ public sealed class MovementInfo
     public uint FlagsExtra2;
     public uint MoveTime;
     public float SwimPitch;
+
+    /// <summary>Added on the 5.5.0 engine. One means normal gravity.</summary>
+    public float GravityModifier = 1.0f;
     public uint FallTime;
     public float JumpHorizontalSpeed;
     public float JumpVerticalSpeed;
@@ -278,6 +316,16 @@ public sealed class MovementInfo
     {
         var moveInfo = this;
 
+        // On the 5.5.0/69110 engine the client sends a longer MovementInfo than the 9.x path:
+        // a GravityModifier float after MoveIndex, a leading HasStandingOnGameObjectGUID bit and
+        // trailing HasAdvFlying/HasDriveStatus bits, each with an optional body. Verified field-for-
+        // field against the client's own CMSG movement serialiser 0x66AF00 (not just inferred from
+        // the writer): GravityModifier = WriteF32([+0xf8]) after MoveIndex; the nine has-bits in the
+        // order below; body order transport, standing-guid, inertia, adv-flying, fall, drive-status.
+        // Corroborated by TrinityCore master MovementInfo operator>> and WPP V11/V5_5_0. Gated by
+        // HERMES_256_MOVEREADER (default off).
+        bool use550 = ModernVersion.Uses550Engine && s_moveReader550;
+
         if (ModernVersion.AddedInVersion(9, 2, 0, 1, 14, 1, 2, 5, 3))
         {
             moveInfo.Flags = data.ReadUInt32();
@@ -296,6 +344,11 @@ public sealed class MovementInfo
 
         uint moveIndex = data.ReadUInt32();
 
+        // GravityModifier: read right after MoveIndex and before the (usually empty) remove-forces
+        // loop, matching TrinityCore master and WPP V11. The writer emits it in the same slot.
+        if (use550)
+            moveInfo.GravityModifier = data.ReadFloat();
+
         for (uint i = 0; i < removeMovementForcesCount; ++i)
         {
             data.ReadPackedGuid128();
@@ -309,6 +362,7 @@ public sealed class MovementInfo
             moveInfo.FlagsExtra = data.ReadBits<uint>(18);
         }
 
+        bool hasStandingOnGameObject = use550 && data.HasBit();  // HasStandingOnGameObjectGUID
         bool hasTransport = data.HasBit();
         bool hasFall = data.HasBit();
         bool hasSpline = data.HasBit(); // todo 6.x read this infos
@@ -316,18 +370,38 @@ public sealed class MovementInfo
         data.ReadBit(); // HeightChangeFailed
         data.ReadBit(); // RemoteTimeValid
         bool hasInertia = ModernVersion.AddedInVersion(9, 2, 0, 1, 14, 1, 2, 5, 3) ? data.HasBit() : false;
+        bool hasAdvFlying = use550 && data.HasBit();
+        bool hasDriveStatus = use550 && data.HasBit();
 
+        // Optional-body order (TrinityCore / WPP V11): transport, standing-on-gameobject guid,
+        // inertia, adv-flying, fall, drive-status.
         if (hasTransport)
             ReadTransportInfoModern(data);
+
+        if (hasStandingOnGameObject)
+            data.ReadPackedGuid128(); // StandingOnGameObjectGUID
 
         if (ModernVersion.AddedInVersion(9, 2, 0, 1, 14, 1, 2, 5, 3))
         {
             if (hasInertia)
             {
-                data.ReadPackedGuid128();
+                // The Inertia ID is a u32 on 69110, verified against the client's own CMSG
+                // movement serialiser 0x66AF00 (it emits WriteU32([+0xc4]) here, not a packed
+                // guid). Matches WPP V5_5_0 ReadInertiaData / V11 (ReadInt32 "ID"). The legacy
+                // path keeps its original packed-guid read so non-550 behaviour is unchanged.
+                if (use550)
+                    data.ReadUInt32();        // ID
+                else
+                    data.ReadPackedGuid128(); // legacy/9.x ID (unchanged)
                 data.ReadVector3(); // Force
                 data.ReadUInt32(); // Lifetime
             }
+        }
+
+        if (hasAdvFlying)
+        {
+            data.ReadFloat(); // ForwardVelocity
+            data.ReadFloat(); // UpVelocity
         }
 
         if (hasFall)
@@ -344,6 +418,16 @@ public sealed class MovementInfo
                 moveInfo.JumpCosAngle = data.ReadFloat();
                 moveInfo.JumpHorizontalSpeed = data.ReadFloat();
             }
+        }
+
+        if (hasDriveStatus)
+        {
+            // 5.5.0 arm (WPP V5_5_0_61735 ReadDriveStatusData): two floats then two bits. Never
+            // fires from a TBC client (no vehicle/drive movement in this content), so untested.
+            data.ReadFloat(); // Speed
+            data.ReadFloat(); // MovementAngle
+            data.ReadBit();   // Accelerating
+            data.ReadBit();   // Drifting
         }
     }
 
@@ -402,13 +486,38 @@ public sealed class MovementInfo
             data.WriteBits(moveInfo.FlagsExtra, 18);
         }
             
+        // The 5.5.0 engine added a gravity modifier here and three more optional-block bits.
+        // Omitting them leaves the create block four bytes and three bits short, which shifts the
+        // fragment list and every value after it — the client answers that with an immediate
+        // disconnect rather than a crash.
+        // WowPacketParser's ReadMovementUpdateBlock for the 5.5.0 module goes straight from
+        // MoveIndex to the bit field - there is no gravity float there. It may be a 69110
+        // addition that 61735 predates, or four bytes we invented; the source cannot say.
+        // HERMES_256_GRAVITY=0 drops it so the two can be told apart by testing.
+        if (ModernVersion.Uses550Engine && s_gravity)
+            data.WriteFloat(moveInfo.GravityModifier);
+
+        if (ModernVersion.Uses550Engine)
+            data.WriteBit(false);                                      // HasStandingOnGameObjectGUID
         data.WriteBit(moveInfo.TransportGuid != default);                 // HasTransport
         data.WriteBit(hasFall);                                        // HasFall
-        data.WriteBit(HasSplineData);                                  // HasSpline - marks that the unit uses spline movement
+        // Never claim spline movement on 5.5.0 while the spline block itself is suppressed in
+        // ObjectUpdateBuilder. Setting this bit makes the client prepare a spline sub-structure it
+        // then never fills, and its create-block validator checks that structure (FUN_0x67C590 on
+        // the region at +0x570) before accepting the packet. The two flags have to agree.
+        // Suppressing this was the reason-7 workaround, from before the descriptors were
+        // correct. HERMES_256_SPLINE=1 sends splines normally again, which is what the parser
+        // expects; worth retrying now that so much else has been fixed.
+        data.WriteBit(HasSplineData && (SendSplines || !ModernVersion.Uses550Engine));  // HasSpline
         data.WriteBit(false);                                          // HeightChangeFailed
         data.WriteBit(false);                                          // RemoteTimeValid
         if (ModernVersion.AddedInVersion(9, 2, 0, 1, 14, 1, 2, 5, 3))
             data.WriteBit(false);                                      // HasInertia
+        if (ModernVersion.Uses550Engine)
+        {
+            data.WriteBit(false);                                      // HasAdvFlying
+            data.WriteBit(false);                                      // HasDriveStatus
+        }
         data.FlushBits();
 
         if (moveInfo.TransportGuid != default)

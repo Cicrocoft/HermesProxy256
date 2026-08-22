@@ -52,6 +52,11 @@ public static partial class GameData
     public static FrozenDictionary<uint, uint> TransportPeriods = FrozenDictionary<uint, uint>.Empty;
     public static FrozenDictionary<uint, string> AreaNames = FrozenDictionary<uint, string>.Empty;
     public static FrozenDictionary<uint, uint> RaceFaction = FrozenDictionary<uint, uint>.Empty;
+    // ReputationIndex -> Faction.db2 ID, from the modern client's own Faction table (build 69110),
+    // byte-identical on this range to the legacy 2.4.3 Faction.dbc (index 20 -> 47 Ironforge in both).
+    // Needed by the 5.5.0-engine SMSG_INITIALIZE_FACTIONS / SMSG_SET_FACTION_STANDING bodies, which
+    // carry faction ids where the legacy wire carries reputation-index-ordered slots.
+    public static FrozenDictionary<uint, uint> FactionIdByRepIndex = FrozenDictionary<uint, uint>.Empty;
     public static FrozenSet<uint> DispellSpells = FrozenSet<uint>.Empty;
     public static Dictionary<uint, List<float>> SpellEffectPoints = [];
     public static FrozenSet<uint> StackableAuras = FrozenSet<uint>.Empty;
@@ -389,6 +394,18 @@ public static partial class GameData
         return 1;
     }
 
+    /// <summary>
+    /// Maps a legacy reputation list index (the slot position in the pre-5.5.0
+    /// SMSG_INITIALIZE_FACTIONS body) to its Faction ID. Returns 0 for untracked slots.
+    /// </summary>
+    public static uint GetFactionIdByReputationIndex(uint index)
+    {
+        uint factionId;
+        if (FactionIdByRepIndex.TryGetValue(index, out factionId))
+            return factionId;
+        return 0;
+    }
+
     public static uint GetBattlegroundIdFromMapId(uint mapId)
     {
         foreach (var bg in Battlegrounds)
@@ -573,6 +590,7 @@ public static partial class GameData
             LoadTransports,
             LoadAreaNames,
             LoadRaceFaction,
+            LoadFactionReputationIndexes,
             LoadDispellSpells,
             LoadSpellEffectPoints,
             LoadStackableAuras,
@@ -1125,6 +1143,21 @@ public static partial class GameData
             dict.Add(id, faction);
         }
         RaceFaction = dict.ToFrozenDictionary();
+    }
+
+    public static void LoadFactionReputationIndexes()
+    {
+        var path = Path.Combine("CSV", $"FactionReputationIndex.csv");
+        using var reader = Sep.Reader(o => o with { HasHeader = true }).FromFile(path);
+        var dict = new Dictionary<uint, uint>(EstimateRowCount(path, 8));
+
+        foreach (var row in reader)
+        {
+            uint repIndex = uint.Parse(row[0].Span);
+            uint factionId = uint.Parse(row[1].Span);
+            dict.Add(repIndex, factionId);
+        }
+        FactionIdByRepIndex = dict.ToFrozenDictionary();
     }
 
     public static void LoadDispellSpells()

@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Copyright (C) 2012-2020 CypherCore <http://github.com/CypherCore>
  *
  * This program is free software: you can redistribute it and/or modify
@@ -493,6 +493,17 @@ public class ByteBuffer : IDisposable
 
     public void WriteFloat(float data)
     {
+        // A non-finite float is fatal on the 5.5.0 client: its create-block validator runs every
+        // optional movement sub-block through a NaN/infinity check (RVA 0x66EF00) and refuses the
+        // whole packet if any float fails, which surfaces as an immediate reason-7 disconnect with
+        // nothing logged. Legacy values converted from the 2.4.3 core can be non-finite, so clamp
+        // here rather than hunt for the one field that produced it.
+        if (!float.IsFinite(data))
+        {
+            Framework.Logging.Log.Print(Framework.Logging.LogType.Warn,
+                $"[256-spike] non-finite float ({data}) replaced with 0 before the wire");
+            data = 0f;
+        }
         FlushBits();
         EnsureCapacity(4);
         BinaryPrimitives.WriteSingleLittleEndian(_buffer.AsSpan(_position), data);
@@ -908,6 +919,38 @@ public class ByteBuffer : IDisposable
                 data[i] = _buffer[i];
             return data;
         }
+    }
+
+    /// <summary>
+    /// Moves the write cursor back to <paramref name="size"/> bytes, discarding what follows.
+    ///
+    /// Added for a diagnostic that needs to shorten a descriptor block by a measured number of bytes
+    /// without claiming to know which field is wrong (HERMES_256_UNITTRIM). Not part of normal
+    /// packet construction - nothing in the send path should need to unwrite.
+    /// </summary>
+    /// <summary>
+    /// Zero a range of already-written bytes. Diagnostic only, for bisecting a descriptor block
+    /// against a known-good capture: these create blocks are linear and unmasked, so removing a
+    /// field's value without changing the block's length is the only way to take it off the wire
+    /// without moving every field after it. Offsets come from the same GetSize() the builder uses
+    /// to record its fragment boundaries.
+    /// </summary>
+    public void ZeroRange(uint start, uint count)
+    {
+        int limit = Math.Max(_length, _position);
+        if (start >= (uint)limit || count == 0)
+            return;
+        int from = (int)start;
+        int to = (int)Math.Min((ulong)start + count, (ulong)limit);
+        Array.Clear(_buffer, from, to - from);
+    }
+
+    public void Truncate(uint size)
+    {
+        if (size > (uint)_position)
+            return;
+        _position = (int)size;
+        _bitPosition = 8;
     }
 
     public uint GetSize()

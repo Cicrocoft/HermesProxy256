@@ -45,6 +45,26 @@ internal static class SpellPacketHelpers
         writer.WriteInt32(logData.AttackPower);
         writer.WriteInt32(logData.SpellPower);
         writer.WriteUInt32(logData.Armor);
+
+        if (ModernVersion.Uses550Engine)
+        {
+            // Keep in lockstep with SpellCastLogData.Write: two extra int32s after Armor,
+            // and a one-byte power type per entry on the 5.5.x engine.
+            writer.WriteInt32(0);            // Unknown_1105_1
+            writer.WriteInt32(0);            // Unknown_1105_2
+            writer.WriteBits((uint)logData.PowerData.Count, 9);
+            writer.FlushBits();
+
+            foreach (var powerData in logData.PowerData)
+            {
+                writer.WriteUInt8((byte)powerData.PowerType);
+                writer.WriteInt32(powerData.Amount);
+                writer.WriteInt32(powerData.Cost);
+            }
+
+            return true;
+        }
+
         writer.WriteBits((uint)logData.PowerData.Count, 9);
         writer.FlushBits();
 
@@ -63,6 +83,23 @@ internal static class SpellPacketHelpers
     /// </summary>
     public static void WriteContentTuningParams(ref SpanPacketWriter writer, ContentTuningParams tuning)
     {
+        if (ModernVersion.Uses550Engine)
+        {
+            // Keep in lockstep with ContentTuningParams.Write's 5.5.x arm.
+            writer.WriteUInt16((ushort)tuning.PlayerItemLevel);
+            writer.WriteInt16(tuning.PlayerLevelDelta);
+            writer.WriteUInt32((uint)tuning.TargetItemLevel);
+            writer.WriteUInt8(tuning.TargetLevel);
+            writer.WriteUInt8(tuning.Expansion);
+            writer.WriteUInt8(tuning.TargetMinScalingLevel);
+            writer.WriteUInt8(tuning.TargetMaxScalingLevel);
+            writer.WriteInt8(tuning.TargetScalingLevelDelta);
+            writer.WriteBits((uint)tuning.TuningType, 4);
+            writer.WriteBit(false);              // ScalesWithItemLevel
+            writer.FlushBits();
+            return;
+        }
+
         writer.WriteFloat(tuning.PlayerItemLevel);
         writer.WriteFloat(tuning.TargetItemLevel);
         writer.WriteInt16(tuning.PlayerLevelDelta);
@@ -77,8 +114,8 @@ internal static class SpellPacketHelpers
         writer.FlushBits();
     }
 
-    // Size constants for MaxSize calculations
-    public const int SpellCastLogDataFixedSize = 22; // 8 + 4 + 4 + 4 + 2 (bits flushed)
+    // Size constants for MaxSize calculations (upper bounds across engine variants)
+    public const int SpellCastLogDataFixedSize = 30; // 8 + 4 + 4 + 4 + 8 (5.5.x extra ints) + 2 (bits flushed)
     public const int SpellLogPowerDataSize = 12;     // 3 ints
     public const int ContentTuningParamsSize = 22;   // 8 + 2 + 2 + 5 + 4 + 1 (bits flushed)
 }
@@ -136,6 +173,29 @@ public class SupercededSpells : ServerPacket, ISpanWritable
 
     public override void Write()
     {
+        if (ModernVersion.Uses550Engine)
+        {
+            // 5.5.x (WowPacketParser 5.5.0 HandleSupercededSpells): one count, then per
+            // entry a LearnedSpellInfo whose Superceded presence bit is set and whose
+            // Superceded id follows the bit byte. The parallel SpellID/Superceded lists
+            // fold into count entries; the 9.x favorites list does not exist here.
+            _worldPacket.WriteInt32(SpellID.Count);
+
+            for (int i = 0; i < SpellID.Count; i++)
+            {
+                _worldPacket.WriteUInt32(SpellID[i]);
+                _worldPacket.WriteBit(false);                       // IsFavorite
+                _worldPacket.WriteBit(false);                       // hasEquipableSpellInvSlot
+                _worldPacket.WriteBit(i < Superceded.Count);        // hasSuperceded
+                _worldPacket.WriteBit(false);                       // hasTraitDefinition
+                _worldPacket.FlushBits();
+
+                if (i < Superceded.Count)
+                    _worldPacket.WriteUInt32(Superceded[i]);
+            }
+            return;
+        }
+
         _worldPacket.WriteInt32(SpellID.Count);
         _worldPacket.WriteInt32(Superceded.Count);
         _worldPacket.WriteInt32(FavoriteSpellID.Count);
@@ -152,7 +212,7 @@ public class SupercededSpells : ServerPacket, ISpanWritable
 
     // Cap for spell lists - usually 1 spell superceded at a time
     private const int MaxSpellsPerList = 8;
-    // 3 counts(12) + 3 lists of spells(96)
+    // 3 counts(12) + 3 lists of spells(96); 5.5.x entries are at most 9 bytes each
     public int MaxSize => 12 + MaxSpellsPerList * 4 * 3;
 
     public int WriteToSpan(Span<byte> buffer)
@@ -163,6 +223,27 @@ public class SupercededSpells : ServerPacket, ISpanWritable
             return -1;
 
         var writer = new SpanPacketWriter(buffer);
+
+        if (ModernVersion.Uses550Engine)
+        {
+            // Keep in lockstep with Write()'s 5.5.x arm.
+            writer.WriteInt32(SpellID.Count);
+
+            for (int i = 0; i < SpellID.Count; i++)
+            {
+                writer.WriteUInt32(SpellID[i]);
+                writer.WriteBit(false);
+                writer.WriteBit(false);
+                writer.WriteBit(i < Superceded.Count);
+                writer.WriteBit(false);
+                writer.FlushBits();
+
+                if (i < Superceded.Count)
+                    writer.WriteUInt32(Superceded[i]);
+            }
+            return writer.Position;
+        }
+
         writer.WriteInt32(SpellID.Count);
         writer.WriteInt32(Superceded.Count);
         writer.WriteInt32(FavoriteSpellID.Count);
@@ -193,6 +274,30 @@ public class LearnedSpells : ServerPacket, ISpanWritable
 
     public override void Write()
     {
+        if (ModernVersion.Uses550Engine)
+        {
+            // 5.5.x (WowPacketParser 5.5.0 HandleLearnedSpells): count, SpecializationID,
+            // SuppressMessaging bit, then per spell a LearnedSpellInfo — SpellID plus a
+            // presence-bit byte (IsFavorite, EquipableSpellInvSlot, Superceded,
+            // TraitDefinition), all absent for legacy-translated spells. The 9.x favorites
+            // list does not exist on this engine.
+            _worldPacket.WriteInt32(Spells.Count);
+            _worldPacket.WriteUInt32(SpecializationID);
+            _worldPacket.WriteBit(SuppressMessaging);
+            _worldPacket.FlushBits();
+
+            foreach (uint spell in Spells)
+            {
+                _worldPacket.WriteUInt32(spell);
+                _worldPacket.WriteBit(false);   // IsFavorite
+                _worldPacket.WriteBit(false);   // hasEquipableSpellInvSlot
+                _worldPacket.WriteBit(false);   // hasSuperceded
+                _worldPacket.WriteBit(false);   // hasTraitDefinition
+                _worldPacket.FlushBits();
+            }
+            return;
+        }
+
         _worldPacket.WriteInt32(Spells.Count);
         _worldPacket.WriteInt32(FavoriteSpellID.Count);
         _worldPacket.WriteUInt32(SpecializationID);
@@ -207,8 +312,8 @@ public class LearnedSpells : ServerPacket, ISpanWritable
         _worldPacket.FlushBits();
     }
 
-    // MaxSize: 3 int32 (12) + 2 lists capped at 8 (64) + 1 bit byte = 77
-    public int MaxSize => 12 + MaxSpells * 4 * 2 + 1;
+    // MaxSize: 3 int32 (12) + 2 lists capped at 8 (5 bytes each on 5.5.x) + 1 bit byte = 77
+    public int MaxSize => 12 + MaxSpells * 5 * 2 + 1;
 
     public int WriteToSpan(Span<byte> buffer)
     {
@@ -216,6 +321,24 @@ public class LearnedSpells : ServerPacket, ISpanWritable
             return -1;
 
         var writer = new SpanPacketWriter(buffer);
+
+        if (ModernVersion.Uses550Engine)
+        {
+            // Keep in lockstep with Write()'s 5.5.x arm.
+            writer.WriteInt32(Spells.Count);
+            writer.WriteUInt32(SpecializationID);
+            writer.WriteBit(SuppressMessaging);
+            writer.FlushBits();
+
+            foreach (uint spell in Spells)
+            {
+                writer.WriteUInt32(spell);
+                writer.WriteBits(0, 4);         // IsFavorite/EquipableInvSlot/Superceded/TraitDefinition
+                writer.FlushBits();
+            }
+            return writer.Position;
+        }
+
         writer.WriteInt32(Spells.Count);
         writer.WriteInt32(FavoriteSpellID.Count);
         writer.WriteUInt32(SpecializationID);
@@ -505,7 +628,12 @@ public struct AuraInfo
 {
     public void Write(WorldPacket data)
     {
-        data.WriteUInt8(Slot);
+        // 5.5.x reads Slot as a u16 (client reader at case 0x64F885: u16 before the HasAura
+        // bit); 9.x-era builds read a u8. Getting this wrong desyncs every field after it.
+        if (ModernVersion.Uses550Engine)
+            data.WriteUInt16(Slot);
+        else
+            data.WriteUInt8(Slot);
         data.WriteBit(AuraData != null);
         data.FlushBits();
 
@@ -529,13 +657,35 @@ public class AuraDataInfo
         data.WriteUInt16(CastLevel);
         data.WriteUInt8(Applications);
         data.WriteInt32(ContentTuningID);
-        data.WriteBit(CastUnit != default);
-        data.WriteBit(Duration.HasValue);
-        data.WriteBit(Remaining.HasValue);
-        data.WriteBit(TimeMod.HasValue);
-        data.WriteBits(Points.Count, 6);
-        data.WriteBits(EstimatedPoints.Count, 6);
-        data.WriteBit(ContentTuning != null);
+
+        if (ModernVersion.Uses550Engine)
+        {
+            // 5.5.3 aura body, client case 0x64F885 and WowPacketParser's 5.5.3 arm agree
+            // token for token: a 12-byte DstLocation after ContentTuningID, then a 24-bit
+            // header (CastUnit, CastUnit2, Duration, Remaining, TimeMod, PointsCount:6,
+            // EstimatedPointsCount:6, ContentTuning, 6 unused bits), then the optional
+            // bodies with ContentTuning first.
+            data.WriteVector3(DstLocation);
+            data.WriteBit(CastUnit != default);
+            data.WriteBit(false);                   // HasCastUnit2 — no legacy source
+            data.WriteBit(Duration.HasValue);
+            data.WriteBit(Remaining.HasValue);
+            data.WriteBit(TimeMod.HasValue);
+            data.WriteBits(Points.Count, 6);
+            data.WriteBits(EstimatedPoints.Count, 6);
+            data.WriteBit(ContentTuning != null);
+            data.WriteBits(0, 6);                   // AuraHeaderUnused
+        }
+        else
+        {
+            data.WriteBit(CastUnit != default);
+            data.WriteBit(Duration.HasValue);
+            data.WriteBit(Remaining.HasValue);
+            data.WriteBit(TimeMod.HasValue);
+            data.WriteBits(Points.Count, 6);
+            data.WriteBits(EstimatedPoints.Count, 6);
+            data.WriteBit(ContentTuning != null);
+        }
 
         if (ContentTuning != null)
             ContentTuning.Write(data);
@@ -567,6 +717,7 @@ public class AuraDataInfo
     public ushort CastLevel = 1;
     public byte Applications = 1;
     public int ContentTuningID;
+    public Vector3 DstLocation;          // 5.5.x only; zero for auras translated from legacy
     ContentTuningParams ContentTuning = null!;
     public WowGuid128 CastUnit;
     public int? Duration;
@@ -580,6 +731,26 @@ class ContentTuningParams
 {
     public void Write(WorldPacket data)
     {
+        if (ModernVersion.Uses550Engine)
+        {
+            // 5.5.x ContentTuningParams (WowPacketParser 5.5.0 ReadContentTuningParams):
+            // u16 PlayerItemLevel, s16 PlayerLevelDelta, u32 TargetItemLevel, five scaling
+            // bytes, then Type:4 bits + ScalesWithItemLevel:1 bit. The 9.x float pair and
+            // the u32 Flags do not exist on this engine.
+            data.WriteUInt16((ushort)PlayerItemLevel);
+            data.WriteInt16(PlayerLevelDelta);
+            data.WriteUInt32((uint)TargetItemLevel);
+            data.WriteUInt8(TargetLevel);
+            data.WriteUInt8(Expansion);
+            data.WriteUInt8(TargetMinScalingLevel);
+            data.WriteUInt8(TargetMaxScalingLevel);
+            data.WriteInt8(TargetScalingLevelDelta);
+            data.WriteBits(TuningType, 4);
+            data.WriteBit(false);                   // ScalesWithItemLevel
+            data.FlushBits();
+            return;
+        }
+
         data.WriteFloat(PlayerItemLevel);
         data.WriteFloat(TargetItemLevel);
         data.WriteInt16(PlayerLevelDelta);
@@ -1016,6 +1187,12 @@ public class SpellCastData
 {
     public void Write(WorldPacket data)
     {
+        if (ModernVersion.Uses550Engine)
+        {
+            Write550(data);
+            return;
+        }
+
         data.WritePackedGuid128(CasterGUID);
         data.WritePackedGuid128(CasterUnit);
         data.WritePackedGuid128(CastID);
@@ -1070,6 +1247,73 @@ public class SpellCastData
             data.WriteInt32((int)AmmoInventoryType);
     }
 
+    /// <summary>
+    /// The 5.5.x cast data, from WowPacketParser 5.5.0's ReadSpellCastData cross-checked
+    /// against the client's own dispatcher shapes at 0x66002A/0x66002B (the two giant
+    /// SpellCastData readers, unique in the whole index). Differences from the 9.x body:
+    /// a CastFlagsEx2 u32 after CastFlagsEx; Predict.Type widened to u32 (5.5.3 arm);
+    /// the target block moved before the hit/miss guid arrays; the miss-status list moved
+    /// after the miss-target guids and is byte-encoded, not 4-bit; power entries are
+    /// (u8 Type, s32 Cost) rather than (s32 Cost, s8 Type); and the target block reads
+    /// its Flags as a full u32 with the Unit/Item guids before the presence bits.
+    /// </summary>
+    private void Write550(WorldPacket data)
+    {
+        data.WritePackedGuid128(CasterGUID);
+        data.WritePackedGuid128(CasterUnit);
+        data.WritePackedGuid128(CastID);
+        data.WritePackedGuid128(OriginalCastID);
+        data.WriteInt32(SpellID);
+        data.WriteUInt32(SpellXSpellVisualID);
+        data.WriteUInt32(CastFlags);
+        data.WriteUInt32(CastFlagsEx);
+        data.WriteUInt32(CastFlagsEx2);
+        data.WriteUInt32(CastTime);
+
+        MissileTrajectory.Write(data);
+
+        data.WriteUInt8(DestLocSpellCastIndex);
+
+        Immunities.Write(data);
+        Predict.Write(data);          // Type width handled inside for 5.5.x
+
+        data.WriteBits(HitTargets.Count, 16);
+        data.WriteBits(MissTargets.Count, 16);
+        data.WriteBits(MissStatus.Count, 16);
+        data.WriteBits(RemainingPower.Count, 9);
+        data.WriteBit(RemainingRunes != null);
+        data.WriteBits(TargetPoints.Count, 16);
+        data.WriteBit(AmmoDisplayId != null);
+        data.WriteBit(AmmoInventoryType != null);
+        data.FlushBits();
+
+        Target.Write550(data);
+
+        foreach (WowGuid128 hitTarget in HitTargets)
+            data.WritePackedGuid128(hitTarget);
+
+        foreach (WowGuid128 missTarget in MissTargets)
+            data.WritePackedGuid128(missTarget);
+
+        foreach (SpellMissStatus missStatus in MissStatus)
+            missStatus.Write550(data);
+
+        foreach (SpellPowerData power in RemainingPower)
+            power.Write550(data);
+
+        if (RemainingRunes != null)
+            RemainingRunes.Write(data);
+
+        foreach (TargetLocation targetLoc in TargetPoints)
+            targetLoc.Write(data);
+
+        if (AmmoDisplayId != null)
+            data.WriteInt32((int)AmmoDisplayId);
+
+        if (AmmoInventoryType != null)
+            data.WriteInt32((int)AmmoInventoryType);
+    }
+
     public WowGuid128 CasterGUID;
     public WowGuid128 CasterUnit;
     public WowGuid128 CastID = WowGuid128.Empty;
@@ -1078,6 +1322,7 @@ public class SpellCastData
     public uint SpellXSpellVisualID;
     public uint CastFlags;
     public uint CastFlagsEx;
+    public uint CastFlagsEx2;            // 5.5.x only; no legacy source, stays zero
     public uint CastTime;
     public List<WowGuid128> HitTargets = new();
     public List<WowGuid128> MissTargets = new();
@@ -1109,6 +1354,15 @@ public struct SpellMissStatus
             data.WriteBits(ReflectStatus, 4);
 
         data.FlushBits();
+    }
+
+    // 5.5.x encodes miss status as whole bytes (WowPacketParser 5.5.0 ReadSpellMissStatus:
+    // u8 Reason, and only Reason == 11 (Reflect) is followed by a u8 ReflectStatus).
+    public void Write550(WorldPacket data)
+    {
+        data.WriteUInt8((byte)Reason);
+        if (Reason == SpellMissInfo.Reflect)
+            data.WriteUInt8((byte)ReflectStatus);
     }
 
     public SpellMissInfo Reason;
@@ -1194,6 +1448,46 @@ public class SpellTargetData
         data.WriteString(Name);
     }
 
+    /// <summary>
+    /// 5.5.3 target block. Two derivations: WowPacketParser's ReadSpellTargetData553
+    /// (Flags is a full int32 rather than 26 bits, and the Unit/Item guids come before the
+    /// presence bits), and the client's own CMSG-side serialiser for the shared structure
+    /// (sub_69E140, straight-line): put u32, three packed guids, four bits plus a 7-bit
+    /// name length, then SrcLocation (obj+0x40), DstLocation (obj+0x68), f32 Orientation,
+    /// u32 MapID, and the name bytes. Build 69110 writes a THIRD guid after Item that the
+    /// WPP 5.5.3 arm (written for 64802/65746) does not know; its meaning is unknown and
+    /// it goes out empty. Omitting it is the packed-guid-cannot-complete crash.
+    /// </summary>
+    public void Write550(WorldPacket data)
+    {
+        data.WriteUInt32((uint)Flags);
+
+        data.WritePackedGuid128(Unit);
+        data.WritePackedGuid128(Item);
+        data.WritePackedGuid128(WowGuid128.Empty);   // third guid, new in 69110; no legacy source
+
+        data.WriteBit(SrcLocation != null);
+        data.WriteBit(DstLocation != null);
+        data.WriteBit(Orientation.HasValue);
+        data.WriteBit(MapID.HasValue);
+        data.WriteBits(Name.GetByteCount(), 7);
+        data.FlushBits();
+
+        if (SrcLocation != null)
+            SrcLocation.Write(data);
+
+        if (DstLocation != null)
+            DstLocation.Write(data);
+
+        if (Orientation.HasValue)
+            data.WriteFloat(Orientation.Value);
+
+        if (MapID.HasValue)
+            data.WriteInt32(MapID.Value);
+
+        data.WriteString(Name);
+    }
+
     public SpellCastTargetFlags Flags;
     public WowGuid128 Unit;
     public WowGuid128 Item;
@@ -1210,6 +1504,14 @@ public struct SpellPowerData
     {
         data.WriteInt32(Cost);
         data.WriteInt8((sbyte)Type);
+    }
+
+    // 5.5.x reads the power type first, then the cost (WowPacketParser 5.5.0
+    // ReadSpellPowerData: u8 Type, s32 Cost).
+    public void Write550(WorldPacket data)
+    {
+        data.WriteInt8((sbyte)Type);
+        data.WriteInt32(Cost);
     }
 
     public int Cost;
@@ -1262,7 +1564,12 @@ public class SpellHealPrediction
     public void Write(WorldPacket data)
     {
         data.WriteUInt32(Points);
-        data.WriteUInt8(Type);
+        // 5.5.3 widened Type to a full int32 (client channel-start reader 0x643900 pulls
+        // guid, u32, u32, guid for the prediction; WowPacketParser's 5.5.3 arm agrees).
+        if (ModernVersion.Uses550Engine)
+            data.WriteUInt32(Type);
+        else
+            data.WriteUInt8(Type);
         data.WritePackedGuid128(BeaconGUID);
     }
 
@@ -1649,9 +1956,9 @@ public class SpellChannelStart : ServerPacket, ISpanWritable
             HealPrediction.Write(_worldPacket);
     }
 
-    // MaxSize: GUID (18) + 3 uints (12) + bits (1) + InterruptImmunities (8) + HealPrediction (41) = 80
-    // HealPrediction: TargetGUID (18) + Points (4) + Type (1) + BeaconGUID (18) = 41
-    public int MaxSize => PackedGuidHelper.MaxPackedGuid128Size + 12 + 1 + 8 + 41;
+    // MaxSize: GUID (18) + 3 uints (12) + bits (1) + InterruptImmunities (8) + HealPrediction (44) = 83
+    // HealPrediction: TargetGUID (18) + Points (4) + Type (4 on 5.5.x, 1 before) + BeaconGUID (18) = 44
+    public int MaxSize => PackedGuidHelper.MaxPackedGuid128Size + 12 + 1 + 8 + 44;
 
     public int WriteToSpan(Span<byte> buffer)
     {
@@ -1674,7 +1981,11 @@ public class SpellChannelStart : ServerPacket, ISpanWritable
         {
             writer.WritePackedGuid128(HealPrediction.TargetGUID.Low, HealPrediction.TargetGUID.High);
             writer.WriteUInt32(HealPrediction.Predict.Points);
-            writer.WriteUInt8(HealPrediction.Predict.Type);
+            // Keep in lockstep with SpellHealPrediction.Write: 5.5.3 reads Type as u32.
+            if (ModernVersion.Uses550Engine)
+                writer.WriteUInt32(HealPrediction.Predict.Type);
+            else
+                writer.WriteUInt8(HealPrediction.Predict.Type);
             writer.WritePackedGuid128(HealPrediction.Predict.BeaconGUID.Low, HealPrediction.Predict.BeaconGUID.High);
         }
 

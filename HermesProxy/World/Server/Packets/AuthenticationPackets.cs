@@ -75,8 +75,8 @@ class AuthChallenge : ServerPacket, ISpanWritable
         _worldPacket.WriteUInt8(DosZeroBits);
     }
 
-    // Fixed size: DosChallenge(32) + Challenge(16) + byte(1) = 49
-    public int MaxSize => 32 + 16 + 1;
+    // DosChallenge(32) + Challenge(16 or 32) + byte(1)
+    public int MaxSize => 32 + 32 + 1;
 
     public int WriteToSpan(Span<byte> buffer)
     {
@@ -103,7 +103,11 @@ class AuthSession : ClientPacket
         BattlegroupID = _worldPacket.ReadUInt32();
         RealmID = _worldPacket.ReadUInt32();
 
-        LocalChallenge = _worldPacket.ReadBytes(16);
+        // The challenge is 16 bytes up to 3.4.3 and 32 on the modern engine. Reading only 16 from a
+        // 2.5.6 client leaves the rest of the body shifted, so the join ticket comes out empty —
+        // and the half-challenge would then be fed into the session and encryption key derivation,
+        // which both hash it in full.
+        LocalChallenge = _worldPacket.ReadBytes(ModernVersion.Uses550Engine ? 32u : 16u);
         Digest = _worldPacket.ReadBytes(24);
 
         UseIPv6 = _worldPacket.HasBit();
@@ -161,7 +165,7 @@ class AuthResponse : ServerPacket
                     // misaligning the rest of AUTH_RESPONSE — including VirtualRealms — and
                     // thus failing to match any character's GUID realmId. (Per WPP V3_4_0_45166
                     // AuthenticationHandler.cs:39-40, gated on V3_4_3_51505+.)
-                    if (ModernVersion.ExpansionVersion >= 3)
+                    if (ModernVersion.UsesModernEngine)
                         _worldPacket.WriteUInt8(classAvailability.MinActiveExpansionLevel);
                 }
             }
@@ -171,6 +175,11 @@ class AuthResponse : ServerPacket
             _worldPacket.WriteBit(SuccessInfo.NumPlayersHorde.HasValue);
             _worldPacket.WriteBit(SuccessInfo.NumPlayersAlliance.HasValue);
             _worldPacket.WriteBit(SuccessInfo.ExpansionTrialExpiration.HasValue);
+            // A sixth bit, "has CurrentBuild", arrived with the modern engine. The proxy never
+            // fills that block in, but the bit still has to be there or every field after it lands
+            // one bit out.
+            if (ModernVersion.Uses550Engine)
+                _worldPacket.WriteBit(false);
             _worldPacket.FlushBits();
 
             {
@@ -191,7 +200,13 @@ class AuthResponse : ServerPacket
                 _worldPacket.WriteUInt16(SuccessInfo.NumPlayersAlliance.Value);
 
             if (SuccessInfo.ExpansionTrialExpiration.HasValue)
-                _worldPacket.WriteInt32(SuccessInfo.ExpansionTrialExpiration.Value);
+            {
+                // Widened to 64 bits on the modern engine.
+                if (ModernVersion.Uses550Engine)
+                    _worldPacket.WriteInt64(SuccessInfo.ExpansionTrialExpiration.Value);
+                else
+                    _worldPacket.WriteInt32(SuccessInfo.ExpansionTrialExpiration.Value);
+            }
 
             foreach (VirtualRealmInfo virtualRealm in SuccessInfo.VirtualRealms)
                 virtualRealm.Write(_worldPacket);
@@ -355,6 +370,12 @@ class ConnectTo : ServerPacket
 
     public override void Write()
     {
+        if (ModernVersion.Uses550Engine)
+        {
+            WriteModern();
+            return;
+        }
+
         ByteBuffer whereBuffer = new();
         whereBuffer.WriteUInt8((byte)Payload.Where.Type);
 
@@ -389,7 +410,51 @@ class ConnectTo : ServerPacket
     }
 
     public ulong Key;
+    /// <summary>
+    /// The 5.5.0-engine layout, read straight off the client's parser (case RVA 0x617164) and
+    /// identical to TrinityCore master. Three things changed from the older form: the RSA
+    /// signature is gone entirely, the single address became a counted list, and each entry
+    /// carries a bleep token whose three string lengths are bit-packed as 5, 24 and 6 bits.
+    /// </summary>
+    void WriteModern()
+    {
+        _worldPacket.WriteUInt32(1);                    // one address; the client accepts a list
+        _worldPacket.WriteUInt32((uint)Serial);
+        _worldPacket.WriteUInt8(Con);
+        _worldPacket.WriteUInt64(Key);
+        _worldPacket.WriteUInt32(NativeRealmAddress);
+        _worldPacket.WriteUInt32(Key3);
+
+        _worldPacket.WriteUInt8((byte)Payload.Where.Type);
+        switch (Payload.Where.Type)
+        {
+            case AddressType.IPv4:
+                _worldPacket.WriteBytes(Payload.Where.IPv4);
+                break;
+            case AddressType.IPv6:
+                _worldPacket.WriteBytes(Payload.Where.IPv6);
+                break;
+            case AddressType.NamedSocket:
+                _worldPacket.WriteCString(Payload.Where.NameSocket);
+                break;
+        }
+        _worldPacket.WriteUInt16(Payload.Port);
+
+        // BleepToken: Token, ProxyId (a C string) and Address are all empty, so the three lengths
+        // and the lifespan are the whole of it. The bits flush to five bytes before the uint64.
+        _worldPacket.WriteBits(0, 5);                   // Token length
+        _worldPacket.WriteBits(0, 24);                  // ProxyId length
+        _worldPacket.WriteBits(0, 6);                   // Address length
+        _worldPacket.WriteUInt64(0);                    // TokenLifespan, nanoseconds
+    }
+
     public ConnectToSerial Serial;
+
+    /// <summary>Realm this connection belongs to. Zero works; the client stores it verbatim.</summary>
+    public uint NativeRealmAddress;
+
+    /// <summary>Third key component, echoed back in CMSG_AUTH_CONTINUED_SESSION.</summary>
+    public uint Key3;
     public ConnectPayload Payload;
     public byte Con;
 
@@ -423,6 +488,21 @@ class AuthContinuedSession : ClientPacket
 
     public override void Read()
     {
+        if (ModernVersion.Uses550Engine)
+        {
+            // 80 bytes, matching TrinityCore master: the challenge doubled to 32 bytes, Key moved
+            // behind the digest, and NativeRealmAddress and Key3 were added. Reading the old
+            // 56-byte layout takes Key from the first eight bytes of the challenge, so the
+            // connection type decodes to garbage and the instance connection is refused.
+            DosResponse = _worldPacket.ReadUInt64();
+            LocalChallenge = _worldPacket.ReadBytes(32);
+            Digest = _worldPacket.ReadBytes(24);
+            Key = _worldPacket.ReadUInt64();
+            NativeRealmAddress = _worldPacket.ReadUInt32();
+            Key3 = _worldPacket.ReadUInt32();
+            return;
+        }
+
         DosResponse = _worldPacket.ReadUInt64();
         Key = _worldPacket.ReadUInt64();
         LocalChallenge = _worldPacket.ReadBytes(16);
@@ -431,6 +511,8 @@ class AuthContinuedSession : ClientPacket
 
     public ulong DosResponse;
     public ulong Key;
+    public uint NativeRealmAddress;
+    public uint Key3;
     public byte[] LocalChallenge = new byte[16];
     public byte[] Digest = new byte[24];
 }
@@ -452,8 +534,17 @@ class ConnectToFailed : ClientPacket
 
     public override void Read()
     {
-        Serial = (ConnectToSerial)_worldPacket.ReadUInt32();
-        Con = _worldPacket.ReadUInt8();
+        // The 5.5.0 engine reversed these two.
+        if (ModernVersion.Uses550Engine)
+        {
+            Con = _worldPacket.ReadUInt8();
+            Serial = (ConnectToSerial)_worldPacket.ReadUInt32();
+        }
+        else
+        {
+            Serial = (ConnectToSerial)_worldPacket.ReadUInt32();
+            Con = _worldPacket.ReadUInt8();
+        }
     }
 
     public ConnectToSerial Serial;
@@ -465,10 +556,19 @@ class EnterEncryptedMode : ServerPacket
     byte[] EncryptionKey;
     bool Enabled;
 
-    // The HMAC input seed has always been these 16 bytes. Retail/TBC-Classic/Era (<= 2.5.x)
-    // signs the HMAC output with the server's RSA private key; the client verifies with
+    // The HMAC input seed used up to 3.4.3: 16 bytes, hashed with SHA-256. Retail/TBC-Classic/Era
+    // (<= 2.5.x) signs the HMAC output with the server's RSA private key; the client verifies with
     // the baked-in RSA public key and the client-embedded `EnableEncryptionSeed`.
     static readonly byte[] EnableEncryptionSeed = { 0x90, 0x9C, 0xD0, 0x50, 0x5A, 0x2C, 0x14, 0xDD, 0x5C, 0x2C, 0xC0, 0x64, 0x14, 0xF3, 0xFE, 0xC9 };
+
+    // The 5.5.0-generation engine changed all three parts of the input: a different seed, twice as
+    // long, hashed with SHA-512 instead of SHA-256. Values from current CypherCore, which tracks
+    // retail. The signature scheme (Ed25519ctx, same context and key) did not change.
+    static readonly byte[] EnableEncryptionSeed512 =
+    {
+        0x66, 0xBE, 0x29, 0x79, 0xEF, 0xF2, 0xD5, 0xB5, 0x61, 0x53, 0xF6, 0x5F, 0x45, 0xAE, 0x81, 0xCB,
+        0x32, 0xEC, 0x94, 0xEC, 0x75, 0xB3, 0x5F, 0x44, 0x6A, 0x63, 0x43, 0x67, 0x17, 0x20, 0x44, 0x34
+    };
 
     // WotLK Classic 3.4.3+ replaced the RSA signature with Ed25519ctx (RFC 8032) using a
     // fixed context string. Private key and context are Blizzard constants; the client has
@@ -484,21 +584,76 @@ class EnterEncryptedMode : ServerPacket
         0x69, 0x1E, 0x72, 0x9A, 0x0A, 0xAB, 0x2C, 0x77, 0xC3, 0x6F, 0x8A, 0xE7, 0x5A, 0x9A, 0xA7, 0xC9
     };
 
-    public EnterEncryptedMode(byte[] encryptionKey, bool enabled) : base(Opcode.SMSG_ENTER_ENCRYPTED_MODE)
+    /// <param name="regionGroup">
+    /// Which region group's key the client should verify the signature with. Disassembly of the
+    /// 2.5.6 handler shows the client looks this up in a table and, when the lookup misses, skips
+    /// the signature check entirely and simply never acknowledges — no error, no disconnect. So a
+    /// wrong value here is indistinguishable from a wrong signature on the wire, and the value has
+    /// to be found by probing.
+    /// </param>
+    public EnterEncryptedMode(byte[] encryptionKey, bool enabled, int regionGroup = 0,
+                              string? layout = null)
+        : base(Opcode.SMSG_ENTER_ENCRYPTED_MODE)
     {
         EncryptionKey = encryptionKey;
         Enabled = enabled;
+        RegionGroup = regionGroup;
+        Layout = layout;
     }
+
+    int RegionGroup;
+    string? Layout;
 
     public override void Write()
     {
-        // Both paths start with HMAC-SHA256(EncryptionKey) over [Enabled] || EnableEncryptionSeed.
-        HmacSha256 hash = new(EncryptionKey);
-        hash.Process(BitConverter.GetBytes(Enabled), 1);
-        hash.Finish(EnableEncryptionSeed, 16);
-        byte[] toSign = hash.Digest!;
+        byte[] toSign;
+        if (ModernVersion.Uses550Engine)
+        {
+            HmacSha512 hash = new(EncryptionKey);
+            hash.Process(BitConverter.GetBytes(Enabled), 1);
+            hash.Finish(EnableEncryptionSeed512, 32);
+            toSign = hash.Digest!;
+        }
+        else
+        {
+            HmacSha256 hash = new(EncryptionKey);
+            hash.Process(BitConverter.GetBytes(Enabled), 1);
+            hash.Finish(EnableEncryptionSeed, 16);
+            toSign = hash.Digest!;
+        }
 
-        if (ModernVersion.ExpansionVersion >= 3)
+        if (ModernVersion.Uses550Engine)
+        {
+            // FIXME(256-spike): the client silently ignores the current retail layout
+            // (int32 RegionGroup *before* the 64-byte signature — TC master / CypherCore 11.1.7+),
+            // which is what we already sent on the wire. RegionGroup travels with the SHA-512
+            // scheme in every reference core, so the field is probably present but positioned
+            // differently on this build. HERMES_ENC_LAYOUT selects the layout so all three
+            // candidates can be tried from one build, no rebuild:
+            //   "after"           = signature, then int32 RegionGroup  (CypherCore 11.1.0, the
+            //                       first SHA-512 build) — highest-probability untried layout
+            //   "none"            = signature only, no RegionGroup      (CypherCore 12.0.0-era)
+            //   "before"(default) = int32 RegionGroup, then signature   (already disproven)
+            // Body is 65 bytes for "none", 69 otherwise; "before"/"after" differ by whether the
+            // leading or trailing 4 bytes of the existing hex dump are the zero RegionGroup.
+            switch (Layout ?? Environment.GetEnvironmentVariable("HERMES_ENC_LAYOUT"))
+            {
+                case "after":
+                    WriteEd25519(toSign);
+                    _worldPacket.WriteInt32(RegionGroup);
+                    break;
+                case "none":
+                    WriteEd25519(toSign);
+                    break;
+                default:
+                    _worldPacket.WriteInt32(RegionGroup);
+                    WriteEd25519(toSign);
+                    break;
+            }
+        }
+        // 3.4.3 was where the switch from RSA to Ed25519ctx happened; every build on that engine
+        // or newer uses Ed25519.
+        else if (ModernVersion.UsesModernEngine)
             WriteEd25519(toSign);
         else
             WriteRsa(toSign);
@@ -529,7 +684,13 @@ public class AuthWaitInfo
     {
         data.WriteUInt32(WaitCount);
         data.WriteUInt32(WaitTime);
+        // The modern engine added a faction-group restriction byte and a second bit here. The
+        // proxy has no value for either, but their absence would shift everything after them.
+        if (ModernVersion.Uses550Engine)
+            data.WriteUInt8(0);
         data.WriteBit(HasFCM);
+        if (ModernVersion.Uses550Engine)
+            data.WriteBit(false);
         data.FlushBits();
     }
 

@@ -42,6 +42,12 @@ public class FeatureSystemStatus : ServerPacket
 
     public override void Write()
     {
+        if (ModernVersion.Uses550Engine)
+        {
+            Write550();
+            return;
+        }
+
         _worldPacket.WriteUInt8(ComplaintStatus);
 
         _worldPacket.WriteUInt32(ScrollOfResurrectionRequestsRemaining);
@@ -289,7 +295,216 @@ public class FeatureSystemStatus : ServerPacket
         public uint MaxRecruitmentUses;
         public uint DaysInCycle;
     }
+
+    /// <summary>
+    /// 2.5.6 build 69110 body, read out of the client itself - not ported from a parser.
+    ///
+    /// Derivation (see REFERENCE-256-CLIENT.md sections 89/106): the group 0x46 jump table
+    /// dispatches case 0x460063 to the parse wrapper at RVA 0x5A8210, which calls the body reader
+    /// at RVA 0x5A7830. That reader was walked instruction by instruction
+    /// (tools-256-spike/apdreader.py 5A7830) and cross-checked against the jump-table field
+    /// sequence in tools-256-spike/opcode_bodies_jt.txt. The two derivations agree everywhere
+    /// both can see; the jump-table line additionally misses three sub-readers that only the
+    /// instruction walk exposes (QuickJoinConfig at 0x5A7560: 22 floats + 1 bit byte = 89
+    /// unconditional bytes; two EuropaTicket throttle blocks at 0x5A74D0: 4 uint32 each).
+    ///
+    /// The previous three crashes came from transcribing WowPacketParser handler order. The
+    /// client's real shape (nearest named relative: WPP module V12_0_0_65390 plus the classic-only
+    /// extras of V5_5_0_61735):
+    ///
+    ///   +0    uint8   ComplaintStatus
+    ///   +1    9 x uint32  CfgRealmID, CfgRealmRecID, RAF{MaxRecruits, MaxRecruitMonths,
+    ///                     MaxRecruitmentUses, DaysInCycle, RewardsVersion},
+    ///                     CommercePricePollTimeSeconds, KioskSessionDurationMinutes
+    ///   +37   uint64  RedeemForBalanceAmount
+    ///   +45   7 x uint32  ClubsPresenceDelay, ClubPresenceUnsubscribeDelay, ContentSetID,
+    ///                     DisabledGameModesCount, GameRulesCount, ActiveTimerunningSeasonID,
+    ///                     RemainingTimerunningSeasonSeconds
+    ///   +73   2 x int16   MaxPlayerGuidLookupsPerRequest, NameLookupTelemetryInterval
+    ///   +77   12 x u32    NotFoundCacheTimeSeconds, RealmPvpTypeOverride, AddonChatThrottle x3,
+    ///                     GuildChatThrottle x2, GroupChatThrottle x2, AddonPerformanceMsg x3 (floats)
+    ///   +125  DisabledGameModes[count] of { uint8, uint32, uint32 }   (9 wire bytes each)
+    ///         GameRules[count] of { int32 Rule, int32 Value, float ValueF }
+    ///         8 bit-bytes, MSB-first: 43 flags, a 10-bit string length, 7 flags, 4 pad bits.
+    ///             Gates verified in the client: bit 1 -> EuropaTicket tail, bit 4 -> SessionAlert,
+    ///             bit 34 -> RaceClassExpansionLevels array. NOT bits-first: the previous body put
+    ///             a 56-bit block at the front; the client reads the bits only here, after the
+    ///             scalars (the bits-first shape belongs to the glue-screen sibling 0x460064).
+    ///         QuickJoinConfig: 22 floats + 1 bit-byte (ToastsDisabled in the MSB)  [0x5A7560]
+    ///         [bit 4]  SessionAlert { int32 Delay, Period, DisplayTime }
+    ///         [bit 34] uint32 count + count x uint8 (RaceClassExpansionLevels)
+    ///         string bytes, length = the 10-bit value above (Unknown1027; we send 0)
+    ///         1 bit-byte (IsSquelched in the MSB), packed guid128 BnetAccountGuid, packed
+    ///         guid128 GuildGuid
+    ///         [bit 1]  EuropaTicket: 1 bit-byte (Tickets/Bugs/Complaints/Suggestions in the top
+    ///                  4 bits) + TWO throttle blocks of 4 uint32 each. Both WPP modules show only
+    ///                  one throttle block here - the client reader (two calls to 0x5A74D0)
+    ///                  disagrees, and the client wins.
+    ///
+    /// Minimum body (all gates off, counts 0, empty guids): 227 bytes. The old body was 137
+    /// bytes, which is why the client ran off the end and crashed in the packed-guid assembler.
+    /// </summary>
+    void Write550()
+    {
+        _worldPacket.WriteUInt8(ComplaintStatus);              // +0
+        _worldPacket.WriteUInt32(CfgRealmID);                  // +1
+        _worldPacket.WriteInt32(CfgRealmRecID);                // +5
+        _worldPacket.WriteUInt32(RAFSystem.MaxRecruits);       // +9
+        _worldPacket.WriteUInt32(RAFSystem.MaxRecruitMonths);  // +13
+        _worldPacket.WriteUInt32(RAFSystem.MaxRecruitmentUses);// +17
+        _worldPacket.WriteUInt32(RAFSystem.DaysInCycle);       // +21
+        _worldPacket.WriteUInt32(0);                           // +25 RAFSystem.RewardsVersion
+        _worldPacket.WriteUInt32(TokenPollTimeSeconds);        // +29 CommercePricePollTimeSeconds
+        _worldPacket.WriteUInt32(KioskSessionMinutes);         // +33 KioskSessionDurationMinutes
+        _worldPacket.WriteInt64(TokenBalanceAmount);           // +37 RedeemForBalanceAmount
+        _worldPacket.WriteUInt32(ClubsPresenceUpdateTimer);    // +45 ClubsPresenceDelay
+        _worldPacket.WriteUInt32(HiddenUIClubsPresenceUpdateTimer); // +49 ClubPresenceUnsubscribeDelay
+        _worldPacket.WriteInt32(0);                            // +53 ContentSetID
+        _worldPacket.WriteInt32(0);                            // +57 DisabledGameModesCount
+        _worldPacket.WriteInt32(GameRuleValues.Count);         // +61 GameRulesCount
+        _worldPacket.WriteInt32(ActiveSeason);                 // +65 ActiveTimerunningSeasonID
+        _worldPacket.WriteInt32(0);                            // +69 RemainingTimerunningSeasonSeconds
+        _worldPacket.WriteInt16(50);                           // +73 MaxPlayerGuidLookupsPerRequest
+        _worldPacket.WriteInt16(600);                          // +75 NameLookupTelemetryInterval
+        _worldPacket.WriteUInt32(10);                          // +77 NotFoundCacheTimeSeconds
+        _worldPacket.WriteUInt32(0);                           // +81 RealmPvpTypeOverride
+        _worldPacket.WriteInt32(0);                            // +85 AddonChatThrottle.MaxTries
+        _worldPacket.WriteInt32(0);                            // +89 AddonChatThrottle.TriesRestoredPerSecond
+        _worldPacket.WriteInt32(0);                            // +93 AddonChatThrottle.UsedTriesPerMessage
+        _worldPacket.WriteInt32(0);                            // +97 GuildChatThrottle.UsedTriesPerMessage
+        _worldPacket.WriteInt32(0);                            // +101 GuildChatThrottle.TriesRestoredPerSecond
+        _worldPacket.WriteInt32(0);                            // +105 GroupChatThrottle.UsedTriesPerMessage
+        _worldPacket.WriteInt32(0);                            // +109 GroupChatThrottle.TriesRestoredPerSecond
+        _worldPacket.WriteFloat(0.0f);                         // +113 AddonPerformanceMsgWarning
+        _worldPacket.WriteFloat(0.0f);                         // +117 AddonPerformanceMsgError
+        _worldPacket.WriteFloat(0.0f);                         // +121 AddonPerformanceMsgOverall
+
+        // DisabledGameModes: count written as 0 above; each element would be u8 + u32 + u32.
+
+        foreach (var rule in GameRuleValues)                   // { int32, int32, float } on 5.5.0
+        {
+            _worldPacket.WriteInt32(rule.Rule);
+            _worldPacket.WriteInt32(rule.Value);
+            _worldPacket.WriteFloat(0.0f);                     // ValueF - no legacy counterpart
+        }
+
+        // The bit block: 43 flags, a 10-bit string length, 7 flags - 60 bits flushed to exactly
+        // 8 bytes, MSB-first. Names for bits 0..33 follow WPP V12_0_0_65390; the three gate bits
+        // (1, 4, 34) and the length position are verified against the client's reader and are the
+        // only bits that change the byte stream. Bits 35..42 are this classic build's feature
+        // block (LFD/LFR/pet happiness/guild flags among them, exact order not recoverable) and
+        // are all sent clear, as are the 7 post-length bits.
+        _worldPacket.WriteBit(VoiceEnabled);                        // 0
+        _worldPacket.WriteBit(EuropaTicketSystemStatus != null);    // 1  gate: EuropaTicket tail
+        _worldPacket.WriteBit(BpayStoreAvailable);                  // 2
+        _worldPacket.WriteBit(ItemRestorationButtonEnabled);        // 3
+        _worldPacket.WriteBit(SessionAlert != null);                // 4  gate: SessionAlert
+        _worldPacket.WriteBit(RAFSystem.Enabled);                   // 5
+        _worldPacket.WriteBit(RAFSystem.RecruitingEnabled);         // 6
+        _worldPacket.WriteBit(CharUndeleteEnabled);                 // 7
+        _worldPacket.WriteBit(RestrictedAccount);                   // 8
+        _worldPacket.WriteBit(CommerceSystemEnabled);               // 9
+        _worldPacket.WriteBit(TutorialsEnabled);                    // 10
+        _worldPacket.WriteBit(Unk67);                               // 11 VeteranTokenRedeemWillKick
+        _worldPacket.WriteBit(WillKickFromWorld);                   // 12 WorldTokenRedeemWillKick
+        _worldPacket.WriteBit(KioskModeEnabled);                    // 13
+        _worldPacket.WriteBit(CompetitiveModeEnabled);              // 14
+        _worldPacket.WriteBit(TokenBalanceEnabled);                 // 15 RedeemForBalanceAvailable
+        _worldPacket.WriteBit(WarModeFeatureEnabled);               // 16
+        _worldPacket.WriteBit(ClubsEnabled);                        // 17 CommunitiesEnabled
+        _worldPacket.WriteBit(ClubsBattleNetClubTypeAllowed);       // 18 BnetGroupsEnabled
+        _worldPacket.WriteBit(ClubsCharacterClubTypeAllowed);       // 19 CharacterCommunitiesEnabled
+        _worldPacket.WriteBit(ClubsPresenceUpdateEnabled);          // 20 ClubPresenceAllowSubscribeAll
+        _worldPacket.WriteBit(VoiceChatDisabledByParentalControl);  // 21
+        _worldPacket.WriteBit(VoiceChatMutedByParentalControl);     // 22
+        _worldPacket.WriteBit(QuestSessionEnabled);                 // 23
+        _worldPacket.WriteBit(IsMuted);                             // 24 IsChatMuted
+        _worldPacket.WriteBit(ClubFinderEnabled);                   // 25
+        _worldPacket.WriteBit(false);                               // 26 CommunityFinderEnabled
+        _worldPacket.WriteBit(false);                               // 27 BrowserCrashReporterEnabled
+        _worldPacket.WriteBit(false);                               // 28 SpeakForMeAllowed
+        _worldPacket.WriteBit(false);                               // 29 DoesAccountNeedAADCPrompt
+        _worldPacket.WriteBit(false);                               // 30 IsAccountOptedInToAADC
+        _worldPacket.WriteBit(LFGListCustomRequiresAuthenticator);  // 31 LfgRequireAuthenticatorEnabled
+        _worldPacket.WriteBit(false);                               // 32 ScriptsDisallowedForBeta
+        _worldPacket.WriteBit(false);                               // 33 TimerunningEnabled / WarGamesEnabled
+        _worldPacket.WriteBit(RaceClassExpansionLevels.Count > 0);  // 34 gate: byte array below
+        for (int i = 35; i <= 42; ++i)
+            _worldPacket.WriteBit(false);                           // 35..42 classic feature block
+        _worldPacket.WriteBits(0, 10);                              // Unknown1027 string length
+        for (int i = 0; i < 7; ++i)
+            _worldPacket.WriteBit(false);                           // 7 post-length flags
+        _worldPacket.FlushBits();                                   // 60 bits -> 8 bytes
+
+        // QuickJoinConfig, read unconditionally by the sub-reader at 0x5A7560: 22 floats then
+        // ToastsDisabled as the MSB of one trailing bit-byte. 89 bytes. Both the jump-table line
+        // and the crash-frame primitive counts missed this block entirely, which alone accounts
+        // for most of the shortfall that crashed the client.
+        _worldPacket.WriteFloat(QuickJoinConfig.ToastDuration);
+        _worldPacket.WriteFloat(QuickJoinConfig.DelayDuration);
+        _worldPacket.WriteFloat(QuickJoinConfig.QueueMultiplier);
+        _worldPacket.WriteFloat(QuickJoinConfig.PlayerMultiplier);
+        _worldPacket.WriteFloat(QuickJoinConfig.PlayerFriendValue);
+        _worldPacket.WriteFloat(QuickJoinConfig.PlayerGuildValue);
+        _worldPacket.WriteFloat(QuickJoinConfig.ThrottleInitialThreshold);
+        _worldPacket.WriteFloat(QuickJoinConfig.ThrottleDecayTime);
+        _worldPacket.WriteFloat(QuickJoinConfig.ThrottlePrioritySpike);
+        _worldPacket.WriteFloat(QuickJoinConfig.ThrottleMinThreshold);
+        _worldPacket.WriteFloat(QuickJoinConfig.ThrottlePvPPriorityNormal);
+        _worldPacket.WriteFloat(QuickJoinConfig.ThrottlePvPPriorityLow);
+        _worldPacket.WriteFloat(QuickJoinConfig.ThrottlePvPHonorThreshold);
+        _worldPacket.WriteFloat(QuickJoinConfig.ThrottleLfgListPriorityDefault);
+        _worldPacket.WriteFloat(QuickJoinConfig.ThrottleLfgListPriorityAbove);
+        _worldPacket.WriteFloat(QuickJoinConfig.ThrottleLfgListPriorityBelow);
+        _worldPacket.WriteFloat(QuickJoinConfig.ThrottleLfgListIlvlScalingAbove);
+        _worldPacket.WriteFloat(QuickJoinConfig.ThrottleLfgListIlvlScalingBelow);
+        _worldPacket.WriteFloat(QuickJoinConfig.ThrottleRfPriorityAbove);
+        _worldPacket.WriteFloat(QuickJoinConfig.ThrottleRfIlvlScalingAbove);
+        _worldPacket.WriteFloat(QuickJoinConfig.ThrottleDfMaxItemLevel);
+        _worldPacket.WriteFloat(QuickJoinConfig.ThrottleDfBestPriority);
+        _worldPacket.WriteBit(QuickJoinConfig.ToastsDisabled);
+        _worldPacket.FlushBits();
+
+        if (SessionAlert != null)
+        {
+            _worldPacket.WriteInt32(SessionAlert.Delay);
+            _worldPacket.WriteInt32(SessionAlert.Period);
+            _worldPacket.WriteInt32(SessionAlert.DisplayTime);
+        }
+
+        if (RaceClassExpansionLevels.Count > 0)
+        {
+            _worldPacket.WriteInt32(RaceClassExpansionLevels.Count);
+            foreach (var level in RaceClassExpansionLevels)
+                _worldPacket.WriteUInt8(level);
+        }
+
+        // Unknown1027 string bytes would go here; its 10-bit length above is 0.
+
+        _worldPacket.WriteBit(Squelch.IsSquelched);
+        _worldPacket.FlushBits();
+        _worldPacket.WritePackedGuid128(Squelch.BnetAccountGuid);
+        _worldPacket.WritePackedGuid128(Squelch.GuildGuid);
+
+        if (EuropaTicketSystemStatus != null)
+        {
+            // The client reads one bit-byte and then TWO 4-uint32 throttle blocks (calls the
+            // reader at 0x5A74D0 twice, into adjacent structs). We only carry one throttle
+            // state, so it goes in the first block and the second is zeroed.
+            _worldPacket.WriteBit(EuropaTicketSystemStatus.TicketsEnabled);
+            _worldPacket.WriteBit(EuropaTicketSystemStatus.BugsEnabled);
+            _worldPacket.WriteBit(EuropaTicketSystemStatus.ComplaintsEnabled);
+            _worldPacket.WriteBit(EuropaTicketSystemStatus.SuggestionsEnabled);
+            _worldPacket.FlushBits();
+            EuropaTicketSystemStatus.ThrottleState.Write(_worldPacket);
+            _worldPacket.WriteUInt32(0);                   // second throttle block: MaxTries
+            _worldPacket.WriteUInt32(0);                   //   PerMilliseconds
+            _worldPacket.WriteUInt32(0);                   //   TryCount
+            _worldPacket.WriteUInt32(0);                   //   LastResetTimeBeforeNow
+        }
+    }
 }
+
 
 public class FeatureSystemStatusGlueScreen : ServerPacket
 {
@@ -297,7 +512,88 @@ public class FeatureSystemStatusGlueScreen : ServerPacket
 
     public override void Write()
     {
-        if (ModernVersion.ExpansionVersion >= 3)
+        if (ModernVersion.Uses550Engine)
+        {
+            // Layout read directly out of the client's own parser (RVA 0x5A8320 in build 69110),
+            // not derived from WowPacketParser. See REFERENCE-256-CLIENT.md section 14.
+            //
+            // The previous body here was a guess, and it was also sent under the wrong opcode:
+            // this build inserts a message before index 0x62 of group 0x46, so the glue-screen
+            // status is 0x460064 and 0x460063 is the in-game SMSG_FEATURE_SYSTEM_STATUS. Handing
+            // this body to the in-game parser is what crashed the client.
+            //
+            // Field names are not recoverable from the binary — only widths and order — so the
+            // comments below give the client's struct offsets instead of invented names. Every
+            // value is zero: that is the layout the client accepts, but the values have not been
+            // shown to be the ones it wants.
+
+            // 48 bits, MSB-first, exactly six bytes.
+            for (int i = 0; i < 8; i++)
+                _worldPacket.WriteBit(false);       // +0x20 +0x21 +0x22 +0x23 +0x28 +0x29 +0x2a +0x2b
+            for (int i = 0; i < 8; i++)
+                _worldPacket.WriteBit(false);       // +0x30 +0x31 +0x32 +0x33 +0x44 +0x45 +0x46 +0x47
+
+            _worldPacket.WriteBit(false);           // +0x60
+            _worldPacket.WriteBit(false);           // +0x61
+            _worldPacket.WriteBit(false);           // +0x62
+            _worldPacket.WriteBit(false);           // has-block A (+0x98): 33 more bytes when set
+            _worldPacket.WriteBit(false);           // +0x9c
+            _worldPacket.WriteBit(false);           // has-field B (+0xa4): one more uint32 when set
+            _worldPacket.WriteBit(false);           // +0xa8
+            _worldPacket.WriteBit(false);           // +0xa9
+
+            for (int i = 0; i < 7; i++)
+                _worldPacket.WriteBit(false);       // +0xaa +0xab +0x100 +0x10e +0x118 +0x119 +0x11a
+
+            _worldPacket.WriteBits(0, 11);          // length of the trailing alert string (+0x148)
+
+            for (int i = 0; i < 6; i++)
+                _worldPacket.WriteBit(false);       // +0x16c +0x16d +0x16e +0x16f +0x170 +0x171
+
+            _worldPacket.FlushBits();
+
+            // Block A is absent because its bit is clear.
+
+            // The 23 scalars line up one for one with CypherCore's FeatureSystemStatusGlueScreen —
+            // same order, same widths, including the int64 in third place and the two int16s near
+            // the end — so the client's struct offsets can be given their real names.
+            _worldPacket.WriteUInt32(0);            // CommercePricePollTimeSeconds      +0x24
+            _worldPacket.WriteUInt32(0);            // KioskSessionDurationMinutes       +0x2c
+            _worldPacket.WriteInt64(0);             // RedeemForBalanceAmount            +0x38
+
+            // Zero here means "this realm allows no characters", which is enough on its own to
+            // leave the character-select screen blank however correct the character list is.
+            _worldPacket.WriteInt32(10);            // MaxCharactersOnThisRealm          +0x40
+
+            _worldPacket.WriteUInt32(0);            // LiveRegionCharacterCopySourceRegions count
+            _worldPacket.WriteInt32(0);             // ActiveBoostType                   +0x64
+            _worldPacket.WriteInt32(0);             // TrialBoostType                    +0x68
+            _worldPacket.WriteInt32(0);             // MinimumExpansionLevel             +0x6c
+
+            // The character is a TBC one, so a maximum of 0 (Classic) would exclude it.
+            _worldPacket.WriteInt32((int)ModernVersion.ExpansionVersion); // MaximumExpansionLevel +0x70
+
+            _worldPacket.WriteInt32(0);             // ContentSetID                      +0xac
+            _worldPacket.WriteUInt32(0);            // DisabledGameModes count   { u8, u32, u32 }
+            _worldPacket.WriteUInt32(0);            // GameRules count           { u32, u32, f32 }
+            _worldPacket.WriteUInt32(0);            // AvailableGameModeIDs count
+            _worldPacket.WriteInt32(0);             // ActiveTimerunningSeasonID         +0xf8
+            _worldPacket.WriteInt32(0);             // RemainingTimerunningSeasonSeconds +0xfc
+            _worldPacket.WriteInt32(0);             // TimerunningConversionMinCharacterAge +0x104
+            _worldPacket.WriteInt32(0);             // TimerunningConversionMaxSeasonID  +0x108
+            _worldPacket.WriteInt16(0);             // MaxPlayerGuidLookupsPerRequest    +0x10c
+            _worldPacket.WriteInt16(0);             // NameLookupTelemetryInterval       +0x110
+            _worldPacket.WriteUInt32(0);            // NotFoundCacheTimeSeconds          +0x114
+            _worldPacket.WriteUInt32(0);            // DebugTimeEvents count     { u32, u8, string }
+            _worldPacket.WriteInt32(0);             // MostRecentTimeEventID             +0x138
+            _worldPacket.WriteUInt32(0);            // EventRealmQueues                  +0x168
+
+            // Field B is absent, the alert string is empty, and all five arrays have count zero,
+            // so the body ends here at 98 bytes.
+            return;
+        }
+
+        if (ModernVersion.UsesModernEngine)
         {
             // 3.4.3 (WotLK Classic) layout per WPP V3_4_0_45166 MiscellaneousHandler.cs:124-203
             // (gated on V3_4_3_51505+, before V3_4_4_59817). Reads 30 bits + EuropaTicket-conditional
@@ -522,6 +818,21 @@ public class SetTimeZoneInformation : ServerPacket, ISpanWritable
 
     public override void Write()
     {
+        // This build reads three 7-bit lengths and three strings, not two: the client's
+        // constructor is u8, u8, u8 then three string reads. CypherCore has the same third field
+        // (ServerRegionalTimeTZ); the older two-string form would leave the client one string short.
+        if (ModernVersion.Uses550Engine)
+        {
+            _worldPacket.WriteBits(ServerTimeTZ.GetByteCount(), 7);
+            _worldPacket.WriteBits(GameTimeTZ.GetByteCount(), 7);
+            _worldPacket.WriteBits(ServerRegionalTimeTZ.GetByteCount(), 7);
+            _worldPacket.FlushBits();
+            _worldPacket.WriteString(ServerTimeTZ);
+            _worldPacket.WriteString(GameTimeTZ);
+            _worldPacket.WriteString(ServerRegionalTimeTZ);
+            return;
+        }
+
         _worldPacket.WriteBits(ServerTimeTZ.GetByteCount(), 7);
         _worldPacket.WriteBits(GameTimeTZ.GetByteCount(), 7);
         _worldPacket.WriteString(ServerTimeTZ);
@@ -540,6 +851,9 @@ public class SetTimeZoneInformation : ServerPacket, ISpanWritable
         if (serverBytes > MaxTZBytes || gameBytes > MaxTZBytes)
             return -1;
 
+        if (ModernVersion.Uses550Engine)
+            return -1;      // three-string form, take the ordinary Write() path
+
         var writer = new SpanPacketWriter(buffer);
         writer.WriteBits((uint)serverBytes, 7);
         writer.WriteBits((uint)gameBytes, 7);
@@ -550,6 +864,7 @@ public class SetTimeZoneInformation : ServerPacket, ISpanWritable
 
     public string ServerTimeTZ = string.Empty;
     public string GameTimeTZ = string.Empty;
+    public string ServerRegionalTimeTZ = string.Empty;
 }
 
 public struct SavedThrottleObjectState

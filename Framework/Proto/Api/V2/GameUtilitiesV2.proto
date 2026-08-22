@@ -1,0 +1,35 @@
+// Battle.net game utilities service, version 2 — how modern clients ask for the realm list.
+//
+// Same job as the v1 service this proxy already implements, but the request carries
+// bgs.protocol.v2 attributes instead of v1 ones, and the response puts them under "result".
+// Reconstructed from CypherCore's generated bindings.
+//
+// Service hash: 0x5DBB51C2. Methods: 1 ProcessTask, 2 GetAllValuesForAttribute.
+//
+// Generate with (attribute_types.proto is an import stub — the real types are already vendored):
+//   protoc -I <stubdir> -I . --csharp_out=. GameUtilitiesV2.proto
+
+syntax = "proto2";
+
+package bgs.protocol.game_utilities.v2.client;
+
+import "bgs/low/pb/client/api/client/v2/attribute_types.proto";
+
+option csharp_namespace = "Bgs.Protocol.GameUtilities.V2.Client";
+
+message ProcessTaskRequest {
+    repeated bgs.protocol.v2.Attribute attribute = 1;
+    repeated bgs.protocol.v2.Attribute payload = 2;
+}
+
+message ProcessTaskResponse {
+    repeated bgs.protocol.v2.Attribute result = 1;
+}
+
+message GetAllValuesForAttributeRequest {
+    optional string attribute_key = 1;
+}
+
+message GetAllValuesForAttributeResponse {
+    repeated bgs.protocol.v2.Variant attribute_value = 1;
+}

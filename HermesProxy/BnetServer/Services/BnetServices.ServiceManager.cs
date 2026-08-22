@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Concurrent;
 using System.Reflection;
 using Framework.Constants;
@@ -134,6 +134,14 @@ public partial class BnetServices
 
                 if (status != BattlenetRpcErrorCode.Ok)
                     SendErrorResponse(status);
+            }
+
+            // Anything the handler queued goes out now that the reply is on the wire.
+            var pending = _serviceHolder.PendingNotification;
+            if (pending != null)
+            {
+                _serviceHolder.PendingNotification = null;
+                pending();
             }
         }
     }

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Linq.Expressions;
 using System.Net;
@@ -45,6 +45,19 @@ public partial class BnetServices
     }
 
     public GlobalSessionData Session => _globalSession;
+
+    /// <summary>
+    /// Server-initiated message queued by a handler to go out *after* the reply to the call being
+    /// handled. Clients that expect the RPC response before a listener notification stall when the
+    /// two arrive the other way round; upstream gets this ordering from its continuation-passing
+    /// handlers, which this proxy's synchronous dispatch does not have.
+    /// </summary>
+    internal Action? PendingNotification;
+
+    private void SendRequestAfterResponse(OriginalHash service, uint methodId, IMessage? data)
+    {
+        PendingNotification = () => SendRequest(service, methodId, data);
+    }
 
     private void SendRequest(OriginalHash service, uint methodId, IMessage? data)
     {

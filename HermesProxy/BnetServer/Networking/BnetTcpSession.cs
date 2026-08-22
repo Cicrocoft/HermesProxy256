@@ -408,11 +408,31 @@ public class BnetTcpSession : SSLSocket, BnetServices.INetwork
 
             try
             {
-                var stream = new CodedInputStream(result.PayloadArray, 0, result.PayloadLength);
+                // A message whose header declares no payload comes back with a null array rather
+                // than an empty rental. Modern clients send several such bodyless calls right
+                // after logon, so this is a normal case, not a parse failure.
+                var stream = new CodedInputStream(result.PayloadArray ?? Array.Empty<byte>(), 0, result.PayloadLength);
+
+                // FIXME(256-spike): temporary diagnostics. Packets are dropped below without a
+                // trace when they carry no service hash, which makes a client that addresses a
+                // bound service indistinguishable from one that sent nothing. Remove before any PR.
+                Framework.Logging.Log.Print(Framework.Logging.LogType.Warn,
+                    $"[256-spike] BNet in: serviceId={result.Header!.ServiceId} hash=0x{result.Header.ServiceHash:X8} method={result.Header.MethodId} token={result.Header.Token} size={result.PayloadLength}");
+
                 if (result.Header!.ServiceId != 0xFE && result.Header.ServiceHash != 0)
                 {
                     _handlerManager.Invoke(result.Header.ServiceId, (OriginalHash)result.Header.ServiceHash, result.Header.MethodId, result.Header.Token, stream);
                 }
+            }
+            catch (Exception ex)
+            {
+                // A throw here used to escape ReadHandler, which is started fire-and-forget from
+                // AsyncRead. That skipped the AsyncRead() call that continues the loop AND lost the
+                // exception unobserved, so the connection went deaf without a single log line while
+                // still looking healthy from the outside. Handling one bad message must not take
+                // the session down silently.
+                Framework.Logging.Log.Print(Framework.Logging.LogType.Error,
+                    $"BnetTcpSession: handler for service 0x{result.Header?.ServiceHash:X8}/m:{result.Header?.MethodId} threw, connection kept open: {ex}");
             }
             finally
             {

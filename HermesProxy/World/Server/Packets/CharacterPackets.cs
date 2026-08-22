@@ -43,7 +43,69 @@ public sealed class EnumCharactersResult : ServerPacket
             $"[Trace] EnumCharactersResult.Write: ENTER expansion={ModernVersion.ExpansionVersion} chars={Characters.Count}");
         int envStart = _worldPacket.GetData().Length;
 
-        if (ModernVersion.ExpansionVersion >= 3)
+        if (ModernVersion.Uses550Engine)
+        {
+            // FIXME(256-spike): bisect knob. With HERMES_CHARLIST_EMPTY=1 the list goes out with no
+            // characters, which exercises the envelope alone. An empty character-select screen then
+            // means the envelope is right and the fault is in the per-character record; a crash
+            // means the envelope itself is still wrong.
+            if (Environment.GetEnvironmentVariable("HERMES_CHARLIST_EMPTY") == "1")
+            {
+                Framework.Logging.Log.Print(Framework.Logging.LogType.Warn,
+                    $"[256-spike] suppressing {Characters.Count} character(s) — envelope-only test");
+                Characters.Clear();
+            }
+
+            // 5.5.0-generation envelope. Three more flag bits and two more counters than 3.4.3,
+            // which is what made the client read a garbage character count and try to allocate
+            // ~73 GB. Field order per WowPacketParser's V11_0_0_55666 CharacterHandler, taking the
+            // branches for a build past 11.2.7 (IsAccountLapsedPlayer present) and past 11.1.0
+            // (warband groups moved to the end).
+            _worldPacket.WriteBit(Success);
+            _worldPacket.WriteBit(false);                       // Realmless
+            _worldPacket.WriteBit(IsDeletedCharacters);
+            _worldPacket.WriteBit(IsNewPlayerRestrictionSkipped);
+            _worldPacket.WriteBit(IsNewPlayerRestricted);
+            _worldPacket.WriteBit(IsNewPlayer);
+            _worldPacket.WriteBit(IsTrialAccountRestricted);
+            _worldPacket.WriteBit(false);                       // IsAccountLapsedPlayer
+            _worldPacket.WriteBit(DisabledClassesMask.HasValue);
+            _worldPacket.WriteBit(false);                       // ForceCharacterListSort
+
+            _worldPacket.WriteUInt32((uint)Characters.Count);
+            _worldPacket.WriteUInt32(0);                        // RegionwideCharacters
+            _worldPacket.WriteInt32(MaxCharacterLevel);
+            _worldPacket.WriteUInt32((uint)RaceUnlockData.Count);
+            _worldPacket.WriteUInt32((uint)UnlockedConditionalAppearances.Count);
+            _worldPacket.WriteUInt32((uint)RaceLimitDisablesCount);
+            _worldPacket.WriteUInt32(0);                        // WarbandGroups
+
+            if (DisabledClassesMask.HasValue)
+                _worldPacket.WriteUInt32(DisabledClassesMask.Value);
+
+            foreach (var unlockedConditionalAppearance in UnlockedConditionalAppearances)
+                unlockedConditionalAppearance.Write(_worldPacket);
+
+            // RaceLimitDisables loop intentionally absent — count is always 0.
+
+            DumpEnvelope(envStart);
+
+            foreach (var charInfo in Characters)
+                charInfo.Write(_worldPacket);
+
+            // RegionwideCharacters loop intentionally absent — count is always 0.
+
+            foreach (var raceUnlock in RaceUnlockData)
+                raceUnlock.Write550(_worldPacket);
+
+            // WarbandGroups trail the race unlocks on this generation; count is always 0.
+
+            Framework.Logging.Log.Print(Framework.Logging.LogType.Trace,
+                $"[Trace] EnumCharactersResult.Write: EXIT total={_worldPacket.GetData().Length}b (5.5.0 path)");
+            return;
+        }
+
+        if (ModernVersion.UsesModernEngine)
         {
             Framework.Logging.Log.Print(Framework.Logging.LogType.Trace,
                 "[Trace] EnumCharactersResult.Write: branch=V3_4_3 (WPP layout, 7 bits + 5 UInt32s)");
@@ -161,7 +223,11 @@ public sealed class EnumCharactersResult : ServerPacket
         {
             int startSize = data.GetData().Length;
 
-            if (ModernVersion.ExpansionVersion >= 3)
+            if (ModernVersion.Uses550Engine)
+            {
+                Write_V5_5_0(data);
+            }
+            else if (ModernVersion.UsesModernEngine)
             {
                 Write_V3_4_3(data);
             }
@@ -185,6 +251,108 @@ public sealed class EnumCharactersResult : ServerPacket
                 $"[CharInfo] first40={firstHex}");
             Framework.Logging.Log.Print(Framework.Logging.LogType.Network,
                 $"[CharInfo] last30={lastHex}");
+        }
+
+        /// <summary>
+        /// Per-character body for the 5.5.0-generation engine.
+        /// </summary>
+        /// <remarks>
+        /// Field order per WowPacketParser's V11_0_0_55666 ReadBasicCharacterListEntry followed by
+        /// ReadCharacterRestrictionAndMailData, taking every branch a build past 12.0.7 takes.
+        /// Compared with 3.4.3 this reorders most of the record, widens ListPosition to 16 bits,
+        /// moves SpecID up next to ClassID, adds Flags4 / CantLoginReason / CreateTime /
+        /// PersonalTabard / TimerunningSeasonID / RealmQueue / NoRpeReason, and cuts the visual
+        /// item array from 34 slots to 19 while widening each entry.
+        ///
+        /// Values the legacy 8606 core cannot supply are written as zero: they are display-only
+        /// here, and a wrong length anywhere would desynchronise everything after it.
+        /// </remarks>
+        private void Write_V5_5_0(WorldPacket data)
+        {
+            data.WritePackedGuid128(Guid);
+            // Must be the realm this character belongs to, not zero: the glue screen groups
+            // characters by realm and AUTH_RESPONSE advertises exactly one virtual realm, so a
+            // character claiming realm 0 matches nothing. A snapshot of the client confirmed it
+            // parsed the record correctly and stored VirtualRealmAddress = 0.
+            data.WriteUInt32(VirtualRealmAddress);
+            data.WriteUInt16(ListPosition);
+            data.WriteUInt8((byte)RaceId);
+            data.WriteUInt8((byte)SexId);
+            data.WriteUInt8((byte)ClassId);
+            data.WriteInt16((short)SpecID);
+            data.WriteUInt32((uint)Customizations.Count);
+            data.WriteUInt8(ExperienceLevel);
+            data.WriteInt32((int)MapId);
+            data.WriteInt32((int)ZoneId);
+            data.WriteVector3(PreloadPos);
+            data.WriteUInt64(GuildClubMemberID);
+            data.WritePackedGuid128(GuildGuid);
+            data.WriteUInt32((uint)Flags);
+            data.WriteUInt32(Flags2);
+            data.WriteUInt32(Flags3);
+            data.WriteUInt32(Flags4);
+            data.WriteUInt8(0);                        // CantLoginReason
+            data.WriteUInt32(PetCreatureDisplayId);
+            data.WriteUInt32(PetExperienceLevel);
+            data.WriteUInt32(PetCreatureFamilyId);
+
+            const int VisualItemCount_V5_5_0 = 19;
+            for (int vi = 0; vi < VisualItemCount_V5_5_0; vi++)
+            {
+                if (vi < VisualItems.Length)
+                    VisualItems[vi].Write550(data);
+                else
+                    default(VisualItemInfo).Write550(data);
+            }
+
+            data.WriteInt32((int)Unknown703);          // SaveVersion
+            data.WriteUInt64(LastPlayedTime);          // CreateTime
+            data.WriteUInt64(LastPlayedTime);
+            data.WriteInt32((int)LastLoginVersion);
+
+            // PersonalTabard: five int32s, all -1 meaning "no tabard set".
+            for (int t = 0; t < 5; t++)
+                data.WriteInt32(-1);
+
+            data.WriteInt32((int)ProfessionIds[0]);
+            data.WriteInt32((int)ProfessionIds[1]);
+
+            data.WriteInt32(0);                        // TimerunningSeasonID
+            data.WriteUInt32(OverrideSelectScreenFileDataID);
+            data.WriteUInt32(0);                       // RealmQueue
+
+            foreach (ChrCustomizationChoice customization in Customizations)
+            {
+                data.WriteUInt32(customization.ChrCustomizationOptionID);
+                data.WriteUInt32(customization.ChrCustomizationChoiceID);
+            }
+
+            data.WriteBits(Name.GetByteCount(), 6);
+            data.WriteBit(FirstLogin);
+            data.WriteBit(true);                       // RealmInfoFound
+            data.WriteBit(false);                      // IsRealmOffline
+            data.FlushBits();
+            data.WriteString(Name);
+
+            // ReadCharacterRestrictionAndMailData
+            data.WriteBit(BoostInProgress);
+            data.WriteBit(false);                      // RpeAvailable
+            data.FlushBits();
+            data.WriteUInt32(Flags4);                  // RestrictionFlags
+            data.WriteUInt32((uint)MailSenders.Count);
+            data.WriteUInt32((uint)MailSenderTypes.Count);
+            data.WriteUInt32(0);                       // NoRpeReason
+
+            foreach (var mailSenderType in MailSenderTypes)
+                data.WriteUInt32(mailSenderType);
+
+            foreach (string str in MailSenders)
+                data.WriteBits(str.GetByteCount() + 1, 6);
+            data.FlushBits();
+
+            foreach (string str in MailSenders)
+                if (!str.IsEmpty())
+                    data.WriteCString(str);
         }
 
         // 3.4.3.54261 (WotLK Classic) per-character body per WowPacketParser
@@ -384,6 +552,26 @@ public sealed class EnumCharactersResult : ServerPacket
                 data.WriteUInt8(Subclass);
             }
 
+            /// <summary>
+            /// The 5.5.0-generation form: ItemID and TransmogrifiedItemID were added ahead of the
+            /// old fields, the order was rearranged, and a sheathe category byte trails it.
+            /// </summary>
+            /// <remarks>
+            /// The legacy core reports neither item id, so both are written as zero — the slot is
+            /// still rendered from DisplayId.
+            /// </remarks>
+            public void Write550(WorldPacket data)
+            {
+                data.WriteInt32(0);                    // ItemID
+                data.WriteInt32(0);                    // TransmogrifiedItemID
+                data.WriteUInt8(Subclass);
+                data.WriteUInt8(InvType);
+                data.WriteUInt32(DisplayId);
+                data.WriteUInt32(DisplayEnchantId);
+                data.WriteInt32((int)SecondaryItemModifiedAppearanceID);
+                data.WriteUInt8(0);                    // SheatheCategory
+            }
+
             public uint DisplayId;
             public uint DisplayEnchantId;
             public uint SecondaryItemModifiedAppearanceID; // also -1 is some special value
@@ -438,6 +626,27 @@ public sealed class EnumCharactersResult : ServerPacket
             HasAchievement = hasAchievement;
             HasHeritageArmor = hasHeritageArmor;
         }
+        /// <summary>
+        /// Race unlock entry for the 5.5.0-generation engine.
+        /// </summary>
+        /// <remarks>
+        /// RaceID narrowed from int32 to a single signed byte, and a class-unlock count was added
+        /// after it. Writing the old form leaves the client reading that count out of the middle of
+        /// the next record — an arbitrary number it then tries to allocate for, which is where the
+        /// ~73 GB allocation failure came from.
+        /// </remarks>
+        public void Write550(WorldPacket data)
+        {
+            data.WriteUInt8((byte)RaceID);
+            data.WriteUInt32(0);                 // ClassUnlocks count
+            data.WriteBit(HasExpansion);         // HasUnlockedLicense
+            data.WriteBit(HasAchievement);       // HasUnlockedAchievement
+            data.WriteBit(HasHeritageArmor);     // HasHeritageArmorUnlockAchievement
+            data.WriteBit(false);                // HideRaceOnClient
+            data.WriteBit(false);                // FactionBalanceDisabled
+            data.FlushBits();
+        }
+
         public void Write(WorldPacket data)
         {
             data.WriteInt32(RaceID);
@@ -672,16 +881,26 @@ public class CreateChar : ServerPacket, ISpanWritable
 
     public override void Write()
     {
-        _worldPacket.WriteUInt8(Code);
+        // The 5.5.0-generation client reads the result as a uint32, then the guid. Sending the
+        // older single byte left it one byte short: it consumed the byte that should have started
+        // the packed guid, then dereferenced a null buffer. That is the ACCESS_VIOLATION at
+        // RVA 0x2DF2554 (inside the packed-guid reader) seen when creating a character.
+        if (ModernVersion.Uses550Engine)
+            _worldPacket.WriteUInt32(Code);
+        else
+            _worldPacket.WriteUInt8(Code);
         _worldPacket.WritePackedGuid128(Guid);
     }
 
-    public int MaxSize => 1 + PackedGuidHelper.MaxPackedGuid128Size; // byte + GUID
+    public int MaxSize => 4 + PackedGuidHelper.MaxPackedGuid128Size;
 
     public int WriteToSpan(Span<byte> buffer)
     {
         var writer = new SpanPacketWriter(buffer);
-        writer.WriteUInt8(Code);
+        if (ModernVersion.Uses550Engine)
+            writer.WriteUInt32(Code);
+        else
+            writer.WriteUInt8(Code);
         writer.WritePackedGuid128(Guid.Low, Guid.High);
         return writer.Position;
     }
@@ -991,9 +1210,25 @@ public class SetActionButton : ClientPacket
 
     public override void Read()
     {
-        Action = _worldPacket.ReadUInt16();
-        Type = _worldPacket.ReadUInt16();
-        Index = _worldPacket.ReadUInt8();
+        // The 69110 client writes a packed u64 then the button index - verified against its own
+        // serialiser. Reading two u16s consumed the low half and left the stream four bytes out.
+        // The u64 carries the action in the low 56 bits and the type in the top 8, as in 5.5.0.
+        if (ModernVersion.Uses550Engine)
+        {
+            ulong packed = _worldPacket.ReadUInt64();
+            // Narrowed to ushort deliberately: these go straight back out to a 2.4.3 core, whose
+            // own fields are 16-bit, so anything that would not fit is already unrepresentable
+            // downstream. A TBC action is a spell, item or macro id and fits.
+            Action = (ushort)(packed & 0xFFFF);
+            Type = (ushort)(packed >> 56);
+            Index = _worldPacket.ReadUInt8();
+        }
+        else
+        {
+            Action = _worldPacket.ReadUInt16();
+            Type = _worldPacket.ReadUInt16();
+            Index = _worldPacket.ReadUInt8();
+        }
     }
 
     public ushort Action;
@@ -1576,7 +1811,12 @@ public class CharacterRenameResult : ServerPacket, ISpanWritable
 
     public override void Write()
     {
-        _worldPacket.WriteUInt8(Result);
+        // The 69110 client reads the result as a u32; a byte here put every following field three
+        // bytes early. Verified against its own reader for 0x460215.
+        if (ModernVersion.Uses550Engine)
+            _worldPacket.WriteUInt32(Result);
+        else
+            _worldPacket.WriteUInt8((byte)Result);
         _worldPacket.WriteBit(Guid != default);
         _worldPacket.WriteBits(Name.GetByteCount(), 6);
         _worldPacket.FlushBits();
@@ -1587,13 +1827,16 @@ public class CharacterRenameResult : ServerPacket, ISpanWritable
         _worldPacket.WriteString(Name);
     }
 
-    // MaxSize: byte (1) + bits (1+6=7 -> 1) + optional GUID (18) + name (24) = 44
-    public int MaxSize => 1 + 1 + PackedGuidHelper.MaxPackedGuid128Size + GameLimits.MaxPlayerNameBytes;
+    // Result is 4 bytes on the 550 engine and 1 before it; size for the larger.
+    public int MaxSize => 4 + 1 + PackedGuidHelper.MaxPackedGuid128Size + GameLimits.MaxPlayerNameBytes;
 
     public int WriteToSpan(Span<byte> buffer)
     {
         var writer = new SpanPacketWriter(buffer);
-        writer.WriteUInt8(Result);
+        if (ModernVersion.Uses550Engine)
+            writer.WriteUInt32(Result);
+        else
+            writer.WriteUInt8((byte)Result);
         writer.WriteBit(Guid != default);
         writer.WriteBits((uint)Encoding.UTF8.GetByteCount(Name), 6);
         writer.FlushBits();
@@ -1606,6 +1849,6 @@ public class CharacterRenameResult : ServerPacket, ISpanWritable
     }
 
     public string Name = "";
-    public byte Result = 0;
+    public uint Result = 0;
     public WowGuid128 Guid;
 }

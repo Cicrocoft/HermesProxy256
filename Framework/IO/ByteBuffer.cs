@@ -924,8 +924,9 @@ public class ByteBuffer : IDisposable
     /// <summary>
     /// Moves the write cursor back to <paramref name="size"/> bytes, discarding what follows.
     ///
-    /// Added for a diagnostic that needs to shorten a descriptor block by a measured number of bytes
-    /// without claiming to know which field is wrong (HERMES_256_UNITTRIM). Not part of normal
+    /// Added for a diagnostic that needed to shorten a descriptor block by a measured number of
+    /// bytes without claiming to know which field was wrong (HERMES_256_UNITTRIM, removed 23 Aug
+    /// once the divergence was located field by field). No current caller. Not part of normal
     /// packet construction - nothing in the send path should need to unwrite.
     /// </summary>
     /// <summary>
@@ -945,11 +946,21 @@ public class ByteBuffer : IDisposable
         Array.Clear(_buffer, from, to - from);
     }
 
+    /// <summary>
+    /// Shorten the buffer to <paramref name="size"/> bytes.
+    ///
+    /// This lowered only _position until 23 Aug, which made it a silent no-op: GetData() copies
+    /// _buffer[0.._length], so every "truncated" packet went out at full length. The one caller was
+    /// the UnitData trim diagnostic, so the entire 851-byte measurement that root cause 2 was built
+    /// on was taken through a knob that did nothing. Lower both.
+    /// </summary>
     public void Truncate(uint size)
     {
         if (size > (uint)_position)
             return;
         _position = (int)size;
+        if (_length > _position)
+            _length = _position;
         _bitPosition = 8;
     }
 

@@ -46,6 +46,11 @@ public sealed class SniffFile
 
     public void WriteHeader()
     {
+        try { WriteHeaderUnguarded(); } catch { _writeFailed = true; }
+    }
+
+    void WriteHeaderUnguarded()
+    {
         _fileWriter.Write('P');
         _fileWriter.Write('K');
         _fileWriter.Write('T');
@@ -60,13 +65,56 @@ public sealed class SniffFile
         }
     }
 
+    /// <summary>
+    /// DIAGNOSTIC LOGGING MUST NEVER BREAK THE PROXY, and until 23 Aug it could.
+    ///
+    /// WorldSocket.SendPacket calls Packet.LogPacket BEFORE the send and does not guard it, and
+    /// nothing in here caught anything - so a BinaryWriter failure propagated out of the logger,
+    /// past the send, and the packet was never put on the wire. The client then sees a stream with
+    /// a whole SMSG missing, which is indistinguishable from a protocol bug and is intermittent by
+    /// construction.
+    ///
+    /// MEASURED, 23 Aug: the machine's C: drive reached 100% (56 MB free) and eight of the day's
+    /// captures are EXACT multiples of the 64 KB FileStream buffer - 1x, 1x, 3x, 6x, 9x, 10x, 16x -
+    /// which is the signature of a buffer flush that succeeded N times and then threw. The two
+    /// captures from the 12:44 freeze session are both exactly 1 x 65536. Clearing the client's WDB
+    /// cache freed disk space and was followed by ten clean world entries; the failures resumed as
+    /// it filled again, which fits the disk far better than it fits the cache.
+    ///
+    /// So: swallow everything, and latch off after the first failure rather than throwing once per
+    /// packet for the rest of the session. Losing the sniff is an acceptable cost; losing a packet
+    /// is not.
+    /// </summary>
+    bool _writeFailed;
+
     public void WritePacket(uint opcode, bool isFromClient, ReadOnlySpan<byte> data)
     {
         lock (_lock)
         {
-            if (_closed)
+            if (_closed || _writeFailed)
                 return;
 
+            try
+            {
+                WritePacketUnguarded(opcode, isFromClient, data);
+            }
+            catch (Exception e)
+            {
+                _writeFailed = true;
+                try
+                {
+                    Framework.Logging.Log.Print(Framework.Logging.LogType.Error,
+                        $"Packet log write failed ({e.GetType().Name}: {e.Message}) - packet logging " +
+                        "is now OFF for this session. Check free disk space. Sends are unaffected.");
+                }
+                catch { }
+            }
+        }
+    }
+
+    void WritePacketUnguarded(uint opcode, bool isFromClient, ReadOnlySpan<byte> data)
+    {
+        {
             byte direction = !isFromClient ? (byte)0xff : (byte)0x0;
             _fileWriter.Write(direction);
 
@@ -104,8 +152,8 @@ public sealed class SniffFile
             if (_closed)
                 return;
             _closed = true;
-            _fileWriter.Flush();
-            _fileWriter.Close();
+            try { _fileWriter.Flush(); } catch { }
+            try { _fileWriter.Close(); } catch { }
         }
     }
 }

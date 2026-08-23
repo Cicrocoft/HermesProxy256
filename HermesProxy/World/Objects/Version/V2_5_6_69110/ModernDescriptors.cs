@@ -149,14 +149,147 @@ public partial class ObjectUpdateBuilder
     /// Send 1860 - this build's empty animation-state id - instead of 0 for the gameobject and unit
     /// state-anim fields, so the client never starts the default AnimKit. See the write site.
     /// </summary>
+    /// <summary>
+    /// Drop the three arrays this build's ActivePlayerData reader never reads - TrackResourceMask[2],
+    /// RestInfo[2] and CombatRatings[32], 146 bytes between them. Measured by running reader
+    /// 0x713E50 over a real captured block: we emit 6377 where it consumes 6231, and each array sits
+    /// between two dword-adjacent object fields, so there is provably no room for it.
+    ///
+    /// They must go together - dropping any one alone leaves the block a different wrong length. The
+    /// direction is shortening, which rule 2 calls the dangerous one, so this is opt-in until a
+    /// session confirms it. They predate the 22 Aug wiring pass and were simply invisible while the
+    /// block started 29 bytes late.
+    /// </summary>
+    static readonly bool s_apdDropArr =
+        System.Environment.GetEnvironmentVariable("HERMES_256_APDDROPARR") == "1";
+
+    /// <summary>Set UNIT_FLAG_PLAYER_CONTROLLED on the player, so the client's attackability test
+    /// takes its wider threshold. See the write site for the disassembly.</summary>
+    static readonly bool s_pcFlag =
+        System.Environment.GetEnvironmentVariable("HERMES_256_PCFLAG") == "1";
+
+    /// <summary>Send this build's empty animation state (1860) in UnitData.StateAnimID, as
+    /// GameObjectData already does. See the write site.</summary>
+    static readonly bool s_unitAnim =
+        System.Environment.GetEnvironmentVariable("HERMES_256_UNITANIM") == "1";
+
     static readonly bool s_animRaw =
         System.Environment.GetEnvironmentVariable("HERMES_256_ANIMRAW") == "1";
 
     static readonly bool s_noGobDisplay =
         System.Environment.GetEnvironmentVariable("HERMES_256_NOGOBDISPLAY") == "1";
 
+    /// <summary>
+    /// HERMES_256_GOBFIX=1 makes WriteGameObjectData emit what this build's create reader at
+    /// 0x2C705A0 actually consumes: 80 bytes in 24 reads, against the 100 in 29 we send today.
+    /// Three changes, all measured from the reader itself (clientfields-GameObjectData.json):
+    ///
+    ///  * `StateWorldEffectsQuestObjectiveID` does NOT exist here. The reader goes straight from
+    ///    the StateWorldEffectIDs vector count (obj+0x18, wire +20) to CreatedBy (obj+0x30) and
+    ///    GuildGUID (obj+0x40) as packed guids at +24/+26, with no u32 between them. WPP's
+    ///    UpdateFieldsHandler553 - the 5.5.3 arm this build is - has no such field either; it
+    ///    appears first in the 11.x line. Our extra u32 is what displaces everything after it.
+    ///  * `Level` sits between FactionTemplate and State, not after CustomParam. The reader's
+    ///    run between GuildGUID and the State/TypeID/PercentHealth byte triple is EIGHT dwords,
+    ///    obj+0x50 .. obj+0x6C, where the writer has seven. Disassembled at 0x2C709AA..0x2C70B77:
+    ///    obj+0x50 and obj+0x54 each carry a change-notification block (save old value, read,
+    ///    compare, dispatch through the statics at 0x6032980 / 0x60329C0) and obj+0x58, 0x5C,
+    ///    0x60, 0x64 are four bare uniform reads with no notification - the quaternion. obj+0x68
+    ///    and obj+0x6C are read through the stack temp like every other scalar. So the run is
+    ///    Flags, FlagsB, ParentRotation[4], FactionTemplate, Level, and both TrinityCore master
+    ///    (UpdateFields.cpp:7448) and the memory order put Flags before FlagsB.
+    ///  * The tail from wire +79 on is read by nothing. The client stops at 80 with one u8 into
+    ///    obj+0xF0, the AssistActionData optional bit. `AnimGroupInstance` and the three
+    ///    `UiWidgetItem*` fields are 11.x additions; 553 does not have them and neither does this
+    ///    reader. 16 bytes of the 21 we over-send.
+    ///
+    /// What it costs today, and why this is not cosmetic. Our two empty guid masks land on the
+    /// client's Flags, so gameobject Flags reads 0; our Flags lands in FlagsB; our ParentRotation
+    /// lands one slot late so the client's FactionTemplate takes ParentRotation[3] = 1.0f =
+    /// 0x3F800000 = 1065353216, far outside FactionTemplate's 1..3152; our FactionTemplate lands
+    /// in Level; and our `Level` lands on the client's WorldEffects VECTOR COUNT, so any
+    /// gameobject with a non-zero GAMEOBJECT_LEVEL makes the reader resize that vector and read
+    /// that many dwords past the end of what we meant to send.
+    ///
+    /// The section 128/129 anchors do not move: DisplayID +0, SpellVisualID +4,
+    /// StateSpellVisualID +8 and SpawnTrackingStateAnimID +12 are all before the first change at
+    /// +24, so the 1860 that stopped the animation crash still lands in obj+0xC.
+    ///
+    /// Direction is shortening (100 -> 80), which rule 2 calls the dangerous one - but the values
+    /// blob is length-prefixed, so a short block cannot desynchronise the batch; it only means
+    /// the reader stops before the declared end. Opt-in until a session confirms it.
+    /// </summary>
+    static readonly bool s_gobFix =
+        System.Environment.GetEnvironmentVariable("HERMES_256_GOBFIX") == "1";
+
+    /// <summary>
+    /// HERMES_256_DYNFIX=1 drops `ScriptVisualID` from WriteDynamicObjectData. This build has no
+    /// two-field SpellCastVisual struct: the inline reader in chain 0x18E3DE0 (descriptor at
+    /// obj+0x170) makes six reads for 19 bytes - packed guid obj+0x0, u8 obj+0x10, u32 obj+0x14,
+    /// u32 obj+0x18, float obj+0x1C, u32 obj+0x20 - which is exactly 553's Caster, Type,
+    /// SpellXSpellVisualID, SpellID, Radius, CastTime. The SpellCastVisual pair is TrinityCore
+    /// master's shape (UpdateFields.h:1542), not this arm's.
+    ///
+    /// Every position after the extra field is a same-width dword, so the index-wise order leg
+    /// sees zero disagreements and only the byte count moves - this is the same-width swap that
+    /// leg is blind to, and it was caught by the count alone. On the wire today our SpellID is
+    /// read into the client's float Radius slot, our Radius into CastTime, and our CastTime is
+    /// never read.
+    /// </summary>
+    static readonly bool s_dynFix =
+        System.Environment.GetEnvironmentVariable("HERMES_256_DYNFIX") == "1";
+
+    /// <summary>
+    /// HERMES_256_CORPSEFIX=1 drops the trailing `StateSpellVisualKitID` from WriteCorpseData.
+    /// The create reader at 0x2C6F650 makes 30 reads for 105 bytes and stops at FactionTemplate
+    /// (obj+0x7C); 553's ReadCreateCorpseData ends in the same place. Our 31st field is not read.
+    ///
+    /// This is the safest of the three by construction: the writer is aligned field-for-field on
+    /// all 30 of the client's reads, CorpseData is the last descriptor in a Corpse create, and
+    /// the values blob is length-prefixed - so the client consumes 105 whether we send 105 or
+    /// 109 and nothing it parses changes. Only the declared size does.
+    /// </summary>
+    static readonly bool s_corpseFix =
+        System.Environment.GetEnvironmentVariable("HERMES_256_CORPSEFIX") == "1";
+
     static readonly bool s_itemLook =
         System.Environment.GetEnvironmentVariable("HERMES_256_ITEMLOOK") == "1";
+
+    /// <summary>
+    /// HERMES_256_UNITTAIL=1 emits the end of UnitData that this build's create-reader actually
+    /// reads and the V2_5_5 field set does not have: a packed guid at obj+0x308, VirtualItems[3]
+    /// as the 23-byte element of reader 0x741E60, and a 7-byte name trailer. It replaces the two
+    /// trailing create-bits, so the block grows by 77 bytes (creature 569 -> 646, player 869 -> 946).
+    ///
+    /// Measured, not inferred. Running the client's own reader 0x2C5D120 over a creature's captured
+    /// create block (a 586-byte values blob carved out of PacketsLog, so 5 header + 12 ObjectData +
+    /// 569 UnitData) with the visibility byte we actually send, the reader consumes 598 bytes where
+    /// we emit 569 - it reads 29 bytes past our data, into the next object's update block. This
+    /// knob is the direction that ENDS that over-read: it can only make the block longer, and
+    /// over-sending is harmless where under-sending is not (PLAN-256.md rule 2). On its own it
+    /// changes nothing the client renders, because the misaligned mid-block VirtualItems below is
+    /// still there; it is the safe half of the fix and it is enabled first for that reason.
+    /// </summary>
+    static readonly bool s_unitTail =
+        System.Environment.GetEnvironmentVariable("HERMES_256_UNITTAIL") == "1";
+
+    /// <summary>
+    /// HERMES_256_UNITDROPVI=1 stops emitting VirtualItems[3] (3 x 16 = 48 bytes) between
+    /// FactionTemplate and Flags, where this build's reader does not read it. The block shrinks by
+    /// 48 bytes and everything from Flags onward moves back into place.
+    ///
+    /// The client's instruction stream is unambiguous here: at RVA 0x2C5E8BA it reads FactionTemplate
+    /// into obj+0x124, and the very next stream read (0x2C5E985 / 0x2C5E99D, the two arms of the
+    /// notification fork - dedup by store offset, PLAN-256.md rule 5) goes to obj+0x128 = Flags,
+    /// then 0x12C, 0x130, 0x134, 0x138 = Flags2..AuraState. There is no room for a 3-element array
+    /// between 0x124 and 0x128, and the reader's own VirtualItems loop is at the end of the block
+    /// (0x2C62EC0, `cmp eax,3`, object array at obj+0x3E8, stride 0x1C).
+    ///
+    /// Turn this on only WITH HERMES_256_UNITTAIL: alone it shortens the block while the reader
+    /// still wants the tail, taking the over-read from 29 bytes to 77.
+    /// </summary>
+    static readonly bool s_unitDropVi =
+        System.Environment.GetEnvironmentVariable("HERMES_256_UNITDROPVI") == "1";
 
     static readonly bool s_unitFields =
         System.Environment.GetEnvironmentVariable("HERMES_256_UNITFIELDS") == "1";
@@ -166,6 +299,15 @@ public partial class ObjectUpdateBuilder
 
     static readonly bool s_apdProbe =
         System.Environment.GetEnvironmentVariable("HERMES_256_APDPROBE") == "1";
+
+    /// <summary>
+    /// Appends the five bytes between what WriteActivePlayerData emits (6231) and what the
+    /// client's own ActivePlayerData reader walks over real captured bytes (6236) - a u32 that
+    /// starts at wire +6230 and an empty packed guid at +6234. See the long note at the end of
+    /// WriteActivePlayerData. Off by default; lengthening a block can only end an over-read.
+    /// </summary>
+    static readonly bool s_apdTail =
+        System.Environment.GetEnvironmentVariable("HERMES_256_APDTAIL") == "1";
 
     /// <summary>
     /// The legacy unit flags are not carried across. Measured: copying them raw makes every
@@ -221,8 +363,22 @@ public partial class ObjectUpdateBuilder
     /// Three things it settles that hand-editing had wrong: there is no CreatureType byte between
     /// Sex and DisplayPower; the regen arrays are gated on Owner|UnitAll, so the gating measured
     /// in-game was right; and both power blocks are interleaved loops, not separate arrays.
-    /// The arithmetic closes on the value measured in game: Race at +92, plus five bytes, plus
-    /// OverrideDisplayPowerID, plus 10x8 regen and 10x12 power, puts Level at +301.
+    ///
+    /// VERIFIED AGAINST THE CLIENT, 23 Aug. A creature's create block was carved out of a live
+    /// capture (PacketsLog, 586-byte values blob = 5 fragment header + 12 ObjectData + 569 UnitData)
+    /// and fed to the client's own create-reader 0x2C5D120 with the visibility byte we really send -
+    /// 0/None for every world unit, not Owner. Every one of the reader's first 62 reads lands
+    /// exactly on a field boundary of this body, at the same width, with the values we wrote
+    /// (Health 100 at +0, DisplayID 11416 at +16, Level 2 at +219, FactionTemplate 32 at +244).
+    /// The head of this body is byte-exact from +0 to +247 and there is nothing missing or spare
+    /// in it - in particular there is no "26-byte pre-Level gap" and no 76-byte excess.
+    ///
+    /// There is exactly ONE divergence, at +248, and it is VirtualItems. See the two knobs
+    /// s_unitTail and s_unitDropVi. With both on the block totals 598 for a creature and 898 for
+    /// the player, which is what the reader consumes in each case.
+    ///
+    /// tools-256-spike/udoffsets.py prints this body's offsets for a given visibility;
+    /// `streamwalk.py 2C5D120 base=<n> flags=<vis> dump=<block.bin>` prints the client's.
     /// </summary>
     void WriteUnitDataReal(WorldPacket w)
     {
@@ -236,7 +392,14 @@ public partial class ObjectUpdateBuilder
         w.WriteUInt32(s_npcFlags ? (uint)(m_updateData.UnitData?.NpcFlags[0] ?? 0) : 0);        // NpcFlags
         w.WriteUInt32(s_npcFlags ? (uint)(m_updateData.UnitData?.NpcFlags[1] ?? 0) : 0);        // NpcFlags2
         w.WriteUInt32((uint)(m_updateData.UnitData?.StateSpellVisualID ?? 0));        // StateSpellVisualID
-        w.WriteUInt32((uint)(m_updateData.UnitData?.StateAnimID ?? 0));        // StateAnimID
+        // >>> StateAnimID. Same field, same value and same reason as GameObjectData's
+        // SpawnTrackingStateAnimID: TrinityCore emits DB2Mgr::GetEmptyAnimStateID() for both, and
+        // section 129 measured that as 1860 on this build. Zero selects the default AnimKit 5102,
+        // whose segment asks for animation 1672, and AnimationData here holds only the TBC subset
+        // (ids 0..801). We fixed the gameobject field - which is what made gameobjects render - and
+        // left this one at 0 for every unit including the player. Candidate for the kneeling NPCs.
+        // HERMES_256_UNITANIM=1 sends 1860. Untested live.
+        w.WriteUInt32(s_unitAnim ? 1860u : (uint)(m_updateData.UnitData?.StateAnimID ?? 0));        // StateAnimID
         w.WriteUInt32((uint)(m_updateData.UnitData?.StateAnimKitID ?? 0));        // StateAnimKitID
         w.WriteUInt32(0);        // ?
         // [elements of StateWorldEffectIDs go here]
@@ -290,26 +453,51 @@ public partial class ObjectUpdateBuilder
         w.WriteInt32(0);        // ScalingLevelDelta
         w.WriteUInt8(0);        // ScalingFactionGroup
         w.WriteUInt32((uint)(m_updateData.UnitData?.FactionTemplate ?? 0));        // FactionTemplate
-        for (int i0 = 0; i0 < 3; ++i0)
+        // >>> VirtualItems (creature/NPC weapon slots), in the V2_5_5 position and element size.
+        // This build reads NEITHER here: FactionTemplate (obj+0x124) is followed immediately by
+        // Flags (obj+0x128), and VirtualItems is a 23-byte element read at the END of the block.
+        // These 48 bytes are therefore consumed by the client as Flags, Flags2, Flags3, Flags4,
+        // AuraState, AttackRoundBaseTime[3] and the first four of BoundingRadius..MountDisplayID -
+        // which is the white names, the grey health bars, the unattackable neutrals and the
+        // kneeling guards, all of it. HERMES_256_UNITDROPVI=1 removes them; see the knob's note.
+        if (!s_unitDropVi)
         {
-            // >>> VirtualItems (creature/NPC weapon slots). The handler resolves the legacy
-            // UNIT_VIRTUAL_ITEM_SLOT_DISPLAY display id back to an item entry; the modern client
-            // renders the held item's appearance from that ItemID via its ItemModifiedAppearance
-            // db2 (+ the hotfix records the proxy pushes), so ItemID alone is enough here.
-            var vi = m_updateData.UnitData?.VirtualItems[i0];
-            w.WriteInt32(s_itemLook ? (vi?.ItemID ?? 0) : 0);                    // ItemID
-            w.WriteInt32(0);                                   // SecondaryItemModifiedAppearanceID
-            w.WriteInt32(0);                                   // ConditionalItemAppearanceID
-            w.WriteUInt16(s_itemLook ? (vi?.ItemAppearanceModID ?? 0) : (ushort)0);      // ItemAppearanceModID
-            w.WriteUInt16(s_itemLook ? (vi?.ItemVisual ?? 0) : (ushort)0);               // ItemVisual
+            for (int i0 = 0; i0 < 3; ++i0)
+            {
+                // The handler resolves the legacy UNIT_VIRTUAL_ITEM_SLOT_DISPLAY display id back
+                // to an item entry; the modern client renders the held item's appearance from that
+                // ItemID via its ItemModifiedAppearance db2 (+ the hotfix records the proxy
+                // pushes), so ItemID alone is enough here.
+                var vi = m_updateData.UnitData?.VirtualItems[i0];
+                w.WriteInt32(s_itemLook ? (vi?.ItemID ?? 0) : 0);                    // ItemID
+                w.WriteInt32(0);                                   // SecondaryItemModifiedAppearanceID
+                w.WriteInt32(0);                                   // ConditionalItemAppearanceID
+                w.WriteUInt16(s_itemLook ? (vi?.ItemAppearanceModID ?? 0) : (ushort)0);      // ItemAppearanceModID
+                w.WriteUInt16(s_itemLook ? (vi?.ItemVisual ?? 0) : (ushort)0);               // ItemVisual
+            }
         }
         // The legacy unit flags are copied across raw, and the bit meanings are not the same
         // in the 5.5.0 engine. A bit that was harmless in 2.4.3 can mean mounted or vehicle
         // here, which draws a second model on a unit whose block is otherwise correct - the
         // creatures read back the right name, level and health, so this is not a misalignment.
         // HERMES_256_NOFLAGS=1 zeroes them to test that.
-        w.WriteUInt32(s_noFlags ? 0u
-                                : (s_flagsMark != 0 ? s_flagsMark : (uint)(m_updateData.UnitData?.Flags ?? 0)));        // Flags
+        // >>> PLAYER_CONTROLLED (0x8). Measured out of CGUnit_C::CanAttack (rva 0x1906BE0): the final
+        // decision has two thresholds and the gate between them is Flags & 0x8 on EITHER unit -
+        //     0x1906EE6  test byte [rdi+0x12608], 8      attacker's Flags (descriptor+0x128)
+        //     0x1906EEF  test byte [rbx+0x12608], 8      target's
+        //     neither set -> attackable only if reaction <= 1   (hated / hostile)
+        //     either  set -> attackable if reaction < 4         (through neutral)
+        // We send Flags = 0 for every unit including the player, so the client sits permanently on
+        // the strict path: hostile creatures attackable, neutral ones not. Exactly the symptom.
+        //
+        // The fix is this one bit on the PLAYER, not HERMES_256_RAWFLAGS - copying the raw 2.4.3
+        // bits across made every creature draw a second pale model, which is why s_noFlags exists.
+        // HERMES_256_PCFLAG=1 turns it on. Untested live.
+        uint unitFlags = s_noFlags ? 0u
+                                   : (s_flagsMark != 0 ? s_flagsMark : (uint)(m_updateData.UnitData?.Flags ?? 0));
+        if (s_pcFlag && m_objectType == Enums.ObjectTypeBCC.ActivePlayer)
+            unitFlags |= 0x8u;   // UNIT_FLAG_PLAYER_CONTROLLED
+        w.WriteUInt32(unitFlags);        // Flags
         w.WriteUInt32(s_noFlags ? 0u : (uint)(m_updateData.UnitData?.Flags2 ?? 0));        // Flags2
         w.WriteUInt32(0);        // Flags3
         w.WriteUInt32(0);        // Flags4
@@ -423,14 +611,20 @@ public partial class ObjectUpdateBuilder
         w.WriteInt32(0);        // LooksLikeCreatureID
         w.WriteInt32(0);        // LookAtControllerID
         w.WriteInt32(0);        // PerksVendorItemID
-        // GuildGUID kept Empty DELIBERATELY: the handler fills UnitData.GuildGUID for guilded
-        // players, but a non-empty packed guid emits more bytes than an empty one and UnitData's
-        // total length (868 sent vs 851 consumed) is under live measurement - wiring this would
-        // move that number. Wire it once the length is settled.
-        w.WritePackedGuid128(WowGuid128.Empty);        // GuildGUID (see note above)
+        // GuildGUID kept Empty, but the old reason has expired: it was held back because the block
+        // length was under live measurement (the "868 sent vs 851 consumed" figure, which section
+        // 130 retracted - the knob that produced it never truncated anything). A packed guid is
+        // symmetric, so a real value costs the same on both sides: the client reads it at 0x2C623EA
+        // into obj+0x210 and consumes mask + popcount bytes, exactly as we write them. Safe to wire
+        // once the two knobs below have shipped and the block length is confirmed in game.
+        w.WritePackedGuid128(WowGuid128.Empty);        // GuildGUID obj+0x210
         w.WriteUInt32(0);        // PassiveSpells size
         w.WriteUInt32(0);        // WorldEffects size
-        w.WriteUInt32(0);        // ChannelObjects size - kept 0 DELIBERATELY: the handler fills UnitData.ChannelObject, but emitting the element would grow the block while UnitData's length is under measurement
+        // ChannelObjects size kept 0 DELIBERATELY, and this one is still load-bearing: these three
+        // counts size the client's three tail vector loops, which run AFTER the obj+0x308 guid and
+        // read their elements from the stream. A non-zero count with no matching elements written
+        // would desynchronise the rest of the block.
+        w.WriteUInt32(0);        // ChannelObjects size
         w.WritePackedGuid128(WowGuid128.Empty);        // SkinningOwnerGUID
         w.WriteInt32(0);        // FlightCapabilityID
         w.WriteFloat(0.0f);        // GlideEventSpeedDivisor
@@ -446,39 +640,65 @@ public partial class ObjectUpdateBuilder
         // [elements of PassiveSpells go here]
         // [elements of WorldEffects go here]
         // [elements of ChannelObjects go here]
-        w.WriteBit(false);        // Field_314
-        w.WriteBit(false);        // HasAssistActionData
-        // [skipped: empty for the data we send]
-
-        // Diagnostic, see the s_unitTrim comment: bring the block to the length the client is
-        // measured to consume, without claiming to know which field is wrong.
-        if (s_unitTrim != 0)
+        // The three counts above are written as 0, so the client's three tail vector loops
+        // (0x2C62A50 over obj+0x220/0x228, 0x2C62C80, 0x2C62CD1) iterate zero times. Confirmed:
+        // the captured creature block goes straight from the obj+0x308 guid into VirtualItems.
+        if (!s_unitTail)
         {
-            w.FlushBits();
-            if (s_unitTrim > 0)
-                w.Truncate(w.GetSize() - (uint)s_unitTrim);
-            else
-                for (int i = 0; i < -s_unitTrim; ++i)
-                    w.WriteUInt8(0);
+            // The V2_5_5 ending: two create-bits, flushed to one byte. This build's reader does
+            // not read them - it reads the 78 bytes below instead. See the s_unitTail note.
+            w.WriteBit(false);        // Field_314
+            w.WriteBit(false);        // HasAssistActionData
+            // [skipped: empty for the data we send]
+        }
+        if (s_unitTail)
+        {
+            // >>> The tail this build's reader actually reads, transcribed from the client.
+            //
+            // 1. A packed guid at obj+0x308, read unconditionally right after the two trailing
+            //    floats (client 0x2C62A22 `lea rdx,[rdi+0x308]`, 0x2C62A34 call packed-guid128).
+            //    Not in the V2_5_5 field set. Empty = 2 bytes.
+            w.WritePackedGuid128(WowGuid128.Empty);        // obj+0x308, unnamed on this build
+
+            // 2. VirtualItems[3], element reader 0x741E60, loop 0x2C62EC0 (`cmp eax,3`, object
+            //    array at obj+0x3E8 with a 0x1C stride). The element is 23 wire bytes, not the 16
+            //    of V2_5_5 - the same growth section 110 found for PlayerData's VisibleItem.
+            //    Ghidra's decompilation of 0x741E60 gives the order exactly:
+            //      u32 -> elem+0x00, u32 -> +0x04, u32 -> +0x08, u16 -> +0x0C, u16 -> +0x0E,
+            //      u32 -> +0x14, u8 -> +0x18, u8 -> +0x19, u8 -> two bools (bit7 -> +0x10,
+            //      bit6 -> +0x11).
+            //    The last one is a whole byte read through the u8 primitive, not a bit-pack, so it
+            //    is written as a byte here.
+            for (int i0 = 0; i0 < 3; ++i0)
+            {
+                var vi = m_updateData.UnitData?.VirtualItems[i0];
+                w.WriteInt32(s_itemLook ? (vi?.ItemID ?? 0) : 0);                          // ItemID
+                w.WriteInt32(0);                                     // SecondaryItemModifiedAppearanceID
+                w.WriteInt32(0);                                     // ConditionalItemAppearanceID
+                w.WriteUInt16(s_itemLook ? (vi?.ItemAppearanceModID ?? 0) : (ushort)0);    // ItemAppearanceModID
+                w.WriteUInt16(s_itemLook ? (vi?.ItemVisual ?? 0) : (ushort)0);             // ItemVisual
+                w.WriteUInt32(0);        // elem+0x14, unnamed on this build
+                w.WriteUInt8(0);         // elem+0x18, unnamed on this build
+                w.WriteUInt8(0);         // elem+0x19, unnamed on this build
+                w.WriteUInt8(0);         // flag byte: bit7 -> elem+0x10, bit6 -> elem+0x11
+            }
+
+            // 3. A 7-byte name trailer, and then a length-prefixed string. Disassembled at
+            //    0x2C633E2..0x2C63570:
+            //      u8   flags; bit 7 selects a path on the object slot at obj+0x318 (0x2C633FD
+            //           `shr dl,7`). 0 keeps it off.
+            //      u8   stored at the head of that struct (0x2C63516).
+            //      u32  stored at struct+0x34 (0x2C63535).
+            //      u8   length byte; the client takes `>> 2` as a character count (0x2C6355E) and
+            //           then reads exactly that many raw bytes (0x2C6356B) and NUL-terminates.
+            //           0 means no string bytes follow, which is what we want - this is not the
+            //           creature name the tooltip shows, that comes from the name query.
+            w.WriteUInt8(0);         // name flags (obj+0x318 path gate, bit 7 = 0)
+            w.WriteUInt8(0);         // name struct head byte
+            w.WriteUInt32(0);        // name struct+0x34
+            w.WriteUInt8(0);         // name length byte (>> 2 = 0 characters)
         }
     }
-
-    /// <summary>
-    /// Trims (positive) or pads (negative) the end of UnitData by this many bytes.
-    ///
-    /// Every figure for the 17-byte displacement is inferred - from three Lua sentinels, from the
-    /// runtime descriptor-range log, from walking the client's reader. Two of those inferences have
-    /// already been retracted, each from a model that was wrong in a way invisible from inside it.
-    /// This measures the total instead: if the client's UnitData really is 852 where we send 868,
-    /// then HERMES_256_UNITTRIM=16 must make the APDPROBE sentinels read 7 / 13 / 19, and nothing
-    /// else in the pipeline would do that.
-    ///
-    /// It repairs nothing - the trimmed bytes belong to real fields, so UnitData's own tail stays
-    /// wrong and creatures keep their white names. The number it produces is what the field-level
-    /// fix has to reproduce.
-    /// </summary>
-    static readonly int s_unitTrim =
-        int.TryParse(System.Environment.GetEnvironmentVariable("HERMES_256_UNITTRIM"), out var ut) ? ut : 0;
 
     static readonly int s_playerLead =
         int.TryParse(System.Environment.GetEnvironmentVariable("HERMES_256_PLAYERLEAD"), out var pd) ? pd : 0;
@@ -742,10 +962,17 @@ public partial class ObjectUpdateBuilder
         w.WriteInt32(apd?.CharacterPoints ?? 0);        // CharacterPoints (obj+0x10DC) - unspent talent points
         w.WriteInt32(0);        // MaxTalentTiers (obj+0x10E0)
         w.WriteUInt32(apd?.TrackCreatureMask ?? 0);        // TrackCreatureMask (obj+0x10E4)
-        for (int i0 = 0; i0 < 2; ++i0)
+        // >>> TrackResourceMask[2] - 8 bytes this build's reader does not read. At obj+0x10E4 the
+        // client goes straight from TrackCreatureMask to MainhandExpertise at obj+0x10E8: two
+        // dword-adjacent fields with no room between them. Measured over real captured bytes, and
+        // the reader has no 2-iteration loop anywhere. Same signature as UnitData.VirtualItems
+        // (section 131), except these are over-sends to delete rather than fields to relocate.
+        if (!s_apdDropArr)
         {
-            // model is also 2 wide, but the legacy handler only fills slot 0
-            w.WriteUInt32(apd != null && i0 < apd.TrackResourceMask.Length ? apd.TrackResourceMask[i0] ?? 0 : 0);        // TrackResourceMask (bound = constant 2 in client)
+            for (int i0 = 0; i0 < 2; ++i0)
+            {
+                w.WriteUInt32(apd != null && i0 < apd.TrackResourceMask.Length ? apd.TrackResourceMask[i0] ?? 0 : 0);        // TrackResourceMask
+            }
         }
         w.WriteFloat(apd?.MainhandExpertise ?? 0.0f);        // MainhandExpertise (obj+0x10E8)
         w.WriteFloat(apd?.OffhandExpertise ?? 0.0f);        // OffhandExpertise (obj+0x10EC)
@@ -789,14 +1016,17 @@ public partial class ObjectUpdateBuilder
         }
         w.WriteUInt32(0);        // CharacterDataElements size (obj+0x1450, elements deferred)
         w.WriteUInt32(0);        // AccountDataElements size (obj+0x1488, elements deferred)
-        for (int i0 = 0; i0 < 2; ++i0)
+        // >>> RestInfo[2] - 10 bytes the reader does not read: it goes from AccountDataElements
+        // straight to ModHealingDonePos at obj+0x14C0. Element reader 0x712440 exists, but nothing
+        // in 0x713E50 calls it over this block.
+        if (!s_apdDropArr)
         {
-            // >>> RestInfo - inline, bound = constant 2, element reader 0x712440 (u32+u8)
-            // The handler fills slot 0 (XP rest) from the legacy PLAYER_REST_STATE fields;
-            // slot 1 (honor rest) has no legacy counterpart and its element stays null.
-            var ri = apd != null && i0 < apd.RestInfo.Length ? apd.RestInfo[i0] : null;
-            w.WriteUInt32(ri?.Threshold ?? 0);        // Threshold
-            w.WriteUInt8((byte)(ri?.StateID ?? 0));        // StateID
+            for (int i0 = 0; i0 < 2; ++i0)
+            {
+                var ri = apd != null && i0 < apd.RestInfo.Length ? apd.RestInfo[i0] : null;
+                w.WriteUInt32(ri?.Threshold ?? 0);        // Threshold
+                w.WriteUInt8((byte)(ri?.StateID ?? 0));        // StateID
+            }
         }
         w.WriteInt32(apd?.ModHealingDonePos ?? 0);        // ModHealingDonePos (obj+0x14C0)
         w.WriteFloat(0.0f);        // ModHealingPercent (obj+0x14C4)
@@ -842,10 +1072,21 @@ public partial class ObjectUpdateBuilder
         w.WriteUInt32(apd?.YesterdayContribution ?? 0);        // YesterdayContribution (obj+0x1518)
         w.WriteUInt32(apd?.LastWeekContribution ?? 0);        // LastWeekContribution (obj+0x151C)
         w.WriteUInt32(apd?.LastWeekRank ?? 0);        // LastWeekRank (obj+0x1520)
-        w.WriteInt32(apd?.WatchedFactionIndex ?? 0);        // WatchedFactionIndex (obj+0x1524) - legacy rep INDEX passed through; see section 103: the modern faction list is keyed differently, revisit with SMSG_INITIALIZE_FACTIONS
-        for (int i0 = 0; i0 < 32; ++i0)
+        // -1, not 0. Zero names a real slot in the client's reputation list and switches the XP bar
+        // to that faction's standing; -1 is the documented "none" sentinel and is what every other
+        // version writer here uses (V3_4_3_54261/ObjectUpdateBuilder.cs:866). Length-neutral.
+        w.WriteInt32(apd?.WatchedFactionIndex ?? -1);        // WatchedFactionIndex (obj+0x1524) - legacy rep INDEX passed through; see section 103: the modern faction list is keyed differently, revisit with SMSG_INITIALIZE_FACTIONS
+        // >>> CombatRatings[32] - 128 bytes, and the costly one. The client goes from
+        // WatchedFactionIndex at obj+0x1524 to MaxLevel at obj+0x1528, dword-adjacent, so MaxLevel
+        // reads our CombatRatings[0]. This is what puts a faction on the XP bar: WatchedFactionIndex
+        // is itself displaced 18 bytes by the two arrays above, and -1 never reaches the field.
+        // The reader has no 32-iteration loop over this block.
+        if (!s_apdDropArr)
         {
-            w.WriteInt32(apd != null && i0 < apd.CombatRatings.Length ? apd.CombatRatings[i0] ?? 0 : 0);        // CombatRatings (bound = constant 0x20 in client, matching the model)
+            for (int i0 = 0; i0 < 32; ++i0)
+            {
+                w.WriteInt32(apd != null && i0 < apd.CombatRatings.Length ? apd.CombatRatings[i0] ?? 0 : 0);        // CombatRatings
+            }
         }
         w.WriteInt32(apd?.MaxLevel ?? 0);        // MaxLevel (obj+0x1528)
         w.WriteInt32(0);        // ScalingPlayerLevelDelta (obj+0x152C)
@@ -1014,9 +1255,49 @@ public partial class ObjectUpdateBuilder
         w.WriteUInt8(0);
         w.WriteUInt32(0);
         w.WriteUInt8(0);
-        // ---- end of block. Remaining client reads are all zero-length for us:
-        // elements of array #18 (obj+0x1938), the optional 0x737820 struct (absent, bit 5 = 0),
-        // and the bank-tab-settings elements (3-bit count = 0). ----
+        // ---- end of block. The comment that used to stand here said "remaining client reads
+        // are all zero-length for us". MEASURED 23 Aug, and it is not true of the reader's own
+        // walk: streamwalk over the REAL captured bytes of two different sessions consumes
+        // 6236 in both, while this writer emits 6231. The last two reads in the client field
+        // map are a u32 at wire +6230 and a PACKED GUID at +6234 - and we stop at +6230, so the
+        // u32 takes three bytes of stale heap and the guid takes its two mask bytes from stale
+        // heap as well. A packed-guid mask read out of garbage is length-variable, which is the
+        // one shape rule 2 says is fatal rather than merely wrong.
+        //
+        // WITHDRAWN, same day, and the withdrawal is the useful part. Those last two reads are
+        // NOT taken: they belong to the optional 0x737820 struct at obj+0x1BF0, and that arm is
+        // gated by the very bit this writer emits as 0 a few bytes earlier:
+        //
+        //     0x71AB0F  CALL 0x2D83880        read one bit  <- our bit
+        //     0x71AB1D  SETNZ DL
+        //     0x71AB20  CALL 0x72E190         optional-manager(obj+0x1BF0, present = DL)
+        //     0x71AB25  TEST AL,AL
+        //     0x71AB27  JZ 0x71AB95           skips the struct when the bit is 0
+        //
+        // So the block really does end at 6231, the "-6" correction in model-256.md is right,
+        // and this writer is NOT short. streamwalk and clientfields both walk that arm only
+        // because neither can evaluate a gate whose input is a bit we choose.
+        //
+        // It follows that the 23 Aug 03:46 world-entry freeze is NOT explained by a create-path
+        // over-read. The client hung in a hash-map deserialiser (0x72E070) whose element count is
+        // a u32 read at its entry (0x72E096), reached from this reader at 0x71AE6F for the
+        // container at obj+0x1C40 - and this writer emits that count, as zero, at wire +6191.
+        // Both the good and the frozen session's captured blocks are byte-identical in structure
+        // and the client's own reader consumes 6236 over both. The cause is still open.
+        //
+        // HERMES_256_APDTAIL=1 appends the five bytes that would take the block from 6231 to the
+        // 6236 streamwalk walks. On the evidence above it is INERT - the client does not read
+        // them - so it is kept only as the one-knob test should the gate's "-5" ever be doubted
+        // again, and it stays OFF. Lengthening the last block on the wire cannot break anything
+        // (the client resynchronises on the declared size), but nor does it fix anything here.
+        if (s_apdTail)
+        {
+            w.WriteUInt8(0);   // bytes 1..3 of the u32 the reader starts at wire +6230
+            w.WriteUInt8(0);
+            w.WriteUInt8(0);
+            w.WriteUInt8(0);   // the 2-byte mask of the packed guid at wire +6234, i.e. empty
+            w.WriteUInt8(0);
+        }
     }
 
     // The handler fills GameObjectData (DisplayID, Flags, State, TypeID, FactionTemplate, Level,
@@ -1061,34 +1342,56 @@ public partial class ObjectUpdateBuilder
         // crashed it before. HERMES_256_ANIMRAW=1 sends the legacy value again.
         w.WriteUInt32(s_animRaw ? (go?.StateAnimID ?? 0) : 1860u);        // SpawnTrackingStateAnimID (model name: StateAnimID)
         w.WriteUInt32(go?.StateAnimKitID ?? 0);        // SpawnTrackingStateAnimKitID (model name: StateAnimKitID)
-        w.WriteUInt32(0);        // stateWorldEffectIDs count - kept 0: dynamic array, elements would grow the block; no legacy source fills the model array anyway
-        w.WriteUInt32(0);        // StateWorldEffectsQuestObjectiveID
+        w.WriteUInt32(0);        // stateWorldEffectIDs count (obj+0x18) - kept 0: dynamic array, elements would grow the block; no legacy source fills the model array anyway
+        // >>> StateWorldEffectsQuestObjectiveID does NOT exist on this build. The reader goes
+        // straight from the vector count at wire +20 to the two packed guids at +24 and +26 with
+        // no u32 between them (clientfields-GameObjectData.json entries 5/6/7; 553 has no such
+        // field either - it is an 11.x addition). This u32 is what puts every later field two
+        // positions out. HERMES_256_GOBFIX=1 removes it; see the knob's note.
+        if (!s_gobFix)
+        {
+            w.WriteUInt32(0);        // StateWorldEffectsQuestObjectiveID - not read on 69110
+        }
         // CreatedBy and GuildGUID kept Empty DELIBERATELY: handler fills CreatedBy, but a
         // non-empty packed guid is length-variable; report, do not wire, per the current rules.
-        w.WritePackedGuid128(WowGuid128.Empty);        // CreatedBy (see note above)
-        w.WritePackedGuid128(WowGuid128.Empty);        // GuildGUID (no legacy source)
-        w.WriteUInt32(go?.Flags ?? 0);        // Flags
-        w.WriteUInt32(0);        // FlagsB - no legacy counterpart
+        w.WritePackedGuid128(WowGuid128.Empty);        // CreatedBy (see note above) obj+0x30
+        w.WritePackedGuid128(WowGuid128.Empty);        // GuildGUID (no legacy source) obj+0x40
+        w.WriteUInt32(go?.Flags ?? 0);        // Flags obj+0x50
+        w.WriteUInt32(0);        // FlagsB obj+0x54 - no legacy counterpart
         // ParentRotation: handler fills it only for the special transports (Deeprun Tram,
         // Zangarmarsh elevator); identity quaternion (0,0,0,1) is the neutral value otherwise.
-        w.WriteFloat(go?.ParentRotation[0] ?? 0.0f);        // ParentRotationx
-        w.WriteFloat(go?.ParentRotation[1] ?? 0.0f);        // ParentRotationy
-        w.WriteFloat(go?.ParentRotation[2] ?? 0.0f);        // ParentRotationz
-        w.WriteFloat(go?.ParentRotation[3] ?? 1.0f);        // ParentRotationw
-        w.WriteUInt32((uint)(go?.FactionTemplate ?? 0));        // FactionTemplate
-        w.WriteUInt8((byte)(go?.State ?? 0));        // State
-        w.WriteUInt8((byte)(go?.TypeID ?? 0));        // TypeID
-        w.WriteUInt8(go?.PercentHealth ?? 0);        // PercentHealth - no legacy source (destructible buildings do not exist on this core)
-        w.WriteUInt32(go?.ArtKit ?? 0);        // ArtKit
-        w.WriteUInt32(0);        // EnableDoodadSets count - dynamic, no legacy source
-        w.WriteUInt32(go?.CustomParam ?? 0);        // CustomParam
-        w.WriteUInt32((uint)(go?.Level ?? 0));        // Level
-        w.WriteUInt32(0);        // AnimGroupInstance
-        w.WriteUInt32(0);        // UiWidgetItemID
-        w.WriteUInt32(0);        // UiWidgetItemQuality
-        w.WriteUInt32(0);        // UiWidgetItemCount
-        w.WriteUInt32(0);        // WorldEffects count
-        w.WriteBits(0, 1);   // AssistActionData.has_value()
+        w.WriteFloat(go?.ParentRotation[0] ?? 0.0f);        // ParentRotationx obj+0x58
+        w.WriteFloat(go?.ParentRotation[1] ?? 0.0f);        // ParentRotationy obj+0x5C
+        w.WriteFloat(go?.ParentRotation[2] ?? 0.0f);        // ParentRotationz obj+0x60
+        w.WriteFloat(go?.ParentRotation[3] ?? 1.0f);        // ParentRotationw obj+0x64
+        w.WriteUInt32((uint)(go?.FactionTemplate ?? 0));        // FactionTemplate obj+0x68
+        // >>> Level belongs HERE, between FactionTemplate and State - the reader's run between
+        // GuildGUID and the byte triple is eight dwords (obj+0x50..0x6C) where the writer has
+        // seven, and 553 reads Level in exactly this position. Where we currently put it, after
+        // CustomParam, the client reads it as the WorldEffects vector COUNT.
+        if (s_gobFix)
+        {
+            w.WriteUInt32((uint)(go?.Level ?? 0));        // Level obj+0x6C
+        }
+        w.WriteUInt8((byte)(go?.State ?? 0));        // State obj+0x70
+        w.WriteUInt8((byte)(go?.TypeID ?? 0));        // TypeID obj+0x71
+        w.WriteUInt8(go?.PercentHealth ?? 0);        // PercentHealth obj+0x72 - no legacy source (destructible buildings do not exist on this core)
+        w.WriteUInt32(go?.ArtKit ?? 0);        // ArtKit obj+0x74
+        w.WriteUInt32(0);        // EnableDoodadSets count (obj+0x78) - dynamic, no legacy source
+        w.WriteUInt32(go?.CustomParam ?? 0);        // CustomParam obj+0xB0
+        // >>> The 20 bytes below are read by NOTHING on this build. Level moves up (see above);
+        // AnimGroupInstance and the three UiWidgetItem fields are 11.x additions that neither 553
+        // nor this reader has. The client stops at 80 bytes with the AssistActionData bit.
+        if (!s_gobFix)
+        {
+            w.WriteUInt32((uint)(go?.Level ?? 0));        // Level - wrong position, read as the WorldEffects count
+            w.WriteUInt32(0);        // AnimGroupInstance - not read on 69110
+            w.WriteUInt32(0);        // UiWidgetItemID - not read on 69110
+            w.WriteUInt32(0);        // UiWidgetItemQuality - not read on 69110
+            w.WriteUInt32(0);        // UiWidgetItemCount - not read on 69110
+        }
+        w.WriteUInt32(0);        // WorldEffects count (obj+0xB8)
+        w.WriteBits(0, 1);   // AssistActionData.has_value() obj+0xF0
         w.FlushBits();
     }
 
@@ -1260,14 +1563,20 @@ public partial class ObjectUpdateBuilder
         var dyn = m_updateData.DynamicObjectData;
         // Caster kept Empty DELIBERATELY: the handler fills it, but a non-empty packed guid is
         // length-variable; report, do not wire, per the current rules.
-        w.WritePackedGuid128(WowGuid128.Empty);        // Caster (see note above)
-        w.WriteUInt8((byte)(dyn?.Type ?? 0));        // Type - model field exists, no legacy handler fills it
-        // >>> SpellVisual : SpellCastVisual
-            w.WriteUInt32((uint)(dyn?.SpellXSpellVisualID ?? 0));        // SpellXSpellVisualID
-            w.WriteUInt32(0);        // ScriptVisualID - no legacy source
-        w.WriteUInt32((uint)(dyn?.SpellID ?? 0));        // SpellID
-        w.WriteFloat(dyn?.Radius ?? 0.0f);        // Radius - a float on the wire; the old u32 zero was width-identical
-        w.WriteUInt32(dyn?.CastTime ?? 0);        // CastTime - model field exists, no legacy handler fills it
+        w.WritePackedGuid128(WowGuid128.Empty);        // Caster (see note above) obj+0x0
+        w.WriteUInt8((byte)(dyn?.Type ?? 0));        // Type obj+0x10 - model field exists, no legacy handler fills it
+        // >>> SpellVisual. TrinityCore master carries a two-field SpellCastVisual struct here
+        // (SpellXSpellVisualID + ScriptVisualID); this build carries a single u32, exactly as
+        // 553's ReadCreateDynamicObjectData does. The inline reader in chain 0x18E3DE0 makes six
+        // reads for 19 bytes and there is no seventh. HERMES_256_DYNFIX=1 drops the second half.
+        w.WriteUInt32((uint)(dyn?.SpellXSpellVisualID ?? 0));        // SpellXSpellVisualID obj+0x14
+        if (!s_dynFix)
+        {
+            w.WriteUInt32(0);        // ScriptVisualID - not read on 69110; no legacy source either
+        }
+        w.WriteUInt32((uint)(dyn?.SpellID ?? 0));        // SpellID obj+0x18
+        w.WriteFloat(dyn?.Radius ?? 0.0f);        // Radius obj+0x1C - a float on the wire; the old u32 zero was width-identical
+        w.WriteUInt32(dyn?.CastTime ?? 0);        // CastTime obj+0x20 - model field exists, no legacy handler fills it
     }
 
     // Same bug class: the handler fills CorpseData (DynamicFlags, DisplayID, Items, RaceId,
@@ -1276,26 +1585,35 @@ public partial class ObjectUpdateBuilder
     void WriteCorpseData(WorldPacket w)
     {
         var corpse = m_updateData.CorpseData;
-        w.WriteUInt32(corpse?.DynamicFlags ?? 0);        // DynamicFlags
+        w.WriteUInt32(corpse?.DynamicFlags ?? 0);        // DynamicFlags obj+0x0
         // Owner/PartyGUID/GuildGUID kept Empty DELIBERATELY: the handler fills Owner and
         // GuildGUID, but non-empty packed guids are length-variable; report, do not wire,
         // per the current rules. Consequence: corpse ownership (loot/release UI) is untested.
-        w.WritePackedGuid128(WowGuid128.Empty);        // Owner (see note above)
-        w.WritePackedGuid128(WowGuid128.Empty);        // PartyGUID (no legacy source)
-        w.WritePackedGuid128(WowGuid128.Empty);        // GuildGUID (see note above)
-        w.WriteUInt32(corpse?.DisplayID ?? 0);        // DisplayID
+        w.WritePackedGuid128(WowGuid128.Empty);        // Owner (see note above) obj+0x8
+        w.WritePackedGuid128(WowGuid128.Empty);        // PartyGUID (no legacy source) obj+0x18
+        w.WritePackedGuid128(WowGuid128.Empty);        // GuildGUID (see note above) obj+0x28
+        w.WriteUInt32(corpse?.DisplayID ?? 0);        // DisplayID obj+0x38
         for (int i = 0; i < 19; ++i)
         {
             // model is also 19 wide (itemDisplayId | inventoryType << 24) - guarded anyway
+            // The client's run is 0x80 .. 0xC8 in the descriptor, stride 4. No `obj+0x` anchor on
+            // this line: one comment serves all 19 iterations and fieldcheck would join it to
+            // every one of them.
             w.WriteUInt32(corpse != null && i < corpse.Items.Length ? corpse.Items[i] ?? 0 : 0);        // Items[i]
         }
-        w.WriteUInt8(corpse?.RaceId ?? 0);        // RaceID
-        w.WriteUInt8(corpse?.SexId ?? 0);        // Sex
-        w.WriteUInt8(corpse?.ClassId ?? 0);        // Class - model field exists, no legacy handler fills it
-        w.WriteUInt32(0);        // Customizations count - kept 0 DELIBERATELY: the handler fills legacy-derived Customizations, but emitting elements would grow the block; wire count and elements together once corpse rendering is testable
-        w.WriteUInt32(corpse?.Flags ?? 0);        // Flags
-        w.WriteUInt32((uint)(corpse?.FactionTemplate ?? 0));        // FactionTemplate - model field exists, no legacy handler fills it
-        w.WriteUInt32(0);        // StateSpellVisualKitID
+        w.WriteUInt8(corpse?.RaceId ?? 0);        // RaceID obj+0x3C
+        w.WriteUInt8(corpse?.SexId ?? 0);        // Sex obj+0x3D
+        w.WriteUInt8(corpse?.ClassId ?? 0);        // Class obj+0x3E - model field exists, no legacy handler fills it
+        w.WriteUInt32(0);        // Customizations count (obj+0x40) - kept 0 DELIBERATELY: the handler fills legacy-derived Customizations, but emitting elements would grow the block; wire count and elements together once corpse rendering is testable
+        w.WriteUInt32(corpse?.Flags ?? 0);        // Flags obj+0x78
+        w.WriteUInt32((uint)(corpse?.FactionTemplate ?? 0));        // FactionTemplate obj+0x7C - model field exists, no legacy handler fills it
+        // >>> The reader at 0x2C6F650 stops here: 30 reads, 105 bytes, last store obj+0x7C, and
+        // 553's ReadCreateCorpseData ends in the same place. This 31st field is not read.
+        // HERMES_256_CORPSEFIX=1 drops it; see the knob's note.
+        if (!s_corpseFix)
+        {
+            w.WriteUInt32(0);        // StateSpellVisualKitID - not read on 69110
+        }
     }
 
 }

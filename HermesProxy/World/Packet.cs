@@ -64,12 +64,20 @@ public abstract class ClientPacket : IDisposable
         if (!context.PacketsLog)
             return;
 
-        if (sniffFile == null)
+        // Creating the file is itself a disk operation, and this runs INSIDE the send path - see
+        // the note in SniffFile.WritePacket. On a full disk `new SniffFile` throws, the exception
+        // escapes past LogPacket, and WorldSocket.SendPacket never reaches its send. Guard the
+        // whole thing: no diagnostic is worth dropping a packet for.
+        try
         {
-            sniffFile = new SniffFile("modern", (ushort)context.ClientBuild);
-            sniffFile.WriteHeader();
+            if (sniffFile == null)
+            {
+                sniffFile = new SniffFile("modern", (ushort)context.ClientBuild);
+                sniffFile.WriteHeader();
+            }
+            sniffFile.WritePacket(GetOpcode(), true, _worldPacket.GetData());
         }
-        sniffFile.WritePacket(GetOpcode(), true, _worldPacket.GetData());
+        catch { }
     }
 
     protected WorldPacket _worldPacket;
@@ -126,12 +134,18 @@ public abstract class ServerPacket
         if (!context.PacketsLog)
             return;
 
-        if (sniffFile == null)
+        // Same guard as the ClientPacket path: this is the SERVER-side call site, reached from
+        // WorldSocket.SendPacket before the send, so anything thrown here loses the packet.
+        try
         {
-            sniffFile = new SniffFile("modern", (ushort)context.ClientBuild);
-            sniffFile.WriteHeader();
+            if (sniffFile == null)
+            {
+                sniffFile = new SniffFile("modern", (ushort)context.ClientBuild);
+                sniffFile.WriteHeader();
+            }
+            sniffFile.WritePacket(GetOpcode(), false, GetData()!);
         }
-        sniffFile.WritePacket(GetOpcode(), false, GetData()!);
+        catch { }
     }
 
     public abstract void Write();

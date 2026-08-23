@@ -442,14 +442,67 @@ public partial class ObjectUpdateBuilder
             //
             // HERMES_256_VALUESNOOP=1 writes bit 0 == 0 (no fragment changed) and omits the legacy
             // body, so the client parses a well-formed empty update and applies nothing instead of
-            // corrupting the entity. It does not restore health updates - that needs the modern
-            // per-field encoder for CGObject's vtable+0x1C8 reader, which is not yet reversed for
-            // 69110 - but it removes the active corruption. Flip the default once, in game, enabling
-            // it visibly stops combat-time descriptor glitches (wrong health values, flicker); that
-            // confirms the malformed body is the corruptor and that an empty mask is the correct
-            // framing to build the real encoder on.
-            if (SuppressLegacyValuesBody)
-                body.WriteUInt8(0);      // changedFragmentMask: no fragment changed (clean no-op)
+            // corrupting the entity. It does not restore health updates - that removes the active
+            // corruption only.
+            //
+            // CORRECTION, 23 Aug, from WPP's own reader for this arm
+            // (.wpp/WowPacketParserModule.V5_5_0_61735/Parsers/UpdateHandler.cs, lines 84-208):
+            // the mask is TWO bits for CGObject, not one. CGObject is an INDIRECT fragment, so it
+            // consumes bit[i] = "changed" and bit[i+1] = "the indirect fragment is active", and the
+            // client only descends into it when BOTH are set. With CGObject first in our sorted
+            // fragment list that is bits 0 and 1, so the byte 3 below was already correct and the
+            // paragraph above is wrong about it. What follows the mask is a u32 updateTypeFlag
+            // (1 << modern TypeID) and then each flagged descriptor's changes-mask body - which is
+            // what ModernValuesUpdate.cs now writes, and what the legacy array never was.
+            //
+            // HERMES_256_VALUESUPDATE >= 1 takes that path. See the knob's ladder in
+            // ModernValuesUpdate.cs.
+            // NEVER WRITE 0 HERE. This byte is not "did anything change" - bit 0 is CGObject's
+            // changed bit and bit 1 is "the indirect fragment EXISTS", and clearing bit 0 tells the
+            // client to tear the fragment down. WPP's reader for this arm is explicit
+            // (UpdateHandler.cs line 203):
+            //
+            //     if (objIdx >= 0 && changedFragments[objIdx]) { ... read ... }
+            //     else obj?.EntityFragments.RemoveAll(f => f.UniversalValue == CGObject);
+            //
+            // TrinityCore never emits 0 either: Object::BuildEntityFragmentsForValuesUpdateForPlayerWithMask
+            // (Object.cpp:113) sets the "exists" bit for EVERY indirect updateable fragment and the
+            // "changed" bit for CGObject unconditionally, so for our shape the byte is always 3.
+            //
+            // MEASURED, 23 Aug 03:18. Writing 0 for "nothing our encoder can express changed" put
+            // the client one update later into a NULL indirect-fragment constructor and killed it:
+            // capture modern_3574_1787447869_1.pkt packet #24 block 2 is `01 00 00` (mask 0, the
+            // teardown) and packet #25 - the last in the file - is a player Values with mask 3 and
+            // a real body. The client then walked the entity's fragment list at RVA 0x2DC0970,
+            // found CGObject still listed with a null storage pointer, and at 0x2DC4939 did
+            // `MOV RAX,[RDI+0x78]; CALL RAX` where RDI is the component registry entry for
+            // fragment id 2 - and CGObject's +0x78 slot is NULL (fragments 1 and 18 have real
+            // constructors there; CGObject's storage is only ever established by a create block).
+            // ACCESS_VIOLATION at 0x0, RAX=0, RDI=rva 0x3C5EED0 = 0x3C5ED70 + 2*0xB0.
+            //
+            // The empty update is mask 3 with updateTypeFlag == 0, which is exactly what
+            // Object::BuildValuesUpdateWithFlag (Object.cpp:135) writes: `data << uint32(0)`.
+            if (ModernValuesEnabled)
+            {
+                // Build into a scratch buffer first. WriteModernValuesUpdate writes the u32
+                // updateTypeFlag itself and returns false only when no descriptor changed, in
+                // which case we still write the flag - as a zero - so the block stays a
+                // well-formed empty update instead of a fragment teardown.
+                WorldPacket modern = new();
+                bool any = WriteModernValuesUpdate(modern);
+                body.WriteUInt8(3);      // CGObject: changed (bit 0) and exists (bit 1)
+                if (any)
+                    body.WriteBytes(modern.GetData());
+                else
+                    body.WriteUInt32(0); // updateTypeFlag: no descriptor changed
+            }
+            else if (SuppressLegacyValuesBody)
+            {
+                // VALUESNOOP was introduced as a "clean no-op" and was not one: it wrote the same
+                // teardown byte. Give it the real empty form now that the form is known.
+                body.WriteUInt8(3);
+                body.WriteUInt32(0);
+            }
             else
                 body.WriteUInt8(3);      // current behaviour: bit 0 fires CGObject's modern reader
         }
@@ -484,7 +537,14 @@ public partial class ObjectUpdateBuilder
                     WriteUnitData(body);
                     uint oPlayer = body.GetSize();
                     WritePlayerData(body);
-                    uint oActive = body.GetSize();
+                    // GetSize() returns _length, which excludes a pending bit-pack, and
+                    // WritePlayerData always ends with WriteBits(0,1) for LeaverStatus. That byte
+                    // reaches the wire on the next fixed-width write, so PlayerData is one byte
+                    // longer than sampled here and ActivePlayerData starts one byte later. Do NOT
+                    // flush instead: on the s_noApd path nothing follows, so a flush would add a
+                    // byte to the wire rather than only to the count. This offset also feeds
+                    // ApplyZeroRanges, so `ap:` ranges were one byte low.
+                    uint oActive = body.GetSize() + (body.HasUnfinishedBitPack() ? 1u : 0u);
                     if (!s_noApd)
                         WriteActivePlayerData(body);
                     uint oEnd = body.GetSize();
@@ -519,12 +579,16 @@ public partial class ObjectUpdateBuilder
                     WriteItemData(body); WriteContainerData(body); break;
             }
         }
-        else if (!SuppressLegacyValuesBody)
+        else if (!ModernValuesEnabled && !SuppressLegacyValuesBody)
         {
             // Current behaviour: the legacy 2.4.3 masked-uint32 array. The client's CGObject update
             // deserialiser (RVA 0x24D380 -> vtable+0x1C8) cannot parse this; with the changed-
             // fragment mask above set to 0 (HERMES_256_VALUESNOOP) this body is omitted and the
             // update becomes a clean no-op instead of corrupting the entity.
+            //
+            // With HERMES_256_VALUESUPDATE >= 1 the body was already written above by
+            // WriteModernValuesUpdate, and this legacy array must NOT also run - only one of the
+            // two paths ever writes.
             BuildValuesUpdate(body);
         }
 

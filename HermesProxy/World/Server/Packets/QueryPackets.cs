@@ -662,10 +662,53 @@ public class QueryCreature : ClientPacket
 
 public class QueryCreatureResponse : ServerPacket
 {
+    /// <summary>
+    /// Emit the creature-template body in the shape the 69110 client actually reads.  Everything
+    /// up to and including the four name/nameAlt string pairs is already identical; four scalar
+    /// divergences follow it, and together they leave the body <b>two bytes short</b>, which is
+    /// rule 2's dangerous direction.
+    ///
+    /// <list type="bullet">
+    /// <item>we write <b>2</b> type-flag <c>u32</c> where the client reads <b>3</b>;</item>
+    /// <item><c>CreatureType</c> is a <b>u8</b>, not an <c>i32</c>;</item>
+    /// <item><c>Classification</c> is a <b>single byte</b>, not an <c>i32</c>;</item>
+    /// <item>a <c>QuestCurrencies</c> <c>u32</c> sits next to <c>QuestItems</c>, with a trailing
+    ///       <c>i32</c> per currency after the QuestItems array.</item>
+    /// </list>
+    ///
+    /// Measured against the client's own reader, not against a reference.  The group-0x4A
+    /// dispatcher case for 0x4A0006 (RVA 0x6B72E8) reads the entry <c>u32</c> and the hasData bit
+    /// itself and then calls the template reader at <b>RVA 0x6B4580</b>; that reader does, in
+    /// order: the 118-bit head (11/11/6/1/1 then 4 x (11,11), byte-identical to ours), four
+    /// name/nameAlt strings, a <b>3</b>-iteration <c>u32</c> loop at 0x6B4910 into obj+0x158/15C/160,
+    /// <c>u8</c> at 0x6B4936 -> obj+0x78, <c>i32</c> at 0x6B494E -> obj+0x7C, <c>u8</c> at 0x6B4961
+    /// -> obj+0x80, then PetSpellDataId, the two ProxyCreatureIDs, the display list, HpMulti,
+    /// EnergyMulti and <b>two</b> array-resize counts at 0x6B4AC6 (obj+0xE8, QuestItems) and
+    /// 0x6B4AE5 (obj+0x110, QuestCurrencies), and it ends with Title/TitleAlt/CursorName followed
+    /// by both arrays.  Walked over a probe body in this layout it consumes exactly the body's
+    /// length and every probe value lands in the field it was written to
+    /// (<c>tools-256-spike/cqprobe.py</c>); walked over what we send today it reads
+    /// <c>DisplayIdCount</c> out of the two-byte-shifted stream as <c>count &lt;&lt; 16</c> and runs
+    /// hundreds of kilobytes past the packet inside the display list.
+    ///
+    /// Neither of the two added fields has a 2.4.3 source - TBC has one <c>type_flags</c> and no
+    /// currencies - so both are written as the zero that means "none" for a flag mask and an empty
+    /// array.  They are values the client combines or counts, never ids it resolves, so zero is
+    /// safe here in a way a zero display id would not be.
+    ///
+    /// Default off.  Only affects 69110; 1.14, 2.5.2 and 3.4.3 keep the Classic-line body.
+    /// </summary>
+    static readonly bool s_creatureQuery553 =
+        System.Environment.GetEnvironmentVariable("HERMES_256_CREATUREQUERY") == "1";
+
+    private static bool Use553Body => ModernVersion.Uses550Engine && s_creatureQuery553;
+
     public QueryCreatureResponse() : base(Opcode.SMSG_QUERY_CREATURE_RESPONSE, ConnectionType.Instance) { }
 
     public override void Write()
     {
+        bool use553 = Use553Body;
+
         _worldPacket.WriteUInt32(CreatureID);
         _worldPacket.WriteBit(Allow);
         _worldPacket.FlushBits();
@@ -695,9 +738,22 @@ public class QueryCreatureResponse : ServerPacket
             for (var i = 0; i < 2; ++i)
                 _worldPacket.WriteUInt32(Stats.Flags[i]);
 
-            _worldPacket.WriteInt32(Stats.Type);
-            _worldPacket.WriteInt32(Stats.Family);
-            _worldPacket.WriteInt32(Stats.Classification);
+            if (use553)
+            {
+                // TypeFlags3. Read at 0x6B4910's third iteration into obj+0x160. No 2.4.3 source -
+                // TBC's creature_template has one type_flags column - so it carries the empty mask.
+                _worldPacket.WriteUInt32(0);
+                _worldPacket.WriteUInt8((byte)Stats.Type);            // u8  -> obj+0x78
+                _worldPacket.WriteInt32(Stats.Family);                // i32 -> obj+0x7C
+                _worldPacket.WriteInt8((sbyte)Stats.Classification);  // i8  -> obj+0x80
+            }
+            else
+            {
+                _worldPacket.WriteInt32(Stats.Type);
+                _worldPacket.WriteInt32(Stats.Family);
+                _worldPacket.WriteInt32(Stats.Classification);
+            }
+
             _worldPacket.WriteUInt32(Stats.PetSpellDataId);
 
             for (var i = 0; i < CreatureConst.MaxCreatureKillCredit; ++i)
@@ -717,6 +773,13 @@ public class QueryCreatureResponse : ServerPacket
             _worldPacket.WriteFloat(Stats.EnergyMulti);
 
             _worldPacket.WriteInt32(Stats.QuestItems.Count);
+
+            // QuestCurrencies. The client sizes a second array here (0x6B4AE5 -> obj+0x110) and
+            // drains it after QuestItems at the very end of the body. Currencies do not exist in
+            // 2.4.3, so the count is zero and no element follows.
+            if (use553)
+                _worldPacket.WriteUInt32(0);
+
             _worldPacket.WriteUInt32(Stats.MovementInfoID);
             _worldPacket.WriteInt32(Stats.HealthScalingExpansion);
             _worldPacket.WriteUInt32(Stats.RequiredExpansion);

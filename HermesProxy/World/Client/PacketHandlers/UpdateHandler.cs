@@ -111,6 +111,16 @@ public partial class WorldClient
     static readonly bool s_valuesAsCreate256 =
         System.Environment.GetEnvironmentVariable("HERMES_256_VALUESASCREATE") == "1";
 
+    /// <summary>
+    /// FIXME(256-spike): diagnostic. Prints, per player update, whether the legacy XP, next-level
+    /// XP, coinage and quest-log fields are present in the incoming field set and whether the
+    /// update is a create. PLAN-256 Track C asks that this be settled before the empty quest log,
+    /// empty XP bar and zero money are folded into the values-update work: if they arrive at
+    /// create time and still read empty, that is a separate fault. Comes out with the spike.
+    /// </summary>
+    static readonly bool s_fieldProbe =
+        System.Environment.GetEnvironmentVariable("HERMES_256_FIELDPROBE") == "1";
+
 
     [PacketHandler(Opcode.SMSG_DESTROY_OBJECT)]
     void HandleDestroyObject(WorldPacket packet)
@@ -2487,6 +2497,28 @@ public partial class WorldClient
                 {
                     updateData.PlayerData.QuestLog[i] = ReadQuestLogEntry(i, updateMaskArray, updates)!;
                 }
+            }
+            // FIXME(256-spike): diagnostic, HERMES_256_FIELDPROBE=1. PLAN-256 Track C asks whether
+            // the emulator delivers XP, money and the quest log in value updates or in the create,
+            // because all four read empty in game while the block geometry is byte-exact. This
+            // prints, per player update, whether the legacy fields are in `updates` at all and
+            // whether this is a create - so one session separates "not arriving" from "arriving
+            // and not applied".
+            if (s_fieldProbe)
+            {
+                int probeXp = LegacyVersion.GetUpdateField(PlayerField.PLAYER_XP);
+                int probeNext = LegacyVersion.GetUpdateField(PlayerField.PLAYER_NEXT_LEVEL_XP);
+                int probeCoin = LegacyVersion.GetUpdateField(PlayerField.PLAYER_FIELD_COINAGE);
+                int filledQuests = 0;
+                for (int i = 0; i < updateData.PlayerData.QuestLog.Length; i++)
+                    if (updateData.PlayerData.QuestLog[i] != null)
+                        filledQuests++;
+                Framework.Logging.Log.Print(Framework.Logging.LogType.Warn,
+                    $"[256-spike] fieldprobe create={isCreate} guid={guid} " +
+                    $"XP={(probeXp >= 0 && updates.ContainsKey(probeXp) ? updates[probeXp].Int32Value.ToString() : "absent")} " +
+                    $"NextLevelXP={(probeNext >= 0 && updates.ContainsKey(probeNext) ? updates[probeNext].Int32Value.ToString() : "absent")} " +
+                    $"Coinage={(probeCoin >= 0 && updates.ContainsKey(probeCoin) ? updates[probeCoin].UInt32Value.ToString() : "absent")} " +
+                    $"QuestLogBase={PLAYER_QUEST_LOG_1_1} questEntriesFilled={filledQuests}");
             }
             int PLAYER_CHOSEN_TITLE = LegacyVersion.GetUpdateField(PlayerField.PLAYER_CHOSEN_TITLE);
             if (PLAYER_CHOSEN_TITLE >= 0 && updateMaskArray[PLAYER_CHOSEN_TITLE])

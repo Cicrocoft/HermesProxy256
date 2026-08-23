@@ -157,7 +157,18 @@ and it is **5.5.3 plus a short list of measured deviations**, not a new build.
 | whether a field exists in this era at all | cmangos 2.4.3 data, our 2.5.2/2.5.3 writers | presence, not layout |
 | anything the above disagree on | **the client** | the only authority |
 
-**Never V2_5_5.** It is the Classic line and the source of three shipped faults.
+**Never V2_5_5.** It is the Classic line and the source of three shipped faults. And never a
+"MoP emulator" from GitHub: those are all 5.4.8-and-earlier from 2013, a different codebase entirely.
+
+**Measured, and it changes how to read the stack:** WPP's 553 handler is **98.8% identical** to the
+11.x handler in the same module. The field set is retail's, tracked build by build — "5.5" is a
+product name, not a lineage. So a disagreement between 553 and TrinityCore is a **build delta**, not
+two references that drifted apart, and it marks the exact spot to ask the client. Both `UnitData`
+deviations showed up as such a disagreement before anyone measured them.
+
+**No 5.5.x server or proxy exists publicly.** TrinityCore has no such branch; WPP has the module only
+because sniffers parse this traffic. Nobody writes it. Measurement is not a detour here — it is the
+only source.
 
 **The seam rule.** Retail-sized bounds sit over era-sized tables, and both crashes lived there: a
 legacy id resolved against a table whose id space is retail-sized but whose contents are not. **A

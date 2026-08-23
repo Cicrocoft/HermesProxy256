@@ -51,6 +51,13 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
     static readonly int s_dumpLen =
         int.TryParse(System.Environment.GetEnvironmentVariable("HERMES_256_DUMPLEN"), out var dl) && dl > 0 ? dl : 128;
 
+    // HERMES_256_QUIET=1 silences the [256-spike] send-path diagnostics: the per-packet PKT logging
+    // (LogPacket, a disk write BEFORE the send - the handover's suspected drop mechanism) and the
+    // "world packet out" hex dump. Tests whether the intermittent world-entry freeze is caused by
+    // logging sitting in the send path rather than by a real protocol drop. Default off (logging on).
+    static readonly bool s_quiet =
+        System.Environment.GetEnvironmentVariable("HERMES_256_QUIET") == "1";
+
     // Source-generated [LoggerMessage] methods use this MEL logger. SourceFile and NetDir are
     // passed per-call but resolve to the same cached strings, so they compile to const loads.
     private static readonly Microsoft.Extensions.Logging.ILogger _melLog = Log.CreateMelLogger(Log.CategoryPacket);
@@ -473,7 +480,7 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
         }
 
         packet.WritePacketData();
-        if (GetSession() != null)
+        if (GetSession() != null && !s_quiet)
             packet.LogPacket(ref GetSession().ModernSniff, GetSession().PacketLogContext);
 
         lock (_sendLock)
@@ -521,6 +528,7 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
             // FIXME(256-spike): temporary diagnostics, mirroring the inbound dump above, so the
             // bytes the client actually receives can be compared against a known-good build.
             // Remove before any PR.
+            if (!s_quiet)
             {
                 // HERMES_256_DUMPLEN raises the cap so a whole create block can be decoded
                 // against our own field map. 128 bytes stops inside the movement block and
@@ -1167,6 +1175,13 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
         // FIXME(256-spike): temporary, paired with the region probe above. Remove before any PR.
         _encryptedModeAcked = true;
         Log.Print(LogType.Warn, "[256-spike] client acknowledged encrypted mode");
+
+        // FIXME(256-spike): log the world key at the UNIVERSAL init point, not just HandleAuthSession.
+        // The instance/continued-session socket (8086, where the create batch flows) derives its key
+        // on a path that skips the AuthSession log, so its traffic could not be decrypted offline.
+        // Every world socket reaches here. Remove before any PR (prints key material).
+        Log.Print(LogType.Warn,
+            $"[256-spike] worldkey connType={_connectType} encryptKey={System.Convert.ToHexString(_encryptKey)}");
 
         _worldCrypt.Initialize(_encryptKey);
         if (_connectType == ConnectionType.Realm)

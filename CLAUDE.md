@@ -99,7 +99,16 @@ The reference stack, in order, with the reason:
 | encoder algorithm, visibility masks | `/c/projekter/TrinityCore/…/UpdateFields.cpp` | mechanism is engine-level |
 | anything the two disagree on | the client | it is the only authority |
 
-**Never V2_5_5.** It is the Classic line, not this engine, and is the source of three shipped faults.
+**Stay on 553 — but not for the reason this file used to give.** "Never V2_5_5, it is the Classic
+line and the source of three shipped faults" was measured on 23 Aug and retired: `wppdiff.py 255 553`
+scores `UnitData` **0.996**, and all three faults it was blamed for (`VirtualItems`' position,
+`VisibleItems` after `QuestLog`, the 78-byte tail) sit identically in 255, 553, 1158 **and** retail
+11.2.7. They are 69110's own deviations; no reference carries them. Among the Classic-line handlers
+the choice barely matters — stay on 553 because the writers are built on it, not to avoid a trap.
+
+**Retail 11.x/12.x is the choice that does matter, and it is the wrong one** for these blocks:
+`ActivePlayerData` 0.718, `UnitData` 0.842, `PlayerData` 0.844 against 553, diverging in exactly the
+TBC content Anniversary needs and retail deleted. Mechanism is shared; the field set is not.
 
 **Two axes, and they answer different questions.** The engine references decide a field's *layout*;
 2.4.3 and our 2.5.2/2.5.3 writers decide whether it *exists* in this era at all. A field with no

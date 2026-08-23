@@ -157,18 +157,49 @@ and it is **5.5.3 plus a short list of measured deviations**, not a new build.
 | whether a field exists in this era at all | cmangos 2.4.3 data, our 2.5.2/2.5.3 writers | presence, not layout |
 | anything the above disagree on | **the client** | the only authority |
 
-**Never V2_5_5.** It is the Classic line and the source of three shipped faults. And never a
-"MoP emulator" from GitHub: those are all 5.4.8-and-earlier from 2013, a different codebase entirely.
+Never a "MoP emulator" from GitHub: those are all 5.4.8-and-earlier from 2013, a different codebase
+entirely.
 
-**Measured, and it changes how to read the stack:** WPP's 553 handler is **98.8% identical** to the
-11.x handler in the same module. The field set is retail's, tracked build by build — "5.5" is a
-product name, not a lineage. So a disagreement between 553 and TrinityCore is a **build delta**, not
-two references that drifted apart, and it marks the exact spot to ask the client. Both `UnitData`
-deviations showed up as such a disagreement before anyone measured them.
+**Two claims that stood here were measured on 23 Aug and both are retired.** `tools-256-spike/wppdiff.py`
+diffs the read sequence of any two WPP generated readers; the tables are in `model-256.md`.
+
+* *"WPP's 553 handler is 98.8% identical to the 11.x handler in the same module, so the field set is
+  retail's."* The handler in question, `UpdateFieldsHandler1158`, declares
+  `namespace …UpdateFields.V1_15_8_63829` — **Classic Era 1.15.8**, not 11.x. That was Classic against
+  Classic. Retail lives in `V11_0_0_55666` / `V12_0_0_65390`, and against it 553 scores
+  `ActivePlayerData` **0.718**, `UnitData` 0.842, `PlayerData` 0.844 — diverging in exactly the TBC
+  content (`TrainingPointsUsed`, `ResistanceBuffMods*`, `PowerCostModifier`, `AmmoID`, `PvpRank`,
+  `ComboTarget`) that retail deleted and Anniversary needs. **Retail is the worse reference here, not
+  the better one.** Engine mechanism is still shared; the field set is the product's.
+* *"Never V2_5_5 — the source of three shipped faults."* `UnitData` 255 vs 553 is **0.996**, and 5.5.0
+  vs 5.5.3 is 0.959 on PlayerData — 2.5.5 is closer to our base than another 5.5.x point release. All
+  three faults (`VirtualItems`' position, `VisibleItems` after `QuestLog`, the 78-byte tail) sit
+  identically in 255, 553, 1158 **and** 1127. They are 69110's own deviations and adopting any other
+  reference would have shipped them unchanged.
+
+**What replaces both:** the references agree with each other far more than any agrees with this
+client, so among the Classic-line handlers the choice is nearly free — stay on 553 because the writers
+are built on it. The deviations are 69110's own, and only the client predicts them, which is what the
+last row of the table above already said. Their remaining use is *naming*: the client maps give
+offsets and widths with no names, and a position where all four references agree is a name for an
+offset, while a position where they disagree marks a spot to ask the client.
 
 **No 5.5.x server or proxy exists publicly.** TrinityCore has no such branch; WPP has the module only
 because sniffers parse this traffic. Nobody writes it. Measurement is not a detour here — it is the
 only source.
+
+**And there is now a direct line to that source: live capture.** `tools-256-spike/LIVE-CAPTURE-METHOD.md`
+documents a proven pipeline — dump the client's RAM once, brute-force the AES-256-GCM world key out of
+it against one captured packet (a 96-bit tag is a near-perfect oracle), then decrypt / decompress /
+parse the whole session through WowPacketParser. Recovered two keys, 100% packet decrypt. It already
+confirmed `SpawnTrackingStateAnimID=1860` on the wire and showed `UnitData` drifting *exactly* where
+this document's deviations predict — the model is now checkable against the real engine. It is live
+Blizzard, so it costs one memory-read of your own client (Warden exposure); the boundary note is in
+that file. It is proven end to end: `SMSG_MULTIPLE_PACKETS` framing cracked (`[len u16][opcode u32]`),
+and the player's own create block parses out of the world-entry mega-batch — cleanly through all of
+`UnitData` up to `VirtualItems`, which is exactly where 69110 deviates from 553 (§131). Live capture is
+now the instrument that confirms this document's deviations against ground truth and pinpoints each at
+the byte where a 553 reader breaks.
 
 **The seam rule.** Retail-sized bounds sit over era-sized tables, and both crashes lived there: a
 legacy id resolved against a table whose id space is retail-sized but whose contents are not. **A

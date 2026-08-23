@@ -168,6 +168,16 @@ public partial class ObjectUpdateBuilder
     static readonly bool s_pcFlag =
         System.Environment.GetEnvironmentVariable("HERMES_256_PCFLAG") == "1";
 
+    /// <summary>PersonalTabard is 10 u32 on 69110 (client reader 0x738FB0, sub 0x666D70), not 553's
+    /// 5. Emitting 5 leaves PlayerData 20 bytes short, so ActivePlayerData starts early and Coinage,
+    /// XP, NextLevelXP and InvSlots all read 0/garbage on the wire. Measured from a live create block
+    /// walked by the client's own reader: with 10 the whole player block parses and Coinage/XP land
+    /// exactly (Hvarne: Coinage 66, XP 1486; Rowine anchors Coinage 737 @+... all correct). Default
+    /// off (old 5) - this is a create-path length change, so gate + one live session confirming the
+    /// coin/XP display before it becomes default. See tools-256-spike/LIVE-CAPTURE-METHOD.md.</summary>
+    static readonly bool s_tabard10 =
+        System.Environment.GetEnvironmentVariable("HERMES_256_TABARD10") == "1";
+
     /// <summary>Send this build's empty animation state (1860) in UnitData.StateAnimID, as
     /// GameObjectData already does. See the write site.</summary>
     static readonly bool s_unitAnim =
@@ -820,12 +830,18 @@ public partial class ObjectUpdateBuilder
         {
             w.WriteUInt32(0);        // Field_3120
         }
-        // >>> PersonalTabard
+        // >>> PersonalTabard - 5 u32 on 553, but this build reads 10 (see s_tabard10). The extra 5
+        // are zero (no legacy source; the era does not use the retail personal-tabard fields), but
+        // the client consumes them, so omitting them shifts everything after by 20 bytes.
         w.WriteInt32(0);        // EmblemStyle
         w.WriteInt32(0);        // EmblemColor
         w.WriteInt32(0);        // BorderStyle
         w.WriteInt32(0);        // BorderColor
         w.WriteInt32(0);        // BackgroundColor
+        if (s_tabard10)
+        {
+            w.WriteInt32(0); w.WriteInt32(0); w.WriteInt32(0); w.WriteInt32(0); w.WriteInt32(0); // +5 -> 10 u32
+        }
         if (custom != null)
         {
             foreach (var c in custom)

@@ -703,6 +703,32 @@ public class QueryCreatureResponse : ServerPacket
 
     private static bool Use553Body => ModernVersion.Uses550Engine && s_creatureQuery553;
 
+    /// <summary>
+    /// World-entry freeze (24 Aug 2026): the empty creature name slots are declared one byte too long.
+    ///
+    /// The four Name/NameAlt length prefixes are the ONLY strings in this body that are not empty-guarded:
+    /// Title, TitleAlt and CursorName above all write <c>IsEmpty() ? 0 : GetByteCount()+1</c>, but the
+    /// Name loop writes <c>GetByteCount()+1</c> unconditionally, so an empty slot goes out as length <b>1</b>
+    /// while writing <b>zero</b> bytes (the write loop is empty-guarded).  A normal creature fills only
+    /// <c>Name[0]</c>, so seven of the eight slots ship length 1 with nothing behind them.
+    ///
+    /// The 69110 client reads <c>length</c> bytes per slot, so those seven phantom bytes shift the whole
+    /// tail: <c>CreatureDisplay.Count</c> is then read out of the wrong offset as <b>0x48000000
+    /// (1,207,959,552)</b>, handed to the display-list resize at client RVA 0x6BB290 and the 12-byte
+    /// element loop at 0x6B4A10 - the 60-second game-thread freeze (ERROR #109 signature) that follows
+    /// CMSG_QUERY_CREATURE at world entry.  Proven against the client's own reader and against a live
+    /// Blizzard SMSG_QUERY_CREATURE_RESPONSE, whose empty slots are length <b>0</b> (see the raw diff in
+    /// tools-256-spike; ours [(7,1),(1,1),(1,1),(1,1)] vs live [(20,0),(0,0),(0,0),(0,0)]).
+    ///
+    /// Default off (current, buggy +1).  ON encodes empty slots as 0, matching Blizzard.  Must be paired
+    /// with HERMES_256_CREATUREQUERY=1 - the Classic body has its own type-width shift that also corrupts
+    /// the count - to fully resolve the freeze on 69110.  Only affects the 550 engine.
+    /// </summary>
+    static readonly bool s_creatureNameLen0 =
+        System.Environment.GetEnvironmentVariable("HERMES_256_CREATURENAMELEN") == "1";
+
+    private static bool EmptyNameLenZero => ModernVersion.Uses550Engine && s_creatureNameLen0;
+
     public QueryCreatureResponse() : base(Opcode.SMSG_QUERY_CREATURE_RESPONSE, ConnectionType.Instance) { }
 
     public override void Write()
@@ -721,10 +747,23 @@ public class QueryCreatureResponse : ServerPacket
             _worldPacket.WriteBit(Stats.Civilian);
             _worldPacket.WriteBit(Stats.Leader);
 
+            bool nameLen0 = EmptyNameLenZero;
             for (var i = 0; i < CreatureConst.MaxCreatureNames; ++i)
             {
-                _worldPacket.WriteBits(Stats.Name[i].GetByteCount() + 1, 11);
-                _worldPacket.WriteBits(Stats.NameAlt[i].GetByteCount() + 1, 11);
+                // The write loop below is empty-guarded, so an empty slot writes 0 bytes. When the length
+                // prefix says 1 for that slot (GetByteCount()+1 on an empty string) the 69110 client reads
+                // a phantom byte and the whole tail shifts, corrupting CreatureDisplay.Count into a
+                // billion-element resize (the world-entry freeze). Match Blizzard: empty slots are 0.
+                if (nameLen0)
+                {
+                    _worldPacket.WriteBits(string.IsNullOrEmpty(Stats.Name[i]) ? 0 : Stats.Name[i].GetByteCount() + 1, 11);
+                    _worldPacket.WriteBits(string.IsNullOrEmpty(Stats.NameAlt[i]) ? 0 : Stats.NameAlt[i].GetByteCount() + 1, 11);
+                }
+                else
+                {
+                    _worldPacket.WriteBits(Stats.Name[i].GetByteCount() + 1, 11);
+                    _worldPacket.WriteBits(Stats.NameAlt[i].GetByteCount() + 1, 11);
+                }
             }
 
             for (var i = 0; i < CreatureConst.MaxCreatureNames; ++i)

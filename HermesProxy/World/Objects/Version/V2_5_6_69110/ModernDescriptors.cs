@@ -320,6 +320,36 @@ public partial class ObjectUpdateBuilder
         System.Environment.GetEnvironmentVariable("HERMES_256_APDTAIL") == "1";
 
     /// <summary>
+    /// World-entry freeze, root-caused from the client's own minidump (24 Aug 2026).
+    ///
+    /// ERROR #109 (thread frozen 60s) fires in the ActivePlayerData CREATE reader: the freeze stack
+    /// is <c>0x72E4E4</c> (a resize/element loop) &lt;- <c>0x729AA0</c> &lt;- the APD reader
+    /// <c>0x713E50</c> at <c>0x71AE1D</c> (the map at obj+0x1B58). In the minidump (WowClassic base
+    /// 0x7FF689270000, frozen thread 13616) the stream cursor is <b>11052</b> - one past the end of
+    /// the 11051-byte packet buffer - and the loop count is <b>3,361,744,641 (0xC8602701)</b>, a value
+    /// that does NOT appear anywhere in the packet: it was read from <b>heap</b> past the buffer end.
+    ///
+    /// Cause: the client's APD create reader consumes ~44 bytes MORE than <see cref="WriteActivePlayerData"/>
+    /// emits, so by the time it reaches the obj+0x1B58 map's u32 count that count is read from beyond
+    /// the buffer. Whatever stale heap sits there becomes an array length handed to a resize+element
+    /// loop - a 60-second spin when it is large. This is why the SAME block "sometimes" entered the
+    /// world: the older note here called good and frozen captures byte-identical and streamwalk
+    /// consumes 6236 over both, which is exactly the signature of an over-read into non-deterministic
+    /// heap rather than a value in the block. The emulator cannot see it (it does not model the bit
+    /// context at 0x71AA75 or the tail arms), and no live ActivePlayer create exists to diff.
+    ///
+    /// The deterministic fix until the exact missing field is identified: append N zero bytes to this
+    /// (last) block so the reader's tail reads - the map counts included - land on in-buffer zeros
+    /// instead of heap. Every count then reads 0, every element loop is skipped, and the reader
+    /// finishes inside the buffer. Trailing zeros on the final block of a batch are inert (the client
+    /// resynchronises on the batch's declared size). Default 0 (current behaviour); set
+    /// HERMES_256_APDPAD=128 to cover the measured ~44-byte over-read with margin.
+    /// </summary>
+    static readonly int s_apdPad =
+        int.TryParse(System.Environment.GetEnvironmentVariable("HERMES_256_APDPAD"), out var _apdPad)
+            ? _apdPad : 0;
+
+    /// <summary>
     /// The legacy unit flags are not carried across. Measured: copying them raw makes every
     /// creature draw a second, pale model - the block itself is fine, since name, level and
     /// health all read back correctly, so a bit that meant something harmless in 2.4.3 means
@@ -1313,6 +1343,14 @@ public partial class ObjectUpdateBuilder
             w.WriteUInt8(0);
             w.WriteUInt8(0);   // the 2-byte mask of the packed guid at wire +6234, i.e. empty
             w.WriteUInt8(0);
+        }
+        // Freeze mitigation: pad the last block so the APD reader's ~44-byte over-read (minidump,
+        // 24 Aug) lands on in-buffer zeros instead of heap - every tail count then reads 0 and the
+        // obj+0x1B58 resize loop is skipped. Default off (s_apdPad == 0) = current behaviour. See s_apdPad.
+        if (s_apdPad > 0)
+        {
+            for (int i0 = 0; i0 < s_apdPad; ++i0)
+                w.WriteUInt8(0);
         }
     }
 

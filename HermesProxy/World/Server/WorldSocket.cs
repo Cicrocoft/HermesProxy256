@@ -51,6 +51,14 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
     static readonly int s_dumpLen =
         int.TryParse(System.Environment.GetEnvironmentVariable("HERMES_256_DUMPLEN"), out var dl) && dl > 0 ? dl : 128;
 
+    // HERMES_256_DUMPDIR: when set, every outgoing world block (plaintext, pre-encryption) is
+    // written to <dir>/out_<seq>_<OPCODE>.bin so a whole session's create/values blocks can be
+    // parsed and diffed against a live capture without decrypting our own wire. Dev-only; the whole
+    // [256-spike] send-path diagnostics come out before any PR.
+    static readonly string? s_dumpDir =
+        System.Environment.GetEnvironmentVariable("HERMES_256_DUMPDIR") is { Length: > 0 } d ? d : null;
+    static int s_dumpSeq;
+
     // HERMES_256_QUIET=1 silences the [256-spike] send-path diagnostics: the per-packet PKT logging
     // (LogPacket, a disk write BEFORE the send - the handover's suspected drop mechanism) and the
     // "world packet out" hex dump. Tests whether the intermittent world-entry freeze is caused by
@@ -537,6 +545,18 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
                 Log.Print(LogType.Warn,
                     $"[256-spike] world packet out: {universalOpcode} opcode=0x{opcode:X} " +
                     $"bodyLen={data.Length} first{dumpLength}={System.Convert.ToHexString(data, 0, dumpLength)}");
+            }
+
+            if (s_dumpDir != null)
+            {
+                try
+                {
+                    int seq = System.Threading.Interlocked.Increment(ref s_dumpSeq);
+                    System.IO.Directory.CreateDirectory(s_dumpDir);
+                    System.IO.File.WriteAllBytes(
+                        System.IO.Path.Combine(s_dumpDir, $"out_{seq:D5}_{universalOpcode}.bin"), data);
+                }
+                catch { /* dev-only diagnostic; never disturb the send path */ }
             }
 
             ByteBuffer buffer = new();

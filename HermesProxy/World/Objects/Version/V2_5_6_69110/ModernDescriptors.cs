@@ -163,6 +163,15 @@ public partial class ObjectUpdateBuilder
     static readonly bool s_apdDropArr =
         System.Environment.GetEnvironmentVariable("HERMES_256_APDDROPARR") == "1";
 
+    // HERMES_256_APDARR2=1 keeps TrackResourceMask[2] (8B) and RestInfo[2] (10B) ON the wire even when
+    // APDDROPARR is set - because the live 69110 client DOES read them. Live sentinel bisection (25 Aug,
+    // catch_numbackpack.py APDPROBE sentinels): with them dropped, char-sheet fields land -8 (after
+    // TrackResourceMask, before Versatility) then -18 (after RestInfo), and NumBackpackSlots reads 0 =>
+    // GetContainerNumSlots(0)=0, bags won't open. CombatRatings[32] stays dropped (MaxLevel measured -18,
+    // not -146, so the client does NOT read it - the WatchedFactionIndex->MaxLevel dword-adjacency holds).
+    static readonly bool s_apdArr2 =
+        System.Environment.GetEnvironmentVariable("HERMES_256_APDARR2") == "1";
+
     /// <summary>Set UNIT_FLAG_PLAYER_CONTROLLED on the player, so the client's attackability test
     /// takes its wider threshold. See the write site for the disassembly.</summary>
     static readonly bool s_pcFlag =
@@ -1142,7 +1151,7 @@ public partial class ObjectUpdateBuilder
         // dword-adjacent fields with no room between them. Measured over real captured bytes, and
         // the reader has no 2-iteration loop anywhere. Same signature as UnitData.VirtualItems
         // (section 131), except these are over-sends to delete rather than fields to relocate.
-        if (!s_apdDropArr)
+        if (!s_apdDropArr || s_apdArr2)   // APDARR2: client DOES read TrackResourceMask (live sentinel)
         {
             for (int i0 = 0; i0 < 2; ++i0)
             {
@@ -1169,13 +1178,13 @@ public partial class ObjectUpdateBuilder
             w.WriteInt32(apd != null && i0 < apd.ModDamageDoneNeg.Length ? apd.ModDamageDoneNeg[i0] ?? 0 : 0);        // ModDamageDoneNeg
             w.WriteFloat(apd != null && i0 < apd.ModDamageDonePercent.Length ? apd.ModDamageDonePercent[i0] ?? 0.0f : 0.0f);        // ModDamageDonePercent
         }
-        w.WriteInt32(apd?.ShieldBlock ?? 0);        // ShieldBlock (obj+0x1118)
+        w.WriteInt32(s_apdProbe ? 0xB001 : (apd?.ShieldBlock ?? 0));        // ShieldBlock (obj+0x1118) [APDPROBE sentinel]
         w.WriteFloat(0.0f);        // ShieldBlockCritPercentage (obj+0x111C)
         w.WriteFloat(0.0f);        // Mastery (obj+0x1120)
         w.WriteFloat(0.0f);        // Speed (obj+0x1124)
         w.WriteFloat(0.0f);        // Avoidance (obj+0x1128)
         w.WriteFloat(0.0f);        // Sturdiness (obj+0x112C)
-        w.WriteInt32(0);        // Versatility (obj+0x1130)
+        w.WriteInt32(s_apdProbe ? 0xB002 : 0);        // Versatility (obj+0x1130) [APDPROBE sentinel]
         w.WriteFloat(0.0f);        // VersatilityBonus (obj+0x1134)
         w.WriteFloat(0.0f);        // PvpPowerDamage (obj+0x1138)
         w.WriteFloat(0.0f);        // PvpPowerHealing (obj+0x113C)
@@ -1194,7 +1203,7 @@ public partial class ObjectUpdateBuilder
         // >>> RestInfo[2] - 10 bytes the reader does not read: it goes from AccountDataElements
         // straight to ModHealingDonePos at obj+0x14C0. Element reader 0x712440 exists, but nothing
         // in 0x713E50 calls it over this block.
-        if (!s_apdDropArr)
+        if (!s_apdDropArr || s_apdArr2)   // APDARR2: client DOES read RestInfo (live sentinel: -18 = TrackResource+RestInfo)
         {
             for (int i0 = 0; i0 < 2; ++i0)
             {
@@ -1219,13 +1228,13 @@ public partial class ObjectUpdateBuilder
         w.WriteFloat(0.0f);        // OverrideAPBySpellPowerPercent (obj+0x14DC)
         w.WriteInt32(apd?.ModTargetResistance ?? 0);        // ModTargetResistance (obj+0x14E0)
         w.WriteInt32(apd?.ModTargetPhysicalResistance ?? 0);        // ModTargetPhysicalResistance (obj+0x14E4)
-        w.WriteUInt32(apd?.LocalFlags ?? 0);        // LocalFlags
+        w.WriteUInt32(s_apdProbe ? 0xB003u : (apd?.LocalFlags ?? 0));        // LocalFlags [APDPROBE sentinel]
         w.WriteUInt8(apd?.GrantableLevels ?? 0);        // GrantableLevels (obj+0x14EC)
         w.WriteUInt8(apd?.MultiActionBars ?? 0);        // MultiActionBars (obj+0x14ED)
         w.WriteUInt8(apd?.LifetimeMaxRank ?? 0);        // LifetimeMaxRank (obj+0x14EE)
         w.WriteUInt8(0);        // NumRespecs (obj+0x14EF) - no legacy source
         w.WriteInt32((int)(apd?.AmmoID ?? 0));        // AmmoID (obj+0x14F0)
-        w.WriteUInt32(apd?.PvpMedals ?? 0);        // PvpMedals (obj+0x14F4)
+        w.WriteUInt32(s_apdProbe ? 0xB004u : (apd?.PvpMedals ?? 0));        // PvpMedals (obj+0x14F4) [APDPROBE sentinel]
         for (int i0 = 0; i0 < 12; ++i0)
         {
             // count = client global 0x33EFE60 = 12, matching the model's 12 buyback slots
@@ -1263,7 +1272,7 @@ public partial class ObjectUpdateBuilder
                 w.WriteInt32(apd != null && i0 < apd.CombatRatings.Length ? apd.CombatRatings[i0] ?? 0 : 0);        // CombatRatings
             }
         }
-        w.WriteInt32(apd?.MaxLevel ?? 0);        // MaxLevel (obj+0x1528)
+        w.WriteInt32(s_apdProbe ? 0xB005 : (apd?.MaxLevel ?? 0));        // MaxLevel (obj+0x1528) [APDPROBE sentinel]
         w.WriteInt32(0);        // ScalingPlayerLevelDelta (obj+0x152C)
         w.WriteInt32(0);        // MaxCreatureScalingLevel (obj+0x1530)
         w.WriteUInt8(0);        // NEW on this build: u8 at obj+0x1534 (RVA 0x71663B), name unknown

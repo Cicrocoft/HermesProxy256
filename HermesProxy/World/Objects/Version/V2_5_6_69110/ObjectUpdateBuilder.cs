@@ -279,7 +279,8 @@ public partial class ObjectUpdateBuilder
     /// </para>
     FieldVisibility GetFieldVisibility() =>
         m_objectType == Enums.ObjectTypeBCC.ActivePlayer
-            ? (s_questLog ? FieldVisibility.Owner | FieldVisibility.PartyMember : FieldVisibility.Owner)
+            ? (s_vejB ? FieldVisibility.Owner | FieldVisibility.PartyMember | FieldVisibility.UnitAll
+               : s_questLog ? FieldVisibility.Owner | FieldVisibility.PartyMember : FieldVisibility.Owner)
             : s_itemOwner && (m_objectType == Enums.ObjectTypeBCC.Item ||
                               m_objectType == Enums.ObjectTypeBCC.Container)
                 ? FieldVisibility.Owner
@@ -364,6 +365,36 @@ public partial class ObjectUpdateBuilder
 
     static readonly bool s_questLog =
         System.Environment.GetEnvironmentVariable("HERMES_256_QUESTLOG") == "1";
+
+    /// <summary>
+    /// Vej B: emit the active-player create at the FULL visibility 0x07 (Owner|PartyMember|UnitAll)
+    /// that live Blizzard sends, instead of 0x01/0x03. Confirmed against the live 0x07 create
+    /// (tools-256-spike/ap_rowine.bin, Rowine): the client needs the 0x07 byte to treat the object
+    /// as its own full active player (quest log / skill / bag UI), and the PlayerData/ActivePlayerData
+    /// layout the proxy already emits is byte-exact to live's at 0x07 - QuestLog[25] 66B, the
+    /// QuestLogExtraMap {u32 key,u32 value}, VisibleItems[19] 23B at the block end, DungeonScore 12B,
+    /// MSB-first name bits, and InvSlots[146] at the ActivePlayerData head with Coinage at +300 for
+    /// the empty case. There is no UnitAll-only field group (every UnitAll gate also includes Owner),
+    /// so 0x07 emits the same field set as 0x03 plus the byte; the reader gating matches the writer.
+    /// Default off. Pair with HERMES_256_QUESTLOG/INVSLOTS to fill the arrays, and APDPAD stays on as
+    /// the tail-over-read cover.
+    /// </summary>
+    static readonly bool s_vejB =
+        System.Environment.GetEnvironmentVariable("HERMES_256_VEJB") == "1";
+
+    /// <summary>
+    /// Live-exact create-object bits (24 Aug, measured over live5_s1_inflated.bin): the live
+    /// client's bit order KEEPS AreaTrigger at bit 13 - the transport gameobject sets
+    /// GameObject at bit 14 (81 4A 00) and the player sets ActivePlayer at bit 17 (8C 00 40),
+    /// both one position later than this writer emitted - and HasEntityPosition is NOT
+    /// hardcoded: all 9 live item creates carry 00 00 00 (no position), while all 90 unit and
+    /// 46 gameobject creates carry it set. Our hardcoded first bit told the client every ITEM
+    /// has a position, which broke exactly and only the item objects (paper doll, backpack),
+    /// while units/gameobjects emit live-identical bytes with or without the fix because
+    /// nothing they set sits above bit 12. Default off = old behavior.
+    /// </summary>
+    static readonly bool s_createBits =
+        System.Environment.GetEnvironmentVariable("HERMES_256_CREATEBITS") == "1";
 
     /// <summary>
     /// TrinityCore's TypeID, which is not the BCC one this repository stores. The modern enum
@@ -482,7 +513,7 @@ public partial class ObjectUpdateBuilder
             //
             // The empty update is mask 3 with updateTypeFlag == 0, which is exactly what
             // Object::BuildValuesUpdateWithFlag (Object.cpp:135) writes: `data << uint32(0)`.
-            if (ModernValuesEnabled)
+            if (ModernValuesEnabled || m_updateData.ForceApdValuesTest)
             {
                 // Build into a scratch buffer first. WriteModernValuesUpdate writes the u32
                 // updateTypeFlag itself and returns false only when no descriptor changed, in
@@ -579,7 +610,7 @@ public partial class ObjectUpdateBuilder
                     WriteItemData(body); WriteContainerData(body); break;
             }
         }
-        else if (!ModernValuesEnabled && !SuppressLegacyValuesBody)
+        else if (!ModernValuesEnabled && !SuppressLegacyValuesBody && !m_updateData.ForceApdValuesTest)
         {
             // Current behaviour: the legacy 2.4.3 masked-uint32 array. The client's CGObject update
             // deserialiser (RVA 0x24D380 -> vtable+0x1C8) cannot parse this; with the changed-
@@ -718,7 +749,7 @@ public partial class ObjectUpdateBuilder
     void WriteCreateBitsModern(WorldPacket data)
     {
         var b = m_createBits;
-        data.WriteBit(true);                                       // HasEntityPosition
+        data.WriteBit(!s_createBits || m_updateData.CreateData?.MoveInfo != null); // HasEntityPosition - live: set only for objects that HAVE a position (items: clear)
         data.WriteBit(b.HasFlag(CreateObjectBits.NoBirthAnim));
         data.WriteBit(b.HasFlag(CreateObjectBits.EnablePortals));
         data.WriteBit(b.HasFlag(CreateObjectBits.PlayHoverAnim));
@@ -731,6 +762,8 @@ public partial class ObjectUpdateBuilder
         data.WriteBit(b.HasFlag(CreateObjectBits.Vehicle));
         data.WriteBit(b.HasFlag(CreateObjectBits.AnimKit));
         data.WriteBit(b.HasFlag(CreateObjectBits.Rotation));
+        if (s_createBits)
+            data.WriteBit(false);                              // AreaTrigger - NOT gone on this build: live puts GameObject at 14 and ActivePlayer at 17
         data.WriteBit(b.HasFlag(CreateObjectBits.GameObject));
         data.WriteBit(b.HasFlag(CreateObjectBits.SmoothPhasing));
         data.WriteBit(b.HasFlag(CreateObjectBits.SceneObject));

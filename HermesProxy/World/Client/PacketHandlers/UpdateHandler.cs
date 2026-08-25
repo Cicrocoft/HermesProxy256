@@ -68,8 +68,60 @@ public partial class WorldClient
             }
         }
 
+        // HERMES_256_SETUPLAST: flush the held INITIAL_SETUP immediately before the self create, so
+        // the client marks its before-map phase complete right at the create and runs its AddToMap
+        // subsystem init (inventory/skills) - not ~40 packets early. Only on the real create (not a
+        // Values update). See GameSessionData.PendingInitialSetup and CypherCore Player.cs:6035.
+        var pendingSetup = GetSession().GameState.PendingInitialSetup;
+        if (pendingSetup != null && self.Type != UpdateTypeModern.Values)
+        {
+            GetSession().GameState.PendingInitialSetup = null;
+            SendPacketToClient(pendingSetup);
+        }
+
         selfPacket.ObjectUpdates.Add(self);
         SendPacketToClient(selfPacket);
+
+        // HERMES_256_APDVALUES: send a SEPARATE SMSG_UPDATE_OBJECT carrying a VALUES block for the
+        // player right after the create. ForceApdValuesTest routes just this object through the
+        // modern values encoder (ModernValuesUpdate.cs -> BuildActivePlayerDataUpdate: Coinage bit
+        // 33, XP 35, NextLevelXP 36), independent of the HERMES_256_VALUESUPDATE ladder and without
+        // affecting any other update. The encoder is mask-driven by nullable HasValue, so simply
+        // assigning the fields forces them into the change mask - no prior cached value is needed.
+        // Sentinels mirror WriteActivePlayerData's APDPROBE (7 / 13 / 19); otherwise the create's
+        // real values.
+        if (s_apdValues && ModernVersion.Uses550Engine && self.Type != UpdateTypeModern.Values)
+        {
+            bool apdProbe = System.Environment.GetEnvironmentVariable("HERMES_256_APDPROBE") == "1";
+            UpdateObject apdPacket = new UpdateObject(GetSession().GameState);
+            ObjectUpdate apdUpdate = new ObjectUpdate(mine, UpdateTypeModern.Values, GetSession());
+            apdUpdate.ForceApdValuesTest = true;
+            apdUpdate.ActivePlayerData.Coinage = apdProbe ? 7UL : (self.ActivePlayerData?.Coinage ?? 0UL);
+            apdUpdate.ActivePlayerData.XP = apdProbe ? 13 : (self.ActivePlayerData?.XP ?? 0);
+            apdUpdate.ActivePlayerData.NextLevelXP = apdProbe ? 19 : (self.ActivePlayerData?.NextLevelXP ?? 400);
+            apdPacket.ObjectUpdates.Add(apdUpdate);
+            SendPacketToClient(apdPacket);
+            Framework.Logging.Log.Print(Framework.Logging.LogType.Warn,
+                $"[256-spike] APDVALUES: forced ActivePlayerData VALUES update for {mine} " +
+                $"(probe={apdProbe} coinage={apdUpdate.ActivePlayerData.Coinage} xp={apdUpdate.ActivePlayerData.XP} nextXp={apdUpdate.ActivePlayerData.NextLevelXP})");
+        }
+
+        // HERMES_256_CREATEORDER: the self create is now on the wire, so release the AfterAddToMap
+        // map-state packets (weather / world states) that were held back to preserve the client's
+        // Before->CREATE->After ordering. Only once, on the first real self create.
+        if (s_createOrder && !GetSession().GameState.SelfCreateSentToClient
+            && self.Type != UpdateTypeModern.Values)
+        {
+            GetSession().GameState.SelfCreateSentToClient = true;
+            ServerPacket[] held;
+            lock (GetSession().GameState.DeferredAfterAddToMapLock)
+            {
+                held = GetSession().GameState.DeferredAfterAddToMap.ToArray();
+                GetSession().GameState.DeferredAfterAddToMap.Clear();
+            }
+            foreach (var p in held)
+                SendPacketToClient(p);
+        }
 
         // The client now knows which object is it, so it can be given the mover. Only once: a second
         // one mid-session would re-run the handshake for a character that is already in control.
@@ -91,6 +143,13 @@ public partial class WorldClient
     /// V3_4_3) and one hang (ERROR #109, section 107). Flipped by the measurement described at
     /// each use site.
     /// </summary>
+    // HERMES_256_APDVALUES: diagnostic. Force a player ActivePlayerData VALUES update (updateType 0)
+    // immediately after the self CREATE. CREATE and VALUES go through different client handlers; our
+    // APD has only ever shipped in the CREATE. If money/XP surface from a VALUES update where the
+    // create's do not, the commit path is VALUES-only. Default off.
+    static readonly bool s_apdValues =
+        System.Environment.GetEnvironmentVariable("HERMES_256_APDVALUES") == "1";
+
     static readonly bool s_itemsFirst =
         System.Environment.GetEnvironmentVariable("HERMES_256_ITEMSFIRST") == "1";
 

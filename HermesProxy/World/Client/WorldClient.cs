@@ -348,6 +348,11 @@ public partial class WorldClient
     static readonly bool s_splitUpdateBlocks =
         Environment.GetEnvironmentVariable("HERMES_256_SPLIT") == "1";
 
+    // Hold the AfterAddToMap map-state packets until the self create is sent (see
+    // GameSessionData.DeferredAfterAddToMap and SendOwnObjectFirstIfNeeded). Default off.
+    static readonly bool s_createOrder =
+        Environment.GetEnvironmentVariable("HERMES_256_CREATEORDER") == "1";
+
     public void SendPacketToClient(ServerPacket packet, Opcode delayUntilOpcode = Opcode.MSG_NULL_ACTION)
     {
         // One update block per packet. The client loops BlockCount times and rejects the whole
@@ -372,6 +377,18 @@ public partial class WorldClient
         }
 
         Opcode opcode = packet.GetUniversalOpcode();
+        if (s_createOrder && ModernVersion.Uses550Engine
+            && !GetSession().GameState.SelfCreateSentToClient
+            && (opcode == Opcode.SMSG_WEATHER
+                || opcode == Opcode.SMSG_INIT_WORLD_STATES
+                || opcode == Opcode.SMSG_START_LIGHTNING_STORM))
+        {
+            // These assume the player is on the map; the legacy server sends them before the self
+            // create. Hold until SendOwnObjectFirstIfNeeded emits the create, then it flushes them.
+            lock (GetSession().GameState.DeferredAfterAddToMapLock)
+                GetSession().GameState.DeferredAfterAddToMap.Enqueue(packet);
+            return;
+        }
         if (delayUntilOpcode != Opcode.MSG_NULL_ACTION)
         {
             if (_delayedPacketsToClient.ContainsKey(delayUntilOpcode))

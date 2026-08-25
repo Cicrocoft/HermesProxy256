@@ -98,6 +98,14 @@ public class ObjectUpdate
     public DynamicObjectData DynamicObjectData = null!;
     public CorpseData CorpseData = null!;
 
+    /// <summary>
+    /// HERMES_256_APDVALUES diagnostic: when set on a VALUES ObjectUpdate for the player, the 69110
+    /// builder encodes it through the modern values encoder (ModernValuesUpdate.cs) and includes
+    /// ActivePlayerData, regardless of the HERMES_256_VALUESUPDATE ladder - and only for this one
+    /// object, so the normal value-update flow is unchanged. Default false.
+    /// </summary>
+    public bool ForceApdValuesTest;
+
     public void InitializePlaceholders()
     {
         if (CreateData == null)
@@ -293,6 +301,11 @@ public class ObjectUpdate
 
 public class UpdateObject : ServerPacket
 {
+    // ON writes the SMSG_UPDATE_OBJECT envelope's leading bit as FALSE, matching every packet of
+    // the live 69110 session (see Write below). Default off = current behavior (TC-master TRUE).
+    static readonly bool s_envelopeBit =
+        System.Environment.GetEnvironmentVariable("HERMES_256_ENVELOPEBIT") == "1";
+
     public UpdateObject(GameSessionData gameState) : base(Opcode.SMSG_UPDATE_OBJECT, ConnectionType.Instance)
     {
         _gameState = gameState;
@@ -314,7 +327,11 @@ public class UpdateObject : ServerPacket
             _worldPacket.WriteUInt16(MapID);
             _worldPacket.WriteUInt32(NumObjUpdates);
 
-            buffer.WriteBit(true);
+            // TC master hardcodes this leading bit TRUE ("unk"), and so did we - but the LIVE
+            // 69110 session sends it FALSE on every SMSG_UPDATE_OBJECT (live7_s1: byte 0x00
+            // where ours is 0x80; both followed by no removals and the same size+data shape).
+            // Retail semantics do not bind a classic-line client; match live under the knob.
+            buffer.WriteBit(!s_envelopeBit);
             bool hasRemovals = !OutOfRangeGuids.Empty() || !DestroyedGuids.Empty();
             buffer.WriteBit(hasRemovals);
             buffer.FlushBits();

@@ -143,6 +143,9 @@ public partial class WorldSocket
         SendConnectToInstance(ConnectToSerial.WorldAttempt1);
         GetSession().GameState.IsConnectedToInstance = true;
         GetSession().GameState.IsFirstEnterWorld = true;
+        GetSession().GameState.SelfCreateSentToClient = false;
+        lock (GetSession().GameState.DeferredAfterAddToMapLock)
+            GetSession().GameState.DeferredAfterAddToMap.Clear();
         GetSession().GameState.CurrentPlayerGuid = playerLogin.Guid;
         GetSession().GameState.CurrentPlayerInfo = GetSession().GameState.OwnCharacters.Single(x => x.CharacterGuid == playerLogin.Guid);
         GetSession().GameState.CurrentPlayerStorage.LoadCurrentPlayer();

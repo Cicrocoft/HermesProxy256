@@ -228,7 +228,7 @@ public partial class ObjectUpdateBuilder
                     if (player != null)
                         Add(0x0040u, player);
                 }
-                if (m_objectType == Enums.ObjectTypeBCC.ActivePlayer && ModernValuesActive)
+                if (m_objectType == Enums.ObjectTypeBCC.ActivePlayer && (ModernValuesActive || m_updateData.ForceApdValuesTest))
                 {
                     var active = BuildActivePlayerDataUpdate();
                     if (active != null)

@@ -62,7 +62,8 @@ do not delete — move to Done with the evidence.**
 
 | # | finding / gap | subsystem · visibility gate | status | evidence |
 |---|---|---|---|---|
-| **P0-FREEZE** | **World-entry freeze REPRODUCES at gate-clean default (24 Aug).** Login completes (PLAYER_LOGIN → LOGIN_VERIFY_WORLD), the world loads, then the client **goes silent right after the multi-object create batches** — last CMSG `CMSG_QUERY_CREATURE` at 00:20:21, then one-way SMSG until the socket dies 54 s later. The batches: SMSG_UPDATE_OBJECT bodyLen **11062 (10 objects)** and **51236 (64 objects)**. So the fault is an object **inside a multi-object batch**, not the player's solo create — prime suspect **creature `UnitData` at visibility `None`** (a different field branch than the player's `Owner`; the gate only ever validated the player's 898) and/or **ActivePlayerData past the +6126 horizon**. Matches §107 (freeze ↔ UNITFIELDS). | `UnitData` (Unit/None) &/or `ActivePlayerData` late | **investigating — next: diff our batch vs live** | `/tmp/hermes-clean.log`; header parse of 51236 = MapID 0, NumObjUpdates 64, DataSize 51225; Instance key `549B5154…` |
+| **P0-FREEZE** | **World-entry freeze — SOLVED (mitigated), confirmed live 24 Aug.** Root cause from the **client's own minidump** (ERROR #109, thread frozen 60 s, base 0x7FF689270000): the **ActivePlayerData create block is ~44 bytes shorter than the client's APD reader `0x713E50` consumes**, so the reader over-runs the packet buffer and reads the obj+0x1B58 map's element count from **stale heap** (observed 0xC8602701) → resize spin at `0x72E4E4`. Intermittent because heap past the buffer is sometimes zero (enters) / sometimes garbage (freezes) — why good and frozen captures were byte-identical and streamwalk read a clean 6236 over both (the emulator can't model the APD tail). **NOT** creature UnitData (all 65 walk clean, 598 B) and **NOT** the query response (that was a separate real bug, also fixed). Fix `HERMES_256_APDPAD=128` pads the last block so the over-read lands on in-buffer zeros → tail counts read 0, resize skipped. **Mitigation, not the field-level fix** — the APD tail (bank/research/dungeon maps, and InvSlots past obj+0x1B58) stays empty; the exact ~44 missing bytes need a live ActivePlayer create or a bit-accurate tail walk. | `ActivePlayerData` tail (over-read) | **SOLVED (mitigated) — committed 3b777db** | client minidump; frozen stack 0x72E4E4←0x729AA0←0x713E50@0x71AE1D; cursor 11052 past 11051-byte buffer; count 0xC8602701 not in packet |
+| **P0-QUERY** | **`SMSG_QUERY_CREATURE_RESPONSE` corruption — SOLVED, confirmed live.** Empty creature name slots shipped length **1** (`GetByteCount()+1` unconditional) while the empty-guarded body wrote **0 bytes** → tail shift → `CreatureDisplay.Count` read as 0x48000000 → resize. Live Blizzard encodes empty slots as **0**. Also the gate-clean default shipped the wrong Classic body shape. | `QueryPackets.cs` | **SOLVED — committed 3b777db** | `HERMES_256_CREATURENAMELEN` + `HERMES_256_CREATUREQUERY`; wire `[(7,0),(0,0),(0,0),(0,0)]` matches live; mobs now have correct names in-game |
 | **P0** | **PlayerData tail layout — SOLVED for ungeared, 11-byte parse-gap for geared.** | `PlayerData` tail · flags=7 | **mostly done** (writer fix next) | Client PlayerData reader 0x738FB0 walked (Fable). Tail = PersonalTabard **10×u32** (not 5), VisibleItem **23B** at block end, QuestLog[25]+`QuestLogExtraMap` u32 count, name-len `ReadBits(6)`, DungeonScore, name, LeaverInfo, DeclinedNames. **Verified end-to-end: Hvarne (ungeared) parses complete — Coinage 66, XP 1486, NextLevelXP 2100, AccountBankCoinage 0.** Rowine (geared) ActivePlayerData values correct at their offsets but WPP's PlayerData ends 11 B short of the true start (3640) — the post-VisibleItems dynamic-array element readers for a char that HAS elements. **Parse-only gap; our writer sends those arrays count=0 so it does not block the writer fix.** |
 | ~~P2b~~ | **`PersonalTabard` 10×u32 — REJECTED (24 Aug).** The prior claim ("client reads 10, our 5 shifts APD 20 B") is **contradicted by the client's own reader.** `streamwalk` over 0x738FB0 consumes **1030 = 5 tabard**; `TABARD10=1` makes PlayerData **1050** and **fails `gate256.py`** (`reader PlayerData emit 1050 reader 1037 -7 = 1030`, +20). The Aug-23 capture that "localised the freeze" (loopI, ranges `19 917 1967 8198` → PlayerData **1050**) was **captured with `TABARD10=1`**, so **that freeze was TABARD10-induced**, not evidence for it. Default (5 tabard) is gate-clean and the client reader walks it. **Keep TABARD10 OFF. Fable's 10-tabard walk needs re-checking against 0x738FB0.** | `PlayerData` writer | **rejected, keep off** | gate reader-check; ranges file; streamwalk |
 | P1 | **Empty questlog** — layout now **confirmed correct**; empty on the capture char is *genuine* (no active quests). So the private-server symptom is purely visibility: we send 0x01, `QuestLog` (PartyMember-gated) never reaches the wire | `PlayerData.QuestLog` · 0x01→0x03 | fix = advance visibility (after P0) | Fable: emulated client PlayerData matches 553 through QuestLog; QuestID 0 ×25 is real |
@@ -74,10 +75,31 @@ do not delete — move to Done with the evidence.**
 | — | **VisibleItem element = 23 bytes** (i32,i32,i32,u16,u16,i32,u8,u8,u8), shared by UnitData.VirtualItems and PlayerData.VisibleItems | UnitData/PlayerData | **done, confirmed live** | both client maps; corrects model (element shape was unstated) |
 | — | **`SpawnTrackingStateAnimID` = 1860**; **movement block byte-perfect** | GameObject/Unit; movement | **done, confirmed live** | §129; position/speeds/GravityModifier exact |
 
-*Open questions parked until their group is reached:* neutral-mob attackability (`PCFLAG`), kneeling
-NPCs (`UNITANIM`), creature scale, `WatchedFactionIndex`, `SMSG_QUERY_CREATURE_RESPONSE`, chat
-(`SMSG_SEND_KNOWN_SPELLS`), the loot family (never run). Each becomes a register row with a
-ground-truth measurement the moment we capture its data.
+### In-world inventory — live on Mememe, 24 Aug (the "fill from truth" phase)
+
+With the freeze gone the client plays, but the legacy→modern **value plumbing** is unfinished. The
+create blocks parse; the sources are empty or placeholders. Handed to the Fable agent as one
+prioritized batch (each behind a `HERMES_256_*` knob, verified against the client reader + raw live
+`live2_deb.pkt`/`live3s2_deb.pkt`). Priority order:
+
+| # | symptom (observed in-game) | cause (hypothesis) | class |
+|---|---|---|---|
+| V1 | XP bar shows **Bloodsail Buccaneers** rep (faction 87, not in rep list) | `WatchedFactionIndex` (obj+0x1524): legacy rep INDEX passed through; modern keying differs (§103). Verify value-passthrough vs alignment | gated/value |
+| V2 | **All mobs 100 HP** (Rabbit, guards) | `UnitData.Health` filled with a placeholder, not the real legacy creature health (source: UpdateHandler.cs) | value-plumbing |
+| V3 | **Cannot attack neutral mobs** (Ragged Young Wolf) | faction reaction / `UnitFlags` (parked PCFLAG) — a wrong reaction or a NON_ATTACKABLE flag | value/flags |
+| V4 | **No skills** | `apd.Skill` not filled from legacy `PLAYER_SKILL_INFO` (300-slot array emitted but 0). Sits *before* the APD shortfall, so it lands once populated | value-plumbing |
+| V5 | **Spells present but don't work** | values-update path (`VALUESUPDATE`) / cooldowns / server-side — may be separate from creates | separate track |
+| V6 | **Cannot interact with vendors** | NpcFlags value and/or the gossip/vendor response path | gated/value |
+| V7 | **Bags don't open / no money** | `InvSlots` (P3) OFF *and* sits after the obj+0x1B58 APD shortfall — needs the exact APD field fix + the fill (seam rule: guid must back a sent item) | gated + P0 tail |
+| V8 | **No gear on the model** | `VisibleItems` / §103 appearance wiring off; element = 23 B | gated/value |
+| V9 | **Questlog empty** | genuine (Mememe may have no quests) or visibility (we send 0x01; QuestLog is PartyMember-gated → 0x03) | P1 |
+
+**High leverage:** V7/V8 and the empty APD tail all trace to the ~44-byte APD shortfall that
+`APDPAD` only mitigates. Identifying the exact missing tail bytes (needs a live ActivePlayer create
+capture or a bit-accurate tail walk) is the one fix that unblocks the tail wholesale.
+
+*Still parked:* kneeling NPCs (`UNITANIM`), creature scale, chat (`SMSG_SEND_KNOWN_SPELLS`), the
+loot family (never run).
 
 ---
 

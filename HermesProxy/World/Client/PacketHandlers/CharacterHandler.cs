@@ -78,6 +78,15 @@ public partial class WorldClient
                 Log.Print(LogType.Network, $"[CharFlags] legacy flags=0x{(uint)char1.Flags:X8} — overriding to 0 for diagnostic");
                 char1.Flags = 0;
             }
+            // HERMES_256_ENUMFLAGS: surgically clear only Rename|Declined (the bits that make the 69110
+            // client emit a rename request during login), keeping the rest so the glue screen stays intact.
+            else if (s_enumFlags && ModernVersion.Uses550Engine)
+            {
+                uint before = (uint)char1.Flags;
+                char1.Flags = (CharacterFlags)(before & ~((uint)CharacterFlags.Rename | (uint)CharacterFlags.Declined));
+                if (before != (uint)char1.Flags)
+                    Log.Print(LogType.Network, $"[256-spike] ENUMFLAGS: cleared Rename|Declined 0x{before:X8}->0x{(uint)char1.Flags:X8}");
+            }
 
             if (LegacyVersion.AddedInVersion(ClientVersionBuild.V3_0_2_9056))
                 char1.Flags2 = packet.ReadUInt32(); // Customization Flags
@@ -185,6 +194,58 @@ public partial class WorldClient
         SendPacketToClient(deleteChar);
     }
 
+    // 69110 has no singular SMSG_QUERY_PLAYER_NAME_RESPONSE opcode - only the plural
+    // SMSG_QUERY_PLAYER_NAMES_RESPONSE - so the singular packet resolves to opcode 0 and is
+    // never seen by the client ("unknown" names). ON re-wraps the same lookup data in the
+    // plural envelope on that build. Default off = current behavior.
+    static readonly bool s_namesResponse256 =
+        System.Environment.GetEnvironmentVariable("HERMES_256_NAMESRESPONSE") == "1";
+
+    // The 5.5.x client runs SendInitialPacketsBeforeAddToMap (CypherCore Player.cs) and appears to
+    // gate "login complete -> initialise the descriptor-backed subsystems (inventory, skills)" on
+    // receiving that full set. Several members of it are MODERN-ONLY (no 2.4.3 source, so this
+    // 2.4.3->modern proxy never synthesises them) and are absent from our login stream where the
+    // live 69110 session sends them: SMSG_SETUP_CURRENCY and SMSG_SEND_SPELL_CHARGES are the two we
+    // already have wire classes for. ON emits empty-but-well-formed versions right after
+    // SMSG_INITIAL_SETUP. Diagnostic: probe backpack/skills after login - if they populate, the
+    // client's init gate wanted these. Default off. (INITIAL_SETUP itself is already sent and is
+    // byte-identical to live, so it is NOT the gap.)
+    static readonly bool s_loginInit =
+        System.Environment.GetEnvironmentVariable("HERMES_256_LOGININIT") == "1";
+
+    // HERMES_256_SETUPLAST: in CypherCore, SMSG_INITIAL_SETUP is the FINAL packet of
+    // SendInitialPacketsBeforeAddToMap (Player.cs:6035), sent immediately before AddToMap emits the
+    // self create. We send it ~40 packets early (on LOGIN_VERIFY_WORLD), so the client marks its
+    // before-map phase complete up front and, when the self create finally arrives, processes it in
+    // an "already set up" context - the ActivePlayerData descriptor never commits into the
+    // inventory/skill subsystems. ON holds INITIAL_SETUP and emits it right before the self create
+    // (SendOwnObjectFirstIfNeeded), matching the reference order. Default off.
+    static readonly bool s_setupLast =
+        System.Environment.GetEnvironmentVariable("HERMES_256_SETUPLAST") == "1";
+
+    // HERMES_256_ENUMFLAGS: cmangos sets CHARACTER_FLAG_RENAME (0x4000) / DECLINED (0x02000000) on the
+    // enum entry, and the 69110 client acts on them by emitting CMSG_CHARACTER_RENAME_REQUEST during
+    // login - an abnormal pre-world identity state (confirmed on the wire). A blanket Flags=0 was tried
+    // and greyed out the glue screen's Create Character button, so clear ONLY those two bits, keeping
+    // the rest. Diagnostic for whether the rename anomaly gates the active-player subsystem commit
+    // (money/bags/skills). Default off.
+    static readonly bool s_enumFlags =
+        System.Environment.GetEnvironmentVariable("HERMES_256_ENUMFLAGS") == "1";
+
+    void SendNameQueryResponseToClient(QueryPlayerNameResponse response)
+    {
+        if (s_namesResponse256 && ModernVersion.Build == ClientVersionBuild.V2_5_6_69110)
+        {
+            QueryPlayerNamesResponse plural = new QueryPlayerNamesResponse();
+            plural.Player = response.Player;
+            plural.Result = response.Result;
+            plural.Data = response.Data;
+            SendPacketToClient(plural);
+            return;
+        }
+        SendPacketToClient(response);
+    }
+
     [PacketHandler(Opcode.SMSG_QUERY_PLAYER_NAME_RESPONSE)]
     void HandleQueryPlayerNameResponse(WorldPacket packet)
     {
@@ -196,7 +257,7 @@ public partial class WorldClient
             if (fail)
             {
                 response.Result = (byte)Enums.V2_5_2_39570.ResponseCodes.Failure;
-                SendPacketToClient(response);
+                SendNameQueryResponseToClient(response);
                 return;
             }
         }
@@ -240,7 +301,7 @@ public partial class WorldClient
         response.Data.AccountID = GetSession().GetGameAccountGuidForPlayer(response.Player);
         response.Data.BnetAccountID = GetSession().GetBnetAccountGuidForPlayer(response.Player);
         response.Data.VirtualRealmAddress = GetSession().RealmId.GetAddress();
-        SendPacketToClient(response);
+        SendNameQueryResponseToClient(response);
     }
 
     [PacketHandler(Opcode.SMSG_LOGIN_VERIFY_WORLD)]
@@ -277,7 +338,20 @@ public partial class WorldClient
 
         InitialSetup setup = new();
         setup.ServerExpansionLevel = (byte)(LegacyVersion.ExpansionVersion - 1);
-        SendPacketToClient(setup);
+        // HERMES_256_SETUPLAST: defer INITIAL_SETUP to immediately before the self create (matching
+        // CypherCore's BeforeAddToMap order, Player.cs:6035) instead of sending it early here.
+        if (s_setupLast && ModernVersion.Uses550Engine)
+            GetSession().GameState.PendingInitialSetup = setup;
+        else
+            SendPacketToClient(setup);
+
+        // HERMES_256_LOGININIT: modern-only BeforeAddToMap members the client may require to finish
+        // login init and commit the ActivePlayerData descriptor into the inventory/skill subsystems.
+        if (s_loginInit)
+        {
+            SendPacketToClient(new SetupCurrency());        // empty currency list (2.4.3 has no currencies)
+            SendPacketToClient(new SendSpellCharges());     // empty charge list
+        }
 
         LoadCUFProfiles cuf = new();
         cuf.Data = GetSession().AccountDataMgr.LoadCUFProfiles();

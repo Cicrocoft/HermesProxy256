@@ -1469,6 +1469,20 @@ public static partial class GameData
     public const uint HotfixItemSparseBegin = 2_200_000;
     public const uint HotfixItemAppearanceBegin = 2_300_000;
     public const uint HotfixItemModifiedAppearanceBegin = 2_400_000;
+    // HERMES_256_HOTFIX553: serialize the item-family hotfix tables (Item, ItemSparse,
+    // ItemEffect, ItemAppearance, ItemModifiedAppearance) in the layouts build 2.5.6.69110
+    // actually parses. The layouts are taken from WoWDBDefs, which lists 2.5.6.69110 by name:
+    // ItemSparse LAYOUT B51F7C79, Item LAYOUT 39911A3F, ItemEffect 1BF9CF3A, ItemAppearance
+    // 481C4281, ItemModifiedAppearance 03A6C979. The BCC-era layouts this file writes by
+    // default differ massively (ItemSparse alone: AllowableRace i64 -> i32[2], Flags[4] ->
+    // [5], StartQuestID u16 -> i32 and moved, StatModifier_bonusStat i8[10] -> i32[10] and
+    // moved, plus five new fields) - a 69110 client cannot parse a BCC blob, which left every
+    // item unresolved (no paper-doll icons, bags that will not open). ON also skips the
+    // CSV hotfix preloads for these tables: their advertised BCC-layout blobs would poison
+    // records the 69110 client already ships correctly in its own db2s. Default off.
+    public static readonly bool ItemHotfix553 =
+        System.Environment.GetEnvironmentVariable("HERMES_256_HOTFIX553") == "1";
+
     public const uint HotfixItemEffectBegin = 2_500_000;
     public const uint HotfixItemDisplayInfoBegin = 2_600_000;
     public const uint HotfixCreatureDisplayInfoBegin = 2_700_000;
@@ -2040,6 +2054,14 @@ public static partial class GameData
     }
     public static void LoadItemSparseHotfixes()
     {
+        if (ItemHotfix553)
+        {
+            // The CSV preload blobs are BCC-layout; advertising them to a 69110 client
+            // poisons records its own db2s already carry correctly. Legacy-driven updates
+            // still go out in the 69110 layout through the gated writers.
+            Log.Print(LogType.Storage, "LoadItemSparseHotfixes skipped (HERMES_256_HOTFIX553).");
+            return;
+        }
         var path = Path.Combine("CSV", "Hotfix", $"ItemSparse{ModernVersion.ExpansionVersion}.csv");
 
         using var reader = Sep.Reader(o => o with { HasHeader = true, Unescape = true }).FromFile(path);
@@ -2315,6 +2337,14 @@ public static partial class GameData
 
     public static void WriteItemSparseHotfix(ItemTemplate item, Framework.IO.ByteBuffer buffer)
     {
+        if (ItemHotfix553)
+        {
+            // Reuse the record mapping so the 69110 layout has a single implementation.
+            ItemSparseRecord r553 = new() { Id = (int)item.Entry };
+            UpdateItemSparseRecord(r553, item);
+            WriteItemSparseHotfix553(r553, buffer);
+            return;
+        }
         int[] StatValues = new int[10];
         for (int i = 0; i < item.StatsCount; i++)
         {
@@ -2453,8 +2483,114 @@ public static partial class GameData
         buffer.WriteInt8((sbyte)item.RequiredLevel);
     }
 
+    // ItemSparse in the 2.5.6.69110 layout (WoWDBDefs LAYOUT B51F7C79, which lists that build
+    // explicitly). Field names map 1:1 from the BCC model because the BCC layout (9E2F6B8B)
+    // already used the modern names: RequiredReputationRank == MinReputation, RequiredCityRank
+    // == RequiredPVPMedal, RequiredHonorRank == RequiredPVPRank, StatType ==
+    // StatModifier_bonusStat, StatValue == StatModifier_bonusAmount, PageText == PageID,
+    // Delay == ItemDelay, RandomProperty == RandomSelect, RequiredReputationId == MinFactionID.
+    // New 5.5.x fields with no legacy source are written 0.
+    public static void WriteItemSparseHotfix553(ItemSparseRecord row, Framework.IO.ByteBuffer buffer)
+    {
+        buffer.WriteCString(row.Description);
+        buffer.WriteCString(row.Name4);        // Display3_lang
+        buffer.WriteCString(row.Name3);        // Display2_lang
+        buffer.WriteCString(row.Name2);        // Display1_lang
+        buffer.WriteCString(row.Name1);        // Display_lang
+        buffer.WriteFloat(row.DmgVariance);
+        buffer.WriteUInt32(row.DurationInInventory);
+        buffer.WriteFloat(row.QualityModifier);
+        buffer.WriteUInt32(row.BagFamily);
+        buffer.WriteInt32(row.StartQuestId);   // StartQuestID - u16 on BCC, i32 here and moved up
+        buffer.WriteFloat(row.RangeMod);       // ItemRange
+        for (int i = 0; i < 10; i++)
+            buffer.WriteFloat(row.StatPercentageOfSocket[i]);
+        for (int i = 0; i < 10; i++)
+            buffer.WriteInt32(row.StatPercentEditor[i]);
+        for (int i = 0; i < 10; i++)
+            buffer.WriteInt32(0);              // Field_1_15_3_55112_014 - no legacy source
+        for (int i = 0; i < 10; i++)
+            buffer.WriteInt32(row.StatType[i]); // StatModifier_bonusStat - i8[10] on BCC, i32[10] here
+        buffer.WriteInt32(row.Stackable);
+        buffer.WriteInt32(row.MaxCount);
+        buffer.WriteInt32(row.RequiredReputationRank); // MinReputation - u8 on BCC, i32 here and moved up
+        buffer.WriteUInt32(row.RequiredAbility);
+        buffer.WriteInt32((int)(row.AllowableRace & 0xFFFFFFFF)); // AllowableRace[0] - i64 on BCC, i32[2] here
+        buffer.WriteInt32((int)((ulong)row.AllowableRace >> 32)); // AllowableRace[1]
+        buffer.WriteUInt32(row.SellPrice);
+        buffer.WriteUInt32(row.BuyPrice);
+        buffer.WriteUInt32(row.VendorStackCount);
+        buffer.WriteFloat(row.PriceVariance);
+        buffer.WriteFloat(row.PriceRandomValue);
+        for (int i = 0; i < 4; i++)
+            buffer.WriteUInt32(row.Flags[i]);
+        buffer.WriteUInt32(0);                 // Flags[4] - BCC has only 4
+        buffer.WriteInt32(row.OppositeFactionItemId);
+        buffer.WriteInt32(0);                  // ModifiedCraftingReagentItemID - no legacy source
+        buffer.WriteInt32(0);                  // ContentTuningID - none
+        buffer.WriteInt32(0);                  // PlayerLevelToItemLevelCurveID - none
+        buffer.WriteUInt32(row.MaxDurability);
+        buffer.WriteUInt16(row.ItemNameDescriptionId);
+        buffer.WriteUInt16(row.RequiredTransmogHoliday);
+        buffer.WriteUInt16(row.RequiredHoliday);
+        buffer.WriteUInt16(row.LimitCategory);
+        buffer.WriteUInt16(row.GemProperties);
+        buffer.WriteUInt16(row.SocketMatchEnchantmentId);
+        buffer.WriteUInt16(row.TotemCategoryId);
+        buffer.WriteUInt16(row.InstanceBound);
+        buffer.WriteUInt16(row.ZoneBound[0]);
+        buffer.WriteUInt16(row.ZoneBound[1]);
+        buffer.WriteUInt16(row.ItemSet);
+        buffer.WriteUInt16(row.LockId);
+        buffer.WriteUInt16(row.PageText);      // PageID
+        buffer.WriteUInt16(row.Delay);         // ItemDelay
+        buffer.WriteUInt16(row.RequiredReputationId); // MinFactionID
+        buffer.WriteUInt16(row.RequiredSkillRank);
+        buffer.WriteUInt16(row.RequiredSkill);
+        buffer.WriteUInt16(row.ItemLevel);
+        buffer.WriteInt16(row.AllowableClass);
+        buffer.WriteUInt16(row.ItemRandomSuffixGroupId);
+        buffer.WriteUInt16(row.RandomProperty); // RandomSelect
+        for (int i = 0; i < 5; i++)
+            buffer.WriteUInt16(row.MinDamage[i]);
+        for (int i = 0; i < 5; i++)
+            buffer.WriteUInt16(row.MaxDamage[i]);
+        for (int i = 0; i < 7; i++)
+            buffer.WriteInt16(row.Resistances[i]);
+        buffer.WriteUInt16(0);                 // Field_1_15_7_59706_054 - no legacy source
+        for (int i = 0; i < 10; i++)
+            buffer.WriteInt16(row.StatValue[i]); // StatModifier_bonusAmount - i8[10] on BCC, i16[10] here
+        buffer.WriteUInt8(row.ExpansionId);
+        buffer.WriteUInt8(row.ArtifactId);
+        buffer.WriteUInt8(row.SpellWeight);
+        buffer.WriteUInt8(row.SpellWeightCategory);
+        buffer.WriteUInt8(row.SocketType[0]);
+        buffer.WriteUInt8(row.SocketType[1]);
+        buffer.WriteUInt8(row.SocketType[2]);
+        buffer.WriteUInt8(row.SheatheType);
+        buffer.WriteUInt8(row.Material);
+        buffer.WriteUInt8(row.PageMaterial);   // PageMaterialID
+        buffer.WriteUInt8(row.PageLanguage);   // LanguageID
+        buffer.WriteUInt8(row.Bonding);
+        buffer.WriteUInt8(row.DamageType);
+        buffer.WriteUInt8(row.ContainerSlots);
+        buffer.WriteUInt8(row.RequiredCityRank);  // RequiredPVPMedal
+        buffer.WriteUInt8(row.RequiredHonorRank); // RequiredPVPRank
+        buffer.WriteUInt8(row.InventoryType);
+        buffer.WriteUInt8(row.OverallQualityId);
+        buffer.WriteUInt8(row.AmmoType);
+        buffer.WriteInt8(row.RequiredLevel);
+        // NOTE: ScalingStatDistributionID and the BCC StatType/StatValue byte arrays do not
+        // exist in this layout; the 69110 client does not read them.
+    }
+
     public static void WriteItemSparseHotfix(ItemSparseRecord row, Framework.IO.ByteBuffer buffer)
     {
+        if (ItemHotfix553)
+        {
+            WriteItemSparseHotfix553(row, buffer);
+            return;
+        }
         Span<int> StatValues = stackalloc int[10];
         for (int i = 0; i < 10; i++)
         {
@@ -2594,6 +2730,14 @@ public static partial class GameData
     }
     public static void LoadItemHotfixes()
     {
+        if (ItemHotfix553)
+        {
+            // The CSV preload blobs are BCC-layout; advertising them to a 69110 client
+            // poisons records its own db2s already carry correctly. Legacy-driven updates
+            // still go out in the 69110 layout through the gated writers.
+            Log.Print(LogType.Storage, "LoadItemHotfixes skipped (HERMES_256_HOTFIX553).");
+            return;
+        }
         var path = Path.Combine("CSV", "Hotfix", $"Item{ModernVersion.ExpansionVersion}.csv");
         using var reader = Sep.Reader(o => o with { HasHeader = true }).FromFile(path);
         uint counter = 0;
@@ -2689,6 +2833,14 @@ public static partial class GameData
 
     public static void WriteItemHotfix(ItemTemplate item, Framework.IO.ByteBuffer buffer)
     {
+        if (ItemHotfix553)
+        {
+            // Reuse the record mapping so the 69110 layout has a single implementation.
+            ItemRecord r553 = new() { Id = (int)item.Entry };
+            UpdateItemRecord(r553, item);
+            WriteItemHotfix553(r553, buffer);
+            return;
+        }
         int fileDataId = (int)GetItemIconFileDataIdByDisplayId(item.DisplayID);
 
         buffer.WriteUInt8((byte)item.Class);
@@ -2730,8 +2882,45 @@ public static partial class GameData
         buffer.WriteUInt16((ushort)item.DamageMaxs[4]);
     }
 
+    // Item in the 2.5.6.69110 layout (WoWDBDefs LAYOUT 39911A3F, which lists that build
+    // explicitly): ClassID widened u8 -> i32, two new i32 fields after AmmunitionType,
+    // and Resistances/MinDamage/MaxDamage widened from 16-bit to i32.
+    public static void WriteItemHotfix553(ItemRecord row, Framework.IO.ByteBuffer buffer)
+    {
+        buffer.WriteInt32(row.ClassId);        // ClassID - u8 on BCC, i32 here
+        buffer.WriteUInt8(row.SubclassId);
+        buffer.WriteUInt8(row.Material);
+        buffer.WriteInt8(row.InventoryType);
+        buffer.WriteInt32(row.RequiredLevel);
+        buffer.WriteUInt8(row.SheatheType);
+        buffer.WriteUInt16(row.RandomProperty);          // RandomSelect
+        buffer.WriteUInt16(row.ItemRandomSuffixGroupId);
+        buffer.WriteInt8(row.SoundOverrideSubclassId);
+        buffer.WriteUInt16(row.ScalingStatDistributionId);
+        buffer.WriteInt32(row.IconFileDataId);
+        buffer.WriteUInt8(row.ItemGroupSoundsId);
+        buffer.WriteInt32(row.ContentTuningId);
+        buffer.WriteUInt32(row.MaxDurability);
+        buffer.WriteUInt8(row.AmmoType);
+        buffer.WriteInt32(0);                  // Field_5_5_4_67090_015 - no legacy source
+        buffer.WriteInt32(0);                  // ScalingStatValue - no legacy source
+        for (int i = 0; i < 5; i++)
+            buffer.WriteUInt8(row.DamageType[i]);
+        for (int i = 0; i < 7; i++)
+            buffer.WriteInt32(row.Resistances[i]);       // i16 on BCC, i32 here
+        for (int i = 0; i < 5; i++)
+            buffer.WriteInt32(row.MinDamage[i]);         // u16 on BCC, i32 here
+        for (int i = 0; i < 5; i++)
+            buffer.WriteInt32(row.MaxDamage[i]);         // u16 on BCC, i32 here
+    }
+
     public static void WriteItemHotfix(ItemRecord row, Framework.IO.ByteBuffer buffer)
     {
+        if (ItemHotfix553)
+        {
+            WriteItemHotfix553(row, buffer);
+            return;
+        }
         buffer.WriteUInt8(row.ClassId);
         buffer.WriteUInt8(row.SubclassId);
         buffer.WriteUInt8(row.Material);
@@ -2777,6 +2966,8 @@ public static partial class GameData
         buffer.WriteInt32(appearance.ItemDisplayInfoID);
         buffer.WriteInt32(appearance.DefaultIconFileDataID);
         buffer.WriteInt32(appearance.UiOrder);
+        if (ItemHotfix553)
+            buffer.WriteInt32(0);  // TransmogPlayerConditionID (69110 layout 481C4281) - no legacy source
     }
 
     public static void WriteItemModifiedAppearanceHotfix(ItemModifiedAppearance modAppearance, Framework.IO.ByteBuffer buffer)
@@ -2786,11 +2977,35 @@ public static partial class GameData
         buffer.WriteInt32(modAppearance.ItemAppearanceModifierID);
         buffer.WriteInt32(modAppearance.ItemAppearanceID);
         buffer.WriteInt32(modAppearance.OrderIndex);
+        if (ItemHotfix553)
+        {
+            // 69110 layout 03A6C979: TransmogSourceTypeEnum is a u8 (BCC wrote i32) and a
+            // Flags i32 follows.
+            buffer.WriteUInt8((byte)modAppearance.TransmogSourceTypeEnum);
+            buffer.WriteInt32(0);  // Flags - no legacy source
+            return;
+        }
         buffer.WriteInt32(modAppearance.TransmogSourceTypeEnum);
     }
 
     public static void WriteItemEffectHotfix(ItemEffect effect, Framework.IO.ByteBuffer buffer)
     {
+        if (ItemHotfix553)
+        {
+            // 69110 layout 1BF9CF3A: identical to BCC until ChrSpecializationID, then a new
+            // PlayerConditionID i32 before the trailing ParentItemID relation.
+            buffer.WriteUInt8(effect.LegacySlotIndex);
+            buffer.WriteInt8(effect.TriggerType);
+            buffer.WriteInt16(effect.Charges);
+            buffer.WriteInt32(effect.CoolDownMSec);
+            buffer.WriteInt32(effect.CategoryCoolDownMSec);
+            buffer.WriteUInt16(effect.SpellCategoryID);
+            buffer.WriteInt32(effect.SpellID);
+            buffer.WriteUInt16(effect.ChrSpecializationID);
+            buffer.WriteInt32(0);              // PlayerConditionID - no legacy source
+            buffer.WriteInt32(effect.ParentItemID);
+            return;
+        }
         buffer.WriteUInt8(effect.LegacySlotIndex);
         buffer.WriteInt8(effect.TriggerType);
         buffer.WriteInt16(effect.Charges);
@@ -3865,6 +4080,14 @@ public static partial class GameData
     }
     public static void LoadItemEffectHotfixes()
     {
+        if (ItemHotfix553)
+        {
+            // The CSV preload blobs are BCC-layout; advertising them to a 69110 client
+            // poisons records its own db2s already carry correctly. Legacy-driven updates
+            // still go out in the 69110 layout through the gated writers.
+            Log.Print(LogType.Storage, "LoadItemEffectHotfixes skipped (HERMES_256_HOTFIX553).");
+            return;
+        }
         var path = Path.Combine("CSV", "Hotfix", $"ItemEffect{ModernVersion.ExpansionVersion}.csv");
         using var reader = Sep.Reader(o => o with { HasHeader = true }).FromFile(path);
         uint counter = 0;
@@ -3904,6 +4127,14 @@ public static partial class GameData
 
     public static void LoadItemDisplayInfoHotfixes()
     {
+        if (ItemHotfix553)
+        {
+            // The CSV preload blobs are BCC-layout; advertising them to a 69110 client
+            // poisons records its own db2s already carry correctly. Legacy-driven updates
+            // still go out in the 69110 layout through the gated writers.
+            Log.Print(LogType.Storage, "LoadItemDisplayInfoHotfixes skipped (HERMES_256_HOTFIX553).");
+            return;
+        }
         var path = Path.Combine("CSV", "Hotfix", $"ItemDisplayInfo{ModernVersion.ExpansionVersion}.csv");
         using var reader = Sep.Reader(o => o with { HasHeader = true }).FromFile(path);
         uint counter = 0;

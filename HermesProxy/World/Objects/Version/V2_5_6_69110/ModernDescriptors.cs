@@ -304,11 +304,55 @@ public partial class ObjectUpdateBuilder
     static readonly bool s_unitFields =
         System.Environment.GetEnvironmentVariable("HERMES_256_UNITFIELDS") == "1";
 
+    // HERMES_256_UNITTRAILER1=1 emits the UnitData name trailer as ONE byte instead of seven.
+    // Live landmark measurement (catch_pd_landmarks.py, 25 Aug): the client's reader consumes exactly
+    // 1 byte between the last UnitData VirtualItem and PlayerData-start (VirtualItems-end 3782 ->
+    // PlayerData head-start 3783), not the 7 we emit (u8 flags + u8 + u32 + u8 length). With the empty
+    // name path (flags bit7=0) the reader reads a single byte and stops. Emitting 7 over-shoots the
+    // whole self-create by 6 bytes, so the ActivePlayerData reader reads Coinage 6 bytes early -
+    // GetMoney returned 0x0007000000000000 (= 7 << 48), the smoking gun. Default off (current 7-byte).
+    static readonly bool s_unitTrailer1 =
+        System.Environment.GetEnvironmentVariable("HERMES_256_UNITTRAILER1") == "1";
+
     static readonly bool s_invSlots =
         System.Environment.GetEnvironmentVariable("HERMES_256_INVSLOTS") == "1";
 
+    // ON plumbs the real character name into the PlayerData Name field; with the 6-bit length
+    // left 0 the character window shows "unknown" (confirmed live, 24 Aug). Length-variable when
+    // on: the client reads exactly nameLen bytes right after the 12-byte DungeonScoreSummary
+    // (live Rowine: name-bits byte 0x18 = len 6, then "Rowine"). Default off = current behavior.
+    static readonly bool s_playerName =
+        System.Environment.GetEnvironmentVariable("HERMES_256_PLAYERNAME") == "1";
+
+    // ON writes ItemBonusKey.ItemID = the item's own EntryID in every item create. The live
+    // 69110 session does this on EVERY item without exception (live5_s1_inflated.bin: entry 38
+    // carries 38, 2654 carries 0x0A5E, 769 carries 0x0301, ... 12/12 items checked), where we
+    // sent 0 = "no bonus key". On modern builds the item instance is keyed off the bonus key,
+    // so 0 is a candidate for the empty paper doll. Default off = current behavior.
+    static readonly bool s_itemBonusKey =
+        System.Environment.GetEnvironmentVariable("HERMES_256_ITEMBONUSKEY") == "1";
+
     static readonly bool s_apdProbe =
         System.Environment.GetEnvironmentVariable("HERMES_256_APDPROBE") == "1";
+
+    /// <summary>
+    /// Live-exact ActivePlayerData structure (24 Aug): the full 553-reader walk over the LIVE
+    /// populated 0x07 create (ap_rowine.bin, APD 3640..11323) closes end-to-end ONLY with these
+    /// corrections, every one anchored on real values (Coinage 737, XP 4061/4500, skills,
+    /// WatchedFactionIndex -1, MaxLevel 70, NumBackpackSlots 16, ModPetHaste 1.0, HonorNextLevel
+    /// 5500, PvpInfo bracket indices at 66-byte stride):
+    ///   1. TWO extra u32 (zero) after the AccountDataElements count.
+    ///   2. RestInfo[2] {u32 Threshold, u8 StateID} IS on the wire (live: {650,1},{0,2}).
+    ///   3. CombatRatings[32] IS on the wire (128 zero bytes) after WatchedFactionIndex.
+    ///      The "reader does not read them / -146 bytes" belief was measured over an all-zero
+    ///      block where a skipped field and a zero field are indistinguishable. The live wire
+    ///      carries all 146 bytes; without them every field after - including NumBackpackSlots,
+    ///      which is why GetContainerNumSlots(0)==0 - lands shifted in the client model.
+    ///   4. The post-PvpInfo tail is 161 bytes on live (ours hand-derived 105): emitted verbatim
+    ///      from the live block (all zeros + the final 19-byte cluster).
+    /// ON also makes APDPAD irrelevant (the exact tail replaces the heap-cover pad).
+    /// Default off = current behavior.
+    /// </summary>
 
     /// <summary>
     /// Appends the five bytes between what WriteActivePlayerData emits (6231) and what the
@@ -316,6 +360,17 @@ public partial class ObjectUpdateBuilder
     /// starts at wire +6230 and an empty packed guid at +6234. See the long note at the end of
     /// WriteActivePlayerData. Off by default; lengthening a block can only end an over-read.
     /// </summary>
+    // XP bar shows a reputation (e.g. "Bloodsail Buccaneers") instead of XP (24 Aug). UpdateHandler
+    // fills WatchedFactionIndex from the legacy 2.4.3 PLAYER_FIELD_WATCHED_FACTION_INDEX - a rep INDEX
+    // into the 2.4.3 faction ordering - and the writer passes it through, so the 69110 client (whose
+    // reputation list is keyed differently) resolves it to the wrong faction and watches it on the XP
+    // bar. Confirmed on the wire: the client's own reader reads 18 into obj+0x1524 (not -1), with
+    // MaxLevel=60 dword-adjacent at obj+0x1528 - so it is a value passthrough, not an alignment shift.
+    // ON forces the field to -1 (the documented "none" every other version writer uses); the XP bar
+    // then shows XP. Length-neutral. Correct legacy->modern mapping would need SMSG_INITIALIZE_FACTIONS.
+    static readonly bool s_watchedFactionNone =
+        System.Environment.GetEnvironmentVariable("HERMES_256_WATCHEDFACTION") == "1";
+
     static readonly bool s_apdTail =
         System.Environment.GetEnvironmentVariable("HERMES_256_APDTAIL") == "1";
 
@@ -733,10 +788,19 @@ public partial class ObjectUpdateBuilder
             //           then reads exactly that many raw bytes (0x2C6356B) and NUL-terminates.
             //           0 means no string bytes follow, which is what we want - this is not the
             //           creature name the tooltip shows, that comes from the name query.
-            w.WriteUInt8(0);         // name flags (obj+0x318 path gate, bit 7 = 0)
-            w.WriteUInt8(0);         // name struct head byte
-            w.WriteUInt32(0);        // name struct+0x34
-            w.WriteUInt8(0);         // name length byte (>> 2 = 0 characters)
+            if (s_unitTrailer1)
+            {
+                // The client (empty-name path, flags bit7=0) reads exactly ONE byte here and stops -
+                // measured live. The 7-byte form below over-shoots the block by 6 bytes.
+                w.WriteUInt8(0);     // name flags/length in one byte (bit7=0, >>2 = 0 characters)
+            }
+            else
+            {
+                w.WriteUInt8(0);         // name flags (obj+0x318 path gate, bit 7 = 0)
+                w.WriteUInt8(0);         // name struct head byte
+                w.WriteUInt32(0);        // name struct+0x34
+                w.WriteUInt8(0);         // name length byte (>> 2 = 0 characters)
+            }
         }
     }
 
@@ -910,7 +974,25 @@ public partial class ObjectUpdateBuilder
             w.WriteBits(0, 2);       // two flag bits (client elem+0x10 / +0x11)
             w.FlushBits();           // the client reads the pair as one whole byte
         }
-        w.WriteBits(0, 6);        // Name length
+        // Real character name, gated behind HERMES_256_PLAYERNAME: the writer never plumbed
+        // a name, so the client window showed "unknown". Source is the session player cache
+        // (NAME_QUERY / char enum); the own character falls back to CurrentPlayerInfo. An
+        // unknown name still writes length 0, byte-identical to the old behavior.
+        byte[] playerNameBytes = System.Array.Empty<byte>();
+        if (s_playerName)
+        {
+            var playerName = m_gameState.GetPlayerName(m_updateData.Guid);
+            if (string.IsNullOrEmpty(playerName) &&
+                m_gameState.CurrentPlayerInfo?.CharacterGuid == m_updateData.Guid)
+                playerName = m_gameState.CurrentPlayerInfo.Name ?? "";
+            if (!string.IsNullOrEmpty(playerName))
+            {
+                playerNameBytes = System.Text.Encoding.UTF8.GetBytes(playerName);
+                if (playerNameBytes.Length > 63)        // 6-bit length field
+                    playerNameBytes = playerNameBytes[..63];
+            }
+        }
+        w.WriteBits(playerNameBytes.Length, 6);        // Name length
         w.WriteBit(false);        // HasLevelLink
         w.WriteBit(false);        // HasDeclinedNames
         // The three fields above pack into ONE byte (client reads a u8 at 0x73B7A4:
@@ -922,7 +1004,10 @@ public partial class ObjectUpdateBuilder
         w.WriteFloat(0.0f);        // DungeonScore.OverallScoreCurrentSeason
         w.WriteFloat(0.0f);        // DungeonScore.LadderScoreCurrentSeason
         w.WriteUInt32(0);        // DungeonScore.Runs size
-        // Name string bytes follow here when the 6-bit length above is non-zero
+        // Name string bytes follow here when the 6-bit length above is non-zero - the live
+        // block places them directly after DungeonScoreSummary and before LeaverInfo.
+        if (playerNameBytes.Length > 0)
+            w.WriteBytes(playerNameBytes);        // Name string (nameLen bytes, no terminator)
         // >>> LeaverInfo (client reader 0x669430, 43 bytes, all verified)
         w.WritePackedGuid128(WowGuid128.Empty);        // BnetAccountGUID
         w.WriteFloat(0.0f);        // LeaveScore
@@ -955,23 +1040,67 @@ public partial class ObjectUpdateBuilder
     /// See REFERENCE-256-CLIENT.md section 117. Previous body kept verbatim at
     /// tools-256-spike/activeplayerdata_previous.cs.
     /// </summary>
+
+    // Maps a modern 69110 InvSlots index to the corresponding legacy slot array. Ranges are the
+    // same as V3_4_3's GetModernInvSlot and were VERIFIED byte-for-byte against the live 69110
+    // ActivePlayer create (tools-256-spike/ap_rowine.bin): bag@30 = legacy[19], backpack@36/38-49
+    // = PackSlots, bank@63-65 = BankSlots, all with Coinage landing exactly at +534. Returns null
+    // for a modern slot with no legacy source (client reads Empty there).
+    static WowGuid128? GetModern69110InvSlot(ActivePlayerData a, int modernIdx)
+    {
+        if (a == null) return null;
+        if (modernIdx <= 18)
+            return a.InvSlots != null && modernIdx < a.InvSlots.Length ? a.InvSlots[modernIdx] : null;
+        if (modernIdx >= 30 && modernIdx <= 33)
+        {
+            int legacyIdx = 19 + (modernIdx - 30);
+            return a.InvSlots != null && legacyIdx < a.InvSlots.Length ? a.InvSlots[legacyIdx] : null;
+        }
+        if (modernIdx >= 35 && modernIdx <= 58)
+        {
+            int idx = modernIdx - 35;
+            return a.PackSlots != null && idx < a.PackSlots.Length ? a.PackSlots[idx] : null;
+        }
+        if (modernIdx >= 59 && modernIdx <= 86)
+        {
+            int idx = modernIdx - 59;
+            return a.BankSlots != null && idx < a.BankSlots.Length ? a.BankSlots[idx] : null;
+        }
+        if (modernIdx >= 87 && modernIdx <= 93)
+        {
+            int idx = modernIdx - 87;
+            return a.BankBagSlots != null && idx < a.BankBagSlots.Length ? a.BankBagSlots[idx] : null;
+        }
+        if (modernIdx >= 94 && modernIdx <= 105)
+        {
+            int idx = modernIdx - 94;
+            return a.BuyBackSlots != null && idx < a.BuyBackSlots.Length ? a.BuyBackSlots[idx] : null;
+        }
+        if (modernIdx >= 106 && modernIdx <= 137)
+        {
+            int idx = modernIdx - 106;
+            return a.KeyringSlots != null && idx < a.KeyringSlots.Length ? a.KeyringSlots[idx] : null;
+        }
+        return null;
+    }
+
     void WriteActivePlayerData(WorldPacket w)
     {
         var apd = m_updateData.ActivePlayerData;
         for (int i0 = 0; i0 < 146; ++i0)
         {
-            // Only the first 23 slots (equipment + bags) are mapped. The handler also prepares
-            // PackSlots, BankSlots, BankBagSlots, BuyBackSlots and KeyringSlots, which belong at
-            // higher indices of this same array - but which indices is NOT known for this build:
-            // V3_4_3's GetModernInvSlot maps a 141-slot layout and this client's count is 146
-            // (global 0x33EFE64), so the ranges above the shared equipment+bags prefix have
-            // drifted (a 5.5.x reagent-bag slot would shift every range by one). Transplanting
-            // the 3.4.3 mapping would file bag contents into the wrong slots the moment the item
-            // guids resolve. Left unfilled DELIBERATELY until the client's slot enum is read (the
-            // InvSlots consumer in Ghidra) or one live probe places a sentinel guid; also still
-            // gated behind HERMES_256_INVSLOTS - see the InvSlots summary above and root cause 4.
-            w.WritePackedGuid128(s_invSlots && i0 < 23
-            ? (m_updateData.ActivePlayerData?.InvSlots[i0] ?? WowGuid128.Empty)
+            // Full slot mapping, VERIFIED against the live 69110 ActivePlayer create
+            // (tools-256-spike/ap_rowine.bin, APD@3640, Coinage 737 lands exactly). The 146-slot
+            // 69110 layout uses the SAME index ranges as V3_4_3's GetModernInvSlot(141): equipment
+            // 0-18, bags 30-33, backpack 35-58, bank 59-86, bankbag 87-93, buyback 94-105, keyring
+            // 106-137. Rowine confirms bag@30 (legacy 19), backpack@36/38-49 (PackSlots), bank@63-65
+            // - no reagent-bag shift below slot 137, so the extra 5 slots sit past the keyring and do
+            // not touch these ranges. The old writer emitted legacy bags at modern 19-22 (an unused
+            // region on this build) and never emitted the backpack at all - that is why bags did not
+            // open and carried items were missing. Still gated behind HERMES_256_INVSLOTS; default
+            // off writes all-Empty exactly as before.
+            w.WritePackedGuid128(s_invSlots
+            ? (GetModern69110InvSlot(apd, i0) ?? WowGuid128.Empty)
             : WowGuid128.Empty);        // InvSlots (count = client global 0x33EFE64 = 146)
         }
         // FarsightObject kept Empty DELIBERATELY: the handler fills it from PLAYER_FARSIGHT,
@@ -1121,7 +1250,7 @@ public partial class ObjectUpdateBuilder
         // -1, not 0. Zero names a real slot in the client's reputation list and switches the XP bar
         // to that faction's standing; -1 is the documented "none" sentinel and is what every other
         // version writer here uses (V3_4_3_54261/ObjectUpdateBuilder.cs:866). Length-neutral.
-        w.WriteInt32(apd?.WatchedFactionIndex ?? -1);        // WatchedFactionIndex (obj+0x1524) - legacy rep INDEX passed through; see section 103: the modern faction list is keyed differently, revisit with SMSG_INITIALIZE_FACTIONS
+        w.WriteInt32(s_watchedFactionNone ? -1 : (apd?.WatchedFactionIndex ?? -1));        // WatchedFactionIndex (obj+0x1524) - legacy rep INDEX; HERMES_256_WATCHEDFACTION forces -1 (none) so the XP bar shows XP, not a mis-resolved faction
         // >>> CombatRatings[32] - 128 bytes, and the costly one. The client goes from
         // WatchedFactionIndex at obj+0x1524 to MaxLevel at obj+0x1528, dword-adjacent, so MaxLevel
         // reads our CombatRatings[0]. This is what puts a faction on the XP bar: WatchedFactionIndex
@@ -1570,9 +1699,15 @@ public partial class ObjectUpdateBuilder
             w.WriteUInt32(0);        // ZoneFlags - no legacy source
         }
         // >>> ItemBonusKey - client reader 0x6D2460, unconditional 8 bytes when empty
-        w.WriteUInt32(0);        // ItemBonusKey.ItemID - zero = no bonus key; legacy random
-                                 // properties travel in PropertySeed/RandomPropertiesID above,
-                                 // not as item bonuses, so this stays empty
+        // The live session fills this with the item's own EntryID on every single item
+        // (verified over 12 live item creates, ItemBonusKey.ItemID == ObjectData.EntryID in
+        // all of them); legacy random properties still travel in PropertySeed /
+        // RandomPropertiesID above. Live also writes ZoneFlags (offset 230) as 7 on every
+        // equippable and 4 on every consumable - semantics unknown, so that one stays 0
+        // until it is understood (see the project rule about plausible values).
+        w.WriteUInt32(s_itemBonusKey
+            ? (uint)(m_updateData.ObjectData?.EntryID ?? 0)
+            : 0);        // ItemBonusKey.ItemID
         w.WriteUInt32(0);        // ItemBonusKey.BonusListIDs count
         if (owner)
         {

@@ -77,6 +77,23 @@ public sealed class GameSessionData
     public Queue<ServerPacket> PendingRealmPackets = new();
     public readonly Lock PendingRealmPacketsLock = new();
     public bool IsInWorld;
+
+    // HERMES_256_CREATEORDER: the 2.4.3 legacy server sends the map-state packets (weather,
+    // world states) BEFORE the player's own create, but the modern 5.5.x client expects the
+    // Before->CREATE->After ordering (CypherCore SendInitialPacketsAfterAddToMap). We buffer the
+    // AfterAddToMap-class packets here until the self ActivePlayer create has been sent, then flush
+    // them, so the client runs its AddToMap subsystem init with the player already on the map.
+    public bool SelfCreateSentToClient;
+    public readonly Queue<ServerPacket> DeferredAfterAddToMap = new();
+    public readonly Lock DeferredAfterAddToMapLock = new();
+
+    // HERMES_256_SETUPLAST: SMSG_INITIAL_SETUP is CypherCore's final BeforeAddToMap packet
+    // (Player.cs:6035) - the client's "pre-map setup done, AddToMap now" boundary. Held here and
+    // emitted immediately before the self create instead of early on LOGIN_VERIFY_WORLD, so the
+    // client runs its AddToMap-time subsystem init (inventory/skills) at the create, not ~40
+    // packets early. null when not deferred or already flushed.
+    public ServerPacket? PendingInitialSetup;
+
     public uint? CurrentMapId;
     public uint CurrentZoneId;
     public uint CurrentTaxiNode;

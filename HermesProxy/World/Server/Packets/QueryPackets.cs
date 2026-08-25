@@ -231,6 +231,58 @@ public class QueryPlayerNameResponse : ServerPacket, ISpanWritable
     public PlayerGuidLookupData Data;
 }
 
+// 2.5.6 (69110) carries name lookups only through the PLURAL SMSG_QUERY_PLAYER_NAMES_RESPONSE
+// (0x630027); the singular SMSG_QUERY_PLAYER_NAME_RESPONSE is not in that build's opcode table,
+// so the singular response above resolves to opcode 0 and never reaches the client - which is
+// why the character window and every player nameplate said "unknown" even though the create
+// block carried the name bytes correctly (verified byte-for-byte against live). Layout from
+// WPP V5_5_0_61735: QueryHandler.ReadNameCacheLookupResult (u8 Result, guid, two presence
+// bits) and CharacterHandler.ReadPlayerGuidLookupData, which reads one extra field the older
+// singular layout lacks: i32 TimerunningSeasonID between Unused915 and the name string.
+public class QueryPlayerNamesResponse : ServerPacket
+{
+    public QueryPlayerNamesResponse() : base(Opcode.SMSG_QUERY_PLAYER_NAMES_RESPONSE)
+    {
+        Data = new PlayerGuidLookupData();
+    }
+
+    public override void Write()
+    {
+        _worldPacket.WriteUInt32(1);        // Count - one lookup result per legacy response
+        _worldPacket.WriteUInt8(Result);        // Result (0 = data follows)
+        _worldPacket.WritePackedGuid128(Player);
+        _worldPacket.WriteBit(Result == 0);        // HasPlayerGuidLookupData
+        _worldPacket.WriteBit(false);        // HasNameCacheUnused920
+        _worldPacket.FlushBits();        // the reader resets its bit context before the lookup data
+        if (Result == 0)
+        {
+            _worldPacket.WriteBit(Data.IsDeleted);
+            _worldPacket.WriteBits(Data.Name.GetByteCount(), 6);
+            for (byte i = 0; i < PlayerConst.MaxDeclinedNameCases; ++i)
+                _worldPacket.WriteBits(Data.DeclinedNames.name[i].GetByteCount(), 7);
+            _worldPacket.FlushBits();
+            for (byte i = 0; i < PlayerConst.MaxDeclinedNameCases; ++i)
+                _worldPacket.WriteString(Data.DeclinedNames.name[i]);
+            _worldPacket.WritePackedGuid128(Data.AccountID);
+            _worldPacket.WritePackedGuid128(Data.BnetAccountID);
+            _worldPacket.WritePackedGuid128(Data.GuidActual);
+            _worldPacket.WriteUInt64(Data.GuildClubMemberID);
+            _worldPacket.WriteUInt32(Data.VirtualRealmAddress);
+            _worldPacket.WriteUInt8((byte)Data.RaceID);
+            _worldPacket.WriteUInt8((byte)Data.Sex);
+            _worldPacket.WriteUInt8((byte)Data.ClassID);
+            _worldPacket.WriteUInt8(Data.Level);
+            _worldPacket.WriteUInt8(Data.Unused915);
+            _worldPacket.WriteInt32(0);        // TimerunningSeasonID - 5.5.x only, no legacy source
+            _worldPacket.WriteString(Data.Name);
+        }
+    }
+
+    public WowGuid128 Player;
+    public byte Result; // 0 - full packet, != 0 - only guid
+    public PlayerGuidLookupData Data;
+}
+
 public class PlayerGuidLookupData
 {
     public void Write(WorldPacket data)

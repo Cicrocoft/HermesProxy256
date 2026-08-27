@@ -601,7 +601,14 @@ public partial class ObjectUpdateBuilder
         //
         // The fix is this one bit on the PLAYER, not HERMES_256_RAWFLAGS - copying the raw 2.4.3
         // bits across made every creature draw a second pale model, which is why s_noFlags exists.
-        // HERMES_256_PCFLAG=1 turns it on. Untested live.
+        // HERMES_256_PCFLAG=1 turns it on. LIVE-CONFIRMED 28 Aug: neutral mobs became attackable,
+        // and the reasoning above was verified against the live Blizzard capture first — for the
+        // very same creature entries (Coldridge Valley: 705 Ragged Young Wolf, 704, 707, 708, 721,
+        // 853) Blizzard sends the IDENTICAL FactionTemplate (32/32/36/189/31/57) and the identical
+        // Flags = 0, so the difference was never in the creature. The client's own predicate
+        // FUN@0x1906BE0 branches on this bit ON THE PLAYER: set -> the PvP path falls through to
+        // "attackable if reaction < 4" (neutral passes); clear -> the NPC-vs-NPC path demands
+        // reaction <= 1, which only hostiles satisfy.
         uint unitFlags = s_noFlags ? 0u
                                    : (s_flagsMark != 0 ? s_flagsMark : (uint)(m_updateData.UnitData?.Flags ?? 0));
         if (s_pcFlag && m_objectType == Enums.ObjectTypeBCC.ActivePlayer)

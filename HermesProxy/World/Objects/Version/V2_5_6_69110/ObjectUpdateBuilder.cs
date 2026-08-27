@@ -684,6 +684,17 @@ public partial class ObjectUpdateBuilder
                 $"values={bytes.Length} packetSoFar={packet.GetData().Length}");
         }
 
+        // Diagnostic: what the legacy server actually gave us for a creature — every NPC showing
+        // 100 health and neutrals being unattackable both point at these three fields.
+        if (isCreate && m_objectType == Enums.ObjectTypeBCC.Unit)
+        {
+            var u = m_updateData.UnitData;
+            Framework.Logging.Log.Print(Framework.Logging.LogType.Warn,
+                $"[256-spike] unit-create: guid={m_updateData.Guid} hp={u?.Health}/{u?.MaxHealth} " +
+                $"lvl={u?.Level} faction={u?.FactionTemplate} flags={u?.Flags} npcFlags={u?.NpcFlags[0]} " +
+                $"displayId={u?.DisplayID}");
+        }
+
         // Diagnostic: Owner/ContainedIn/StackCount for every 69110 item create, so a relog create
         // and a live split/move create can be compared for the same item guid.
         if (isCreate && (m_objectType == Enums.ObjectTypeBCC.Item || m_objectType == Enums.ObjectTypeBCC.Container))

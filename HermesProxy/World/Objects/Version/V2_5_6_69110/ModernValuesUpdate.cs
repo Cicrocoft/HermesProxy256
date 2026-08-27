@@ -114,6 +114,10 @@ public partial class ObjectUpdateBuilder
     static readonly bool s_pdShift1 =
         System.Environment.GetEnvironmentVariable("HERMES_256_PDSHIFT1") == "1";
 
+    // See the HERMES_256_UNITARR1 ground-truth note in BuildUnitDataUpdate. Default off.
+    static readonly bool s_unitArr1 =
+        System.Environment.GetEnvironmentVariable("HERMES_256_UNITARR1") == "1";
+
     /// <summary>
     /// A changes mask over <c>blocks * 32</c> bits, written the way 553's decoder reads it and
     /// TrinityCore's <c>WriteUpdate</c> writes it.
@@ -157,6 +161,22 @@ public partial class ObjectUpdateBuilder
         {
             for (int i = from; i <= to; ++i)
                 Clear(i);
+        }
+
+        /// <summary>
+        /// A copy with every bit at or above <paramref name="firstBit"/> moved up by
+        /// <paramref name="by"/>. This build's descriptors renumber only PART of a mask relative to
+        /// the 553 field list the writers were generated from, so the mask is built in our numbering
+        /// (where the payload writer's Get() calls live) and translated to the wire numbering here.
+        /// The shift is monotonic, so ascending order — and therefore payload order — is preserved.
+        /// </summary>
+        public UfMask ShiftedAbove(int firstBit, int by)
+        {
+            var r = new UfMask(_blocks.Length);
+            for (int b = 0; b < _blocks.Length * 32; ++b)
+                if (Get(b))
+                    r.Set(b >= firstBit ? b + by : b);
+            return r;
         }
 
         /// <summary>TC: <c>WriteBits(GetBlocksMask(0), n)</c> then every non-zero block.</summary>
@@ -234,7 +254,10 @@ public partial class ObjectUpdateBuilder
                 // (pdapd_walk, 24-25 Aug), so its 553-numbered values part is kept — it carries
                 // QuestLog (bits 47+i) and VisibleItems; if equip money-corruption returns, this
                 // was wrong and the Player part must be suppressed again.
-                bool suppressUnitSelf = s_apdInv116 && m_objectType == Enums.ObjectTypeBCC.ActivePlayer;
+                // The self Unit part was suppressed only because its numbering was unverified;
+                // HERMES_256_UNITARR1 fixes it from ground truth, so it ships again when that is on.
+                bool suppressUnitSelf = s_apdInv116 && !s_unitArr1
+                    && m_objectType == Enums.ObjectTypeBCC.ActivePlayer;
                 if (suppressUnitSelf && m_updateData.UnitData != null)
                     Framework.Logging.Log.Print(Framework.Logging.LogType.Warn,
                         "[256-spike] APDINV116: suppressed 553-numbered Unit part on self values update");
@@ -503,7 +526,19 @@ public partial class ObjectUpdateBuilder
         if (m.AnyInRange(195, 229)) m.Set(194);
 
         var w = new WorldPacket();
-        m.WriteHierarchical(w);
+        // HERMES_256_UNITARR1: measured against the live Blizzard captures (gt_unitbits.py over
+        // tools-256-spike/ground-truth/w13_s2.bin + w14_s2.bin — a session with real combat), this
+        // build's UnitData values-mask matches 553 for the SCALARS but is one bit higher from the
+        // array region on. Every observation is unanimous:
+        //   unshifted  bits 0, 5 Health, 6 MaxHealth, 32, 33 Level, 41 Flags, 45 AuraState, 64,
+        //              76 BaseMana, 78 SheatheState, 96   (135/118/77/52 confirmations, 0 against)
+        //   +1         gate 119->120, Power[i] 140->141, MaxPower[i] 150->151, array gate 194->195
+        //              (224/160/60 confirmations, 0 against)
+        // Payload lengths settle it exactly: {0,5,64,78} = 9 B = Health u64 + SheatheState u8, and
+        // {0,5,6,32,33,64,76,120,141,151,195} = 32 B only if 195 is our array gate 194 shifted.
+        // The inserted field lands in 109..118, where this writer emits nothing, so translating at
+        // the mask keeps every payload Get() below on our own numbering.
+        (s_unitArr1 ? m.ShiftedAbove(119, 1) : m).WriteHierarchical(w);
         // Bit 1 (StateWorldEffectIDs) and bits 2-4 (the dynamic fields) are never set, so no
         // dynamic count and no per-element mask follow the block mask. TC flushes here twice; one
         // flush is equivalent when nothing was written between them.

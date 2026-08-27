@@ -210,6 +210,15 @@ public partial class WorldClient
     static readonly bool s_itemCreate1 =
         System.Environment.GetEnvironmentVariable("HERMES_256_ITEMCREATE1") == "1";
 
+    // HERMES_256_MOVENOCREATE: an item that is ALREADY known client-side (in ObjectCacheModern from a
+    // prior packet) does not need re-creating when it merely changes slot — a move or an UNEQUIP
+    // re-sends the legacy create for the existing item, and that redundant re-create corrupts the
+    // client's item state (proven 27 Aug: without this, a move disappears after relog; unequip does
+    // not apply at all). Suppressing it leaves only the InvSlots VALUES update, which references the
+    // still-valid known guid. A genuinely-new split item is NOT cached, so splits are unaffected.
+    static readonly bool s_moveNoCreate =
+        System.Environment.GetEnvironmentVariable("HERMES_256_MOVENOCREATE") == "1";
+
     /// <summary>
     /// Route B (section 125). On the 2.5.6 build the modern per-fragment values-update wire
     /// format (a changed-fragment bitmask + CGObject's own modern changes-mask, read by
@@ -481,6 +490,14 @@ public partial class WorldClient
                                 Log.Print(LogType.Network, $"[Phase5aTrace] Skipping Transport create2 guid={guid}.");
                                 filtered = true;
                             }
+                        }
+
+                        if (s_moveNoCreate && guid.IsItem() &&
+                            GetSession().GameState.ObjectCacheModern.ContainsKey(guid))
+                        {
+                            Log.Print(LogType.Warn,
+                                $"[256-spike] MOVENOCREATE: suppressing re-create of known item {guid}");
+                            filtered = true;
                         }
 
                         if (!filtered)

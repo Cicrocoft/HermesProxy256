@@ -241,18 +241,34 @@ public partial class ObjectUpdateBuilder
                 var unit = suppressUnitSelf ? null : BuildUnitDataUpdate();
                 if (unit != null)
                     Add(0x0020u, unit);
+
+                // Build the APD part first so the Player part can be dropped when they'd combine.
+                // A backpack move/split (APD InvSlots ONLY, flag 0x80) renders live; an equip/unequip
+                // ALSO changes VisibleItems (Player, flag 0x40), producing a mixed 0xC0 body whose
+                // Player part — still on unverified 69110 array numbering — desyncs the cursor so the
+                // APD InvSlots never apply and the item does not move. When APDINV116 is on and the
+                // self update carries an APD part, suppress the Player part so equip/unequip render
+                // via InvSlots like a backpack move (paper-doll appearance then lags to relog). A
+                // QuestLog update carries no APD part, so quests keep their live Player update.
+                WorldPacket? active = null;
+                if (m_objectType == Enums.ObjectTypeBCC.ActivePlayer && (ModernValuesActive || m_updateData.ForceApdValuesTest))
+                    active = BuildActivePlayerDataUpdate();
+
                 if (m_objectType != Enums.ObjectTypeBCC.Unit)
                 {
-                    var player = BuildPlayerDataUpdate();
+                    bool dropPlayerSelf = s_apdInv116
+                        && m_objectType == Enums.ObjectTypeBCC.ActivePlayer
+                        && active != null;
+                    if (dropPlayerSelf && m_updateData.PlayerData != null)
+                        Framework.Logging.Log.Print(Framework.Logging.LogType.Warn,
+                            "[256-spike] APDINV116: suppressed Player part on self APD update (equip/unequip renders via InvSlots)");
+                    var player = dropPlayerSelf ? null : BuildPlayerDataUpdate();
                     if (player != null)
                         Add(0x0040u, player);
                 }
-                if (m_objectType == Enums.ObjectTypeBCC.ActivePlayer && (ModernValuesActive || m_updateData.ForceApdValuesTest))
-                {
-                    var active = BuildActivePlayerDataUpdate();
-                    if (active != null)
-                        Add(0x0080u, active);
-                }
+
+                if (active != null)
+                    Add(0x0080u, active);
                 break;
             }
             case Enums.ObjectTypeBCC.GameObject:
@@ -900,44 +916,65 @@ public partial class ObjectUpdateBuilder
         if (d == null)
             return null;
 
-        // Client-numbered InvSlots-only body (see s_apdInv116 above). InvSlots bits 117+i overlap
-        // the 553-numbered scalar bits (116=Honor etc.), so a mixed body is ambiguous — self
-        // inventory ops are InvSlots-only in practice, and the mis-numbered scalars were garbage
-        // to the client anyway, so they are dropped here with a log line.
+        // HERMES_256_APDINV116: emit the ActivePlayerData values body with 69110's OWN mask
+        // numbering, read straight from the client's update reader FUN@0x71B460 (Ghidra, decompile
+        // in tools-256-spike/ground-truth/apd_update_decomp.c; extractor parse_apd_reader.py). The
+        // 553 numbering this file was generated from is wrong on this build — the client dropped/
+        // renumbered fields, and each region shifted by a DIFFERENT amount, so nothing can be
+        // derived; the binary is the only authority. Confirmed bit→field, object offsets matching
+        // WriteActivePlayerData exactly:
+        //   Coinage      bit 42  (obj+0x58, u64)   — 553 said 33
+        //   XP           bit 44  (obj+0x68, u32)   — 553 said 35
+        //   NextLevelXP  bit 45  (obj+0x6C, u32)   — 553 said 36
+        //   InvSlots     gate 116, entries 117+i   — 553 said 136/137+i (live-proven)
+        // Scalars 33-63 are gated under group bit 32 (reader `if ((dword1 & 1)!=0)` at 0x71B4F0-ish);
+        // the InvSlots array is UNGATED (proven: the InvSlots-only body works without any group gate).
         if (s_apdInv116)
         {
+            var m69 = new UfMask(14);
+            var log = new System.Text.StringBuilder();
+
+            bool wantCoinage = d.Coinage.HasValue;
+            bool wantXP = d.XP.HasValue;
+            bool wantNextXP = d.NextLevelXP.HasValue;
+            if (wantCoinage || wantXP || wantNextXP)
+            {
+                m69.Set(32);                       // group gate for dword-1 scalars (33-63)
+                if (wantCoinage) { m69.Set(42); log.Append($" Coinage={d.Coinage}"); }
+                if (wantXP)      { m69.Set(44); log.Append($" XP={d.XP}"); }
+                if (wantNextXP)  { m69.Set(45); log.Append($" NextXP={d.NextLevelXP}"); }
+            }
+
             var slots = new System.Collections.Generic.List<int>();
             if (s_invSlots && (ModernValuesArrays || m_updateData.ForceApdValuesTest))
                 for (int i = 0; i < 146; ++i)
                     if (GetModern69110InvSlot(d, i) != null) slots.Add(i);
             if (slots.Count > 0)
             {
-                var m116 = new UfMask(14);
-                m116.Set(116);
-                foreach (int i in slots)
-                    m116.Set(117 + i);
-                var w116 = new WorldPacket();
-                m116.WriteHierarchical(w116);
-                w116.FlushBits();
-                var changed116 = new System.Text.StringBuilder();
+                m69.Set(116);                      // InvSlots gate (ungated array — no group gate)
+                foreach (int i in slots) m69.Set(117 + i);
+            }
+
+            if (!m69.Any)
+                return null;
+
+            var w69 = new WorldPacket();
+            m69.WriteHierarchical(w69);
+            w69.FlushBits();
+            // Payloads in ascending bit order: scalars (dword-1) then InvSlots guids (dword-3+).
+            if (m69.Get(42)) w69.WriteUInt64(d.Coinage!.Value);
+            if (m69.Get(44)) w69.WriteInt32(d.XP!.Value);
+            if (m69.Get(45)) w69.WriteInt32(d.NextLevelXP!.Value);
+            if (m69.Get(116))
                 foreach (int i in slots)
                 {
                     var g = GetModern69110InvSlot(d, i)!.Value;
-                    w116.WritePackedGuid128(g);
-                    changed116.Append($" [{i}]={g}");
+                    w69.WritePackedGuid128(g);
+                    log.Append($" [{i}]={g}");
                 }
-                bool droppedScalars = d.Coinage.HasValue || d.XP.HasValue || d.NextLevelXP.HasValue;
-                Framework.Logging.Log.Print(Framework.Logging.LogType.Warn,
-                    $"[256-spike] APD-VALUES(116) InvSlots-only body:{changed116}" +
-                    (droppedScalars ? " (scalars dropped from this body)" : ""));
-                return w116;
-            }
-            // No client-numbered content — suppress the 553-numbered scalar body entirely
-            // rather than send a mask the client reads as different fields.
-            if (d.Coinage.HasValue || d.XP.HasValue || d.NextLevelXP.HasValue)
-                Framework.Logging.Log.Print(Framework.Logging.LogType.Warn,
-                    "[256-spike] APDINV116: suppressed 553-numbered APD scalar body (coinage/xp)");
-            return null;
+            Framework.Logging.Log.Print(Framework.Logging.LogType.Warn,
+                $"[256-spike] APD-VALUES(69110):{log}");
+            return w69;
         }
 
         var m = new UfMask(14);

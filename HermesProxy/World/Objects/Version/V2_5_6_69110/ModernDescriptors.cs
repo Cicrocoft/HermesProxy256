@@ -380,6 +380,11 @@ public partial class ObjectUpdateBuilder
     static readonly bool s_watchedFactionNone =
         System.Environment.GetEnvironmentVariable("HERMES_256_WATCHEDFACTION") == "1";
 
+    // ON writes ActivePlayerData.MaxLevel = 70 in the create so the client shows the XP bar (a
+    // character at MaxLevel 0 is treated as max-level and the bar is hidden). See WriteActivePlayerData.
+    static readonly bool s_maxLevel70 =
+        System.Environment.GetEnvironmentVariable("HERMES_256_MAXLEVEL70") == "1";
+
     static readonly bool s_apdTail =
         System.Environment.GetEnvironmentVariable("HERMES_256_APDTAIL") == "1";
 
@@ -1272,7 +1277,11 @@ public partial class ObjectUpdateBuilder
                 w.WriteInt32(apd != null && i0 < apd.CombatRatings.Length ? apd.CombatRatings[i0] ?? 0 : 0);        // CombatRatings
             }
         }
-        w.WriteInt32(s_apdProbe ? 0xB005 : (apd?.MaxLevel ?? 0));        // MaxLevel (obj+0x1528) [APDPROBE sentinel]
+        // MaxLevel 0 makes the client treat the character as max-level and HIDE the XP bar. TBC 2.4.3
+        // has no MaxLevel field (apd.MaxLevel is null -> 0), so HERMES_256_MAXLEVEL70 writes 70 (the
+        // TBC/Anniversary cap) instead. Stored at obj+0x1528, not resolved against any table, so it is
+        // safe. Length-neutral.
+        w.WriteInt32(s_apdProbe ? 0xB005 : (apd?.MaxLevel ?? (s_maxLevel70 ? 70 : 0)));        // MaxLevel (obj+0x1528) [APDPROBE sentinel; MAXLEVEL70 -> 70 so the XP bar shows]
         w.WriteInt32(0);        // ScalingPlayerLevelDelta (obj+0x152C)
         w.WriteInt32(0);        // MaxCreatureScalingLevel (obj+0x1530)
         w.WriteUInt8(0);        // NEW on this build: u8 at obj+0x1534 (RVA 0x71663B), name unknown

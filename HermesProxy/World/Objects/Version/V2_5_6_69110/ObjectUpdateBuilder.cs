@@ -684,6 +684,16 @@ public partial class ObjectUpdateBuilder
                 $"values={bytes.Length} packetSoFar={packet.GetData().Length}");
         }
 
+        // Diagnostic: Owner/ContainedIn/StackCount for every 69110 item create, so a relog create
+        // and a live split/move create can be compared for the same item guid.
+        if (isCreate && (m_objectType == Enums.ObjectTypeBCC.Item || m_objectType == Enums.ObjectTypeBCC.Container))
+        {
+            var it = m_updateData.ItemData;
+            Framework.Logging.Log.Print(Framework.Logging.LogType.Warn,
+                $"[256-spike] item-create: guid={m_updateData.Guid} owner={it?.Owner} " +
+                $"containedIn={it?.ContainedIn} stack={it?.StackCount}");
+        }
+
         if (isCreate && m_objectType == Enums.ObjectTypeBCC.ActivePlayer)
         {
             // Log the packet from the start of this block, so the movement section is visible and

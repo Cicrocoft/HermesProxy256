@@ -110,6 +110,10 @@ public partial class ObjectUpdateBuilder
     static bool ModernValuesActive => s_valuesUpdate >= 3;
     static bool ModernValuesQuestLog => s_valuesUpdate >= 4;
 
+    // See the HERMES_256_PDSHIFT1 ground-truth note in BuildPlayerDataUpdate. Default off.
+    static readonly bool s_pdShift1 =
+        System.Environment.GetEnvironmentVariable("HERMES_256_PDSHIFT1") == "1";
+
     /// <summary>
     /// A changes mask over <c>blocks * 32</c> bits, written the way 553's decoder reads it and
     /// TrinityCore's <c>WriteUpdate</c> writes it.
@@ -219,7 +223,22 @@ public partial class ObjectUpdateBuilder
             case Enums.ObjectTypeBCC.Player:
             case Enums.ObjectTypeBCC.ActivePlayer:
             {
-                var unit = BuildUnitDataUpdate();
+                // HERMES_256_APDINV116: on this build the client's values-mask numbering differs
+                // from the 553 numbering some of these builders use (proven for APD InvSlots:
+                // gate 116, not 136). A mis-numbered mask makes the client read the wrong fields
+                // AND desyncs the cursor for every later part in the same block — an equip's
+                // mis-numbered part ahead of the APD part turned two slot guids into
+                // Coinage=462086913954257 live. UNIT data demonstrably diverges from 553 on this
+                // build (the VirtualItems create divergence), so the self Unit part stays
+                // suppressed until renumbered. PLAYER data's 69110 create layout matched 553
+                // (pdapd_walk, 24-25 Aug), so its 553-numbered values part is kept — it carries
+                // QuestLog (bits 47+i) and VisibleItems; if equip money-corruption returns, this
+                // was wrong and the Player part must be suppressed again.
+                bool suppressUnitSelf = s_apdInv116 && m_objectType == Enums.ObjectTypeBCC.ActivePlayer;
+                if (suppressUnitSelf && m_updateData.UnitData != null)
+                    Framework.Logging.Log.Print(Framework.Logging.LogType.Warn,
+                        "[256-spike] APDINV116: suppressed 553-numbered Unit part on self values update");
+                var unit = suppressUnitSelf ? null : BuildUnitDataUpdate();
                 if (unit != null)
                     Add(0x0020u, unit);
                 if (m_objectType != Enums.ObjectTypeBCC.Unit)
@@ -750,14 +769,21 @@ public partial class ObjectUpdateBuilder
         if (d.TaxiMountAnimKitID.HasValue) m.Set(30);
         if (d.CurrentBattlePetBreedQuality.HasValue) m.Set(31);
 
+        // HERMES_256_PDSHIFT1: ground truth from the live captures (gt_pdscan.py over world11/12):
+        // on 69110 the PlayerData values-mask ARRAY region sits one bit HIGHER than the 553
+        // numbering — Rowine's own quest-progress updates set {47, 49} = QuestLog gate 47 +
+        // entry[1] 49 (553 says gate 46), and AvgItemLevel updates set {93, 94} = gate 93 +
+        // entry[0] 94 carrying ONE float. Scalars are unshifted (PlayerFlags at 11 with group
+        // gate 0 observed). So 69110 added one field between the scalar region and the arrays.
+        int s = s_pdShift1 ? 1 : 0;
         if (ModernValuesArrays)
         {
             // Our model carries one PartyType byte where the wire has two; send index 0 only.
-            if (d.PartyType.HasValue) m.Set(44);
+            if (d.PartyType.HasValue) m.Set(44 + s);
             for (int i = 0; i < 19; ++i)
-                if (d.VisibleItems[i].HasValue) m.Set(73 + i);
+                if (d.VisibleItems[i].HasValue) m.Set(73 + s + i);
             for (int i = 0; i < 6; ++i)
-                if (d.AvgItemLevel[i].HasValue) m.Set(93 + i);
+                if (d.AvgItemLevel[i].HasValue) m.Set(93 + s + i);
         }
         if (ModernValuesQuestLog)
         {
@@ -766,17 +792,17 @@ public partial class ObjectUpdateBuilder
             // a populated quest log that does not need the 1654-byte PartyMember block in the
             // create, which is what froze the client on 22 Aug (section 127/132).
             for (int i = 0; i < 25; ++i)
-                if (d.QuestLog[i] != null) m.Set(47 + i);
+                if (d.QuestLog[i] != null) m.Set(47 + s + i);
         }
 
         if (!m.Any)
             return null;
 
         if (m.AnyInRange(1, 31)) m.Set(0);
-        if (m.AnyInRange(44, 45)) m.Set(43);
-        if (m.AnyInRange(47, 71)) m.Set(46);
-        if (m.AnyInRange(73, 91)) m.Set(72);
-        if (m.AnyInRange(93, 98)) m.Set(92);
+        if (m.AnyInRange(44 + s, 45 + s)) m.Set(43 + s);
+        if (m.AnyInRange(47 + s, 71 + s)) m.Set(46 + s);
+        if (m.AnyInRange(73 + s, 91 + s)) m.Set(72 + s);
+        if (m.AnyInRange(93 + s, 98 + s)) m.Set(92 + s);
 
         var w = new WorldPacket();
         m.WriteHierarchical(w);
@@ -807,17 +833,17 @@ public partial class ObjectUpdateBuilder
         if (m.Get(30)) w.WriteInt32(d.TaxiMountAnimKitID!.Value);
         if (m.Get(31)) w.WriteUInt8((byte)d.CurrentBattlePetBreedQuality!.Value);
 
-        if (m.Get(43))
+        if (m.Get(43 + s))
         {
             for (int i = 0; i < 2; ++i)
-                if (m.Get(44 + i))
+                if (m.Get(44 + s + i))
                     w.WriteUInt8(d.PartyType!.Value);
         }
-        if (m.Get(46))
+        if (m.Get(46 + s))
         {
             for (int i = 0; i < 25; ++i)
             {
-                if (!m.Get(47 + i))
+                if (!m.Get(47 + s + i))
                     continue;
                 // ReadCreateQuestLog - the arm noQuestLogChangesMask == 1 selects, and the same
                 // 66-byte shape WritePlayerData emits on the create path.
@@ -830,16 +856,16 @@ public partial class ObjectUpdateBuilder
                 w.WriteUInt32(0);      // ObjectiveFlags - the trailing u32 at entry+0x10
             }
         }
-        if (m.Get(72))
+        if (m.Get(72 + s))
         {
             for (int i = 0; i < 19; ++i)
-                if (m.Get(73 + i))
+                if (m.Get(73 + s + i))
                     WriteUpdateVisibleItem(w, d.VisibleItems[i]!.Value);
         }
-        if (m.Get(92))
+        if (m.Get(92 + s))
         {
             for (int i = 0; i < 6; ++i)
-                if (m.Get(93 + i))
+                if (m.Get(93 + s + i))
                     w.WriteFloat(d.AvgItemLevel[i]!.Value);
         }
         return w;
@@ -857,11 +883,62 @@ public partial class ObjectUpdateBuilder
     // shifted, and everything below it is unaffected either way.
     // ---------------------------------------------------------------------------------------
 
+    // HERMES_256_APDINV116: ground truth from the live Blizzard split captures (world12, decoded
+    // with tools-256-spike/ground-truth/gt_apddec.py): on THIS build the APD values-mask InvSlots
+    // section sits at gate bit 116 with slots at 117+i — exactly 20 bits LOWER than the 5.5.0/553
+    // numbering (136/137+i) this file was generated from, and with NO chunk-gate bit alongside
+    // (Blizzard's InvSlots updates set exactly {116, 117+slot}). 69110 dropped ~20 APD head fields,
+    // shifting the whole mask numbering. With the old numbering the client read our InvSlots
+    // updates as entirely different fields (its bit 136 = InvSlots[19]) — which is why a split/move
+    // never rendered its destination slot. Default off.
+    static readonly bool s_apdInv116 =
+        System.Environment.GetEnvironmentVariable("HERMES_256_APDINV116") == "1";
+
     WorldPacket? BuildActivePlayerDataUpdate()
     {
         var d = m_updateData.ActivePlayerData;
         if (d == null)
             return null;
+
+        // Client-numbered InvSlots-only body (see s_apdInv116 above). InvSlots bits 117+i overlap
+        // the 553-numbered scalar bits (116=Honor etc.), so a mixed body is ambiguous — self
+        // inventory ops are InvSlots-only in practice, and the mis-numbered scalars were garbage
+        // to the client anyway, so they are dropped here with a log line.
+        if (s_apdInv116)
+        {
+            var slots = new System.Collections.Generic.List<int>();
+            if (s_invSlots && (ModernValuesArrays || m_updateData.ForceApdValuesTest))
+                for (int i = 0; i < 146; ++i)
+                    if (GetModern69110InvSlot(d, i) != null) slots.Add(i);
+            if (slots.Count > 0)
+            {
+                var m116 = new UfMask(14);
+                m116.Set(116);
+                foreach (int i in slots)
+                    m116.Set(117 + i);
+                var w116 = new WorldPacket();
+                m116.WriteHierarchical(w116);
+                w116.FlushBits();
+                var changed116 = new System.Text.StringBuilder();
+                foreach (int i in slots)
+                {
+                    var g = GetModern69110InvSlot(d, i)!.Value;
+                    w116.WritePackedGuid128(g);
+                    changed116.Append($" [{i}]={g}");
+                }
+                bool droppedScalars = d.Coinage.HasValue || d.XP.HasValue || d.NextLevelXP.HasValue;
+                Framework.Logging.Log.Print(Framework.Logging.LogType.Warn,
+                    $"[256-spike] APD-VALUES(116) InvSlots-only body:{changed116}" +
+                    (droppedScalars ? " (scalars dropped from this body)" : ""));
+                return w116;
+            }
+            // No client-numbered content — suppress the 553-numbered scalar body entirely
+            // rather than send a mask the client reads as different fields.
+            if (d.Coinage.HasValue || d.XP.HasValue || d.NextLevelXP.HasValue)
+                Framework.Logging.Log.Print(Framework.Logging.LogType.Warn,
+                    "[256-spike] APDINV116: suppressed 553-numbered APD scalar body (coinage/xp)");
+            return null;
+        }
 
         var m = new UfMask(14);
 
@@ -951,12 +1028,17 @@ public partial class ObjectUpdateBuilder
         if (d.PvPLastWeeksTierMaxFromWins.HasValue) m.Set(121);
         if (d.PvPRankProgress.HasValue) m.Set(122);
 
-        if (ModernValuesArrays && s_invSlots)
+        if ((ModernValuesArrays || m_updateData.ForceApdValuesTest) && s_invSlots)
         {
-            // Only the first 23 wire slots are mapped; the rest of the 146 are deliberately
-            // unmapped on this build - see WriteActivePlayerData's note on the slot enum.
-            for (int i = 0; i < 23; ++i)
-                if (d.InvSlots[i] != null) m.Set(137 + i);
+            // Map EVERY modern InvSlots index (0-145) through the same legacy->modern slot
+            // mapping the create writer uses (GetModern69110InvSlot), not just the first 23.
+            // The old code only checked d.InvSlots[0..22] (equipment + equipped bags), so a
+            // backpack change (which lives in d.PackSlots, modern slots 35-58), a bank change
+            // (59-86) etc. was NEVER emitted incrementally - the item object was created but the
+            // slot it landed in stayed empty. Live-proven by a backpack split: PackSlots[5] must
+            // reach modern InvSlots[40].
+            for (int i = 0; i < 146; ++i)
+                if (GetModern69110InvSlot(d, i) != null) m.Set(137 + i);
         }
 
         if (!m.Any)
@@ -1071,9 +1153,18 @@ public partial class ObjectUpdateBuilder
 
         if (m.Get(136))
         {
+            // The write loop must resolve through the SAME mapping the mask loop used —
+            // d.InvSlots[i] is null for the remapped indices (backpack/bank live in PackSlots etc.).
+            var changed = new System.Text.StringBuilder();
             for (int i = 0; i < 146; ++i)
                 if (m.Get(137 + i))
-                    w.WritePackedGuid128(d.InvSlots[i]!.Value);
+                {
+                    var g = GetModern69110InvSlot(d, i)!.Value;
+                    w.WritePackedGuid128(g);
+                    changed.Append($" [{i}]={g}");
+                }
+            Framework.Logging.Log.Print(Framework.Logging.LogType.Warn,
+                $"[256-spike] APD-VALUES InvSlots changed:{changed}");
         }
         return w;
     }

@@ -49,6 +49,9 @@ public partial class WorldSocket
         byte slot1 = item.FromPackSlot == Enums.Classic.InventorySlots.Bag0 ? ModernVersion.AdjustInventorySlot(item.FromSlot) : item.FromSlot;
         byte containerSlot2 = item.ToPackSlot != Enums.Classic.InventorySlots.Bag0 ? ModernVersion.AdjustInventorySlot(item.ToPackSlot) : item.ToPackSlot;
         byte slot2 = item.ToPackSlot == Enums.Classic.InventorySlots.Bag0 ? ModernVersion.AdjustInventorySlot(item.ToSlot) : item.ToSlot;
+        Framework.Logging.Log.Print(Framework.Logging.LogType.Warn,
+            $"[256-spike] SPLIT raw From(pack={item.FromPackSlot},slot={item.FromSlot}) To(pack={item.ToPackSlot},slot={item.ToSlot}) qty={item.Quantity}"
+            + $" -> legacy c1={containerSlot1} s1={slot1} c2={containerSlot2} s2={slot2}");
         packet.WriteUInt8(containerSlot1);
         packet.WriteUInt8(slot1);
         packet.WriteUInt8(containerSlot2);
@@ -79,6 +82,9 @@ public partial class WorldSocket
         byte slotB = item.ContainerSlotB == Enums.Classic.InventorySlots.Bag0 ? ModernVersion.AdjustInventorySlot(item.SlotB) : item.SlotB;
         byte containerSlotA = item.ContainerSlotA != Enums.Classic.InventorySlots.Bag0 ? ModernVersion.AdjustInventorySlot(item.ContainerSlotA) : item.ContainerSlotA;
         byte slotA = item.ContainerSlotA == Enums.Classic.InventorySlots.Bag0 ? ModernVersion.AdjustInventorySlot(item.SlotA) : item.SlotA;
+        Framework.Logging.Log.Print(Framework.Logging.LogType.Warn,
+            $"[256-spike] SWAP raw A(pack={item.ContainerSlotA},slot={item.SlotA}) B(pack={item.ContainerSlotB},slot={item.SlotB})"
+            + $" -> legacy cA={containerSlotA} sA={slotA} cB={containerSlotB} sB={slotB}");
         packet.WriteUInt8(containerSlotB);
         packet.WriteUInt8(slotB);
         packet.WriteUInt8(containerSlotA);

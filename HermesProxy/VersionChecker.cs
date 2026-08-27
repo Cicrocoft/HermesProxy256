@@ -841,6 +841,19 @@ public static class ModernVersion
 
     public static byte AdjustInventorySlot(byte slot)
     {
+        if (Build == ClientVersionBuild.V2_5_6_69110)
+        {
+            // 69110 (5.5.x engine) sends retail-ish inventory slot numbers; map to legacy TBC (2.4.3).
+            // Reverse of ModernDescriptors.GetModern69110InvSlot. Legacy TBC: equipment 0-18, equipped
+            // bags 19-22, backpack (item) 23-38, bank items 39-62, bank bags 63-68, keyring 69-100.
+            // Live-proven: client sent backpack split slots 36/40 (Bag0) which must become 24/28.
+            if (slot >= 35 && slot <= 58) return (byte)(23 + (slot - 35));   // backpack (PackSlots)
+            if (slot >= 30 && slot <= 33) return (byte)(19 + (slot - 30));   // equipped bag containers
+            if (slot >= 59 && slot <= 86) return (byte)(39 + (slot - 59));   // bank items
+            if (slot >= 87 && slot <= 93) return (byte)(63 + (slot - 87));   // bank bags
+            if (slot >= 106) return (byte)(69 + (slot - 106));               // keyring
+            return slot;                                                     // equipment 0-18 (unchanged)
+        }
         byte offset = 0;
         if (slot >= World.Enums.Classic.InventorySlots.BankItemStart && slot < World.Enums.Classic.InventorySlots.BankItemEnd)
         {

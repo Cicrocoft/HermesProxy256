@@ -135,6 +135,44 @@ public partial class WorldClient
     bool _sentActiveMover;
 
     /// <summary>
+    /// HERMES_256_VALFIRST (see the knob comment above): partition the player's VALUES blocks out of
+    /// a mid-session batch that also carries item creates, and send them in their own packet FIRST —
+    /// the Blizzard order. Leaves the world-load batch (self CREATE present) and pure-values batches
+    /// (merge — already renders) untouched, so default behaviour is only changed for exactly the
+    /// failing case: an item create accompanied by a self InvSlots update (move/split).
+    /// </summary>
+    public void SendSelfValuesFirstIfNeeded(UpdateObject updateObject)
+    {
+        if (!s_valFirst || !ModernVersion.Uses550Engine)
+            return;
+
+        var mine = GetSession().GameState.CurrentPlayerGuid;
+        if (updateObject.ObjectUpdates.Any(u => u.Guid == mine && u.Type != UpdateTypeModern.Values))
+            return; // world-load / self create batch — SendOwnObjectFirstIfNeeded owns that ordering
+
+        bool hasItemCreate = updateObject.ObjectUpdates.Any(
+            u => u.Type != UpdateTypeModern.Values && u.Guid.IsItem());
+        if (!hasItemCreate)
+            return;
+
+        List<ObjectUpdate> selfValues = updateObject.ObjectUpdates.FindAll(
+            u => u.Guid == mine && u.Type == UpdateTypeModern.Values);
+        if (selfValues.Count == 0)
+            return;
+
+        UpdateObject valuesPacket = new UpdateObject(GetSession().GameState);
+        foreach (var u in selfValues)
+        {
+            updateObject.ObjectUpdates.Remove(u);
+            valuesPacket.ObjectUpdates.Add(u);
+        }
+        Log.Print(LogType.Warn,
+            $"[256-spike] VALFIRST: self VALUES ({selfValues.Count} block(s)) sent ahead of " +
+            $"{updateObject.ObjectUpdates.Count} remaining block(s)");
+        SendPacketToClient(valuesPacket);
+    }
+
+    /// <summary>
     /// Root cause 4 (PLAN-256.md): item objects and the guids that reference them. One knob covers
     /// the two halves that only make sense together - item/container creates ordered ahead of the
     /// player block (SendOwnObjectFirstIfNeeded), and 0x4700 ItemContainer slot guids passed
@@ -152,6 +190,25 @@ public partial class WorldClient
 
     static readonly bool s_itemsFirst =
         System.Environment.GetEnvironmentVariable("HERMES_256_ITEMSFIRST") == "1";
+
+    // HERMES_256_VALFIRST: ground-truth ordering from the live Blizzard split captures
+    // (tools-256-spike/ground-truth, world12_s2c.bin packets [643]/[651] and [674]/[679]): on a self
+    // inventory change the real server sends the player's ActivePlayerData VALUES update (InvSlots)
+    // in its OWN SMSG_UPDATE_OBJECT BEFORE the packet carrying the new item's create. The client
+    // links item->slot at CREATE time, so the slot must already hold the guid when the create
+    // arrives. Our legacy-order translation is the reverse (create first, values after) — exactly
+    // the case that never renders live (grey source slot until relog, where the create replays with
+    // InvSlots already set). Default off.
+    static readonly bool s_valFirst =
+        System.Environment.GetEnvironmentVariable("HERMES_256_VALFIRST") == "1";
+
+    // HERMES_256_ITEMCREATE1: the live captures show Blizzard sends NEW split/loot items as
+    // CreateObject1, never CreateObject2 (world12 [651]/[679]/[723] are all update-type 1). cmangos
+    // sends legacy CreateObject2 for gained items, which we map 1:1 to modern CreateObject2 — a path
+    // the 69110 client may treat differently at render time. This knob maps mid-session ITEM creates
+    // arriving as legacy CreateObject2 to modern CreateObject1 instead. Default off.
+    static readonly bool s_itemCreate1 =
+        System.Environment.GetEnvironmentVariable("HERMES_256_ITEMCREATE1") == "1";
 
     /// <summary>
     /// Route B (section 125). On the 2.5.6 build the modern per-fragment values-update wire
@@ -388,7 +445,10 @@ public partial class WorldClient
                     var guid = oldGuid.To128(GetSession().GameState);
                     PrintString($"Guid = {guid.ToString()}", i);
 
-                    ObjectUpdate updateData = new ObjectUpdate(guid, UpdateTypeModern.CreateObject2, GetSession());
+                    var createType = (s_itemCreate1 && guid.IsItem())
+                        ? UpdateTypeModern.CreateObject1
+                        : UpdateTypeModern.CreateObject2;
+                    ObjectUpdate updateData = new ObjectUpdate(guid, createType, GetSession());
                     AuraUpdate auraUpdate = new AuraUpdate(guid, true);
                     ReadCreateObjectBlock(packet, guid, updateData, auraUpdate, i);
 
@@ -612,6 +672,7 @@ public partial class WorldClient
         }
 
         SendOwnObjectFirstIfNeeded(updateObject);
+        SendSelfValuesFirstIfNeeded(updateObject);
 
         if (updateObject.ObjectUpdates.Count != 0 ||
             updateObject.DestroyedGuids.Count != 0 ||

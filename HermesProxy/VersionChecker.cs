@@ -839,6 +839,34 @@ public static class ModernVersion
         return 0;
     }
 
+    static readonly bool s_invSlotMap256 =
+        System.Environment.GetEnvironmentVariable("HERMES_256_INVSLOTMAP") == "1";
+
+    // The legacy build's own slot table, picked the same way the generic path below picks its
+    // offsets: RemovedInVersion(V2_0_1_6180) means the legacy server predates TBC, and
+    // RemovedInVersion(V3_0_2_9056) means it predates WotLK.
+    static bool LegacyIsVanilla => LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180);
+    static bool LegacyIsTbc => !LegacyIsVanilla && LegacyVersion.RemovedInVersion(ClientVersionBuild.V3_0_2_9056);
+
+    static byte LegacyBagStart => LegacyIsVanilla ? World.Enums.Vanilla.InventorySlots.BagStart
+                                : LegacyIsTbc ? World.Enums.TBC.InventorySlots.BagStart
+                                : World.Enums.WotLK.InventorySlots.BagStart;
+    static byte LegacyItemStart => LegacyIsVanilla ? World.Enums.Vanilla.InventorySlots.ItemStart
+                                 : LegacyIsTbc ? World.Enums.TBC.InventorySlots.ItemStart
+                                 : World.Enums.WotLK.InventorySlots.ItemStart;
+    static byte LegacyBankItemStart => LegacyIsVanilla ? World.Enums.Vanilla.InventorySlots.BankItemStart
+                                     : LegacyIsTbc ? World.Enums.TBC.InventorySlots.BankItemStart
+                                     : World.Enums.WotLK.InventorySlots.BankItemStart;
+    static byte LegacyBankBagStart => LegacyIsVanilla ? World.Enums.Vanilla.InventorySlots.BankBagStart
+                                    : LegacyIsTbc ? World.Enums.TBC.InventorySlots.BankBagStart
+                                    : World.Enums.WotLK.InventorySlots.BankBagStart;
+    static byte LegacyBuyBackStart => LegacyIsVanilla ? World.Enums.Vanilla.InventorySlots.BuyBackStart
+                                    : LegacyIsTbc ? World.Enums.TBC.InventorySlots.BuyBackStart
+                                    : World.Enums.WotLK.InventorySlots.BuyBackStart;
+    static byte LegacyKeyringStart => LegacyIsVanilla ? World.Enums.Vanilla.InventorySlots.KeyringStart
+                                    : LegacyIsTbc ? World.Enums.TBC.InventorySlots.KeyringStart
+                                    : World.Enums.WotLK.InventorySlots.KeyringStart;
+
     public static byte AdjustInventorySlot(byte slot)
     {
         if (Build == ClientVersionBuild.V2_5_6_69110)
@@ -847,6 +875,34 @@ public static class ModernVersion
             // Reverse of ModernDescriptors.GetModern69110InvSlot. Legacy TBC: equipment 0-18, equipped
             // bags 19-22, backpack (item) 23-38, bank items 39-62, bank bags 63-68, keyring 69-100.
             // Live-proven: client sent backpack split slots 36/40 (Bag0) which must become 24/28.
+            if (s_invSlotMap256)
+            {
+                // HERMES_256_INVSLOTMAP. The tail of the original mapping below was written against
+                // VANILLA's slot table while the legacy server here is TBC 2.4.3, and the buyback
+                // range was missing outright. Measured 29 Aug from the reported symptom: sell an
+                // item, it appears in the buyback tab, click it and the server answers "item not
+                // found". The client sends modern slot 94 (proven: Blizzard's own sell blocks in
+                // ground-truth/w13_s2.bin set InvSlots entry 94 for the first buyback slot, and our
+                // writer stores it there), 94 fell through every branch to `return slot`, and TBC's
+                // slot 94 is inside its KEYRING range 86-117 - so cmangos looked up a keyring slot.
+                //
+                // Two more of the same defect, unmeasured but structurally identical, fixed here
+                // rather than left knowingly wrong: bank bags targeted 63 (Vanilla BankBagStart)
+                // where TBC is 67, and the keyring targeted 69, which is Vanilla's BUYBACK start,
+                // where TBC's keyring is 86. Bank items only looked right because Vanilla and TBC
+                // both begin at 39.
+                //
+                // Resolved through the legacy build's own constants, the way the generic path below
+                // does, so this cannot drift again if the legacy target changes.
+                if (slot >= 30 && slot <= 33) return (byte)(LegacyBagStart + (slot - 30));
+                if (slot >= 35 && slot <= 58) return (byte)(LegacyItemStart + (slot - 35));
+                if (slot >= 59 && slot <= 86) return (byte)(LegacyBankItemStart + (slot - 59));
+                if (slot >= 87 && slot <= 93) return (byte)(LegacyBankBagStart + (slot - 87));
+                if (slot >= 94 && slot <= 105) return (byte)(LegacyBuyBackStart + (slot - 94));
+                if (slot >= 106) return (byte)(LegacyKeyringStart + (slot - 106));
+                return slot;                                                 // equipment 0-18
+            }
+
             if (slot >= 35 && slot <= 58) return (byte)(23 + (slot - 35));   // backpack (PackSlots)
             if (slot >= 30 && slot <= 33) return (byte)(19 + (slot - 30));   // equipped bag containers
             if (slot >= 59 && slot <= 86) return (byte)(39 + (slot - 59));   // bank items

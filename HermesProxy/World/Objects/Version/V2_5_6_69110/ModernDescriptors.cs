@@ -506,7 +506,10 @@ public partial class ObjectUpdateBuilder
         // draw the ! / ? over a unit and to open its gossip. The handler already fills
         // UnitData.NpcFlags from the legacy UNIT_NPC_FLAGS (NPC flag bits are stable across
         // versions); writing 0 here dropped that. NpcFlags2 has no legacy source, so 0 stands.
-        w.WriteUInt32(s_npcFlags ? (uint)(m_updateData.UnitData?.NpcFlags[0] ?? 0) : 0);        // NpcFlags
+        // NpcGossipBit256: this client will not initiate ANY interaction without bit 0, so a
+        // cmangos vendor or repairer (which never carries it) is unclickable. See that file for
+        // the Anvilmar measurement. Length-neutral - the u32 is written either way.
+        w.WriteUInt32(s_npcFlags ? NpcGossipBit256.Apply((uint)(m_updateData.UnitData?.NpcFlags[0] ?? 0)) : 0);        // NpcFlags
         w.WriteUInt32(s_npcFlags ? (uint)(m_updateData.UnitData?.NpcFlags[1] ?? 0) : 0);        // NpcFlags2
         w.WriteUInt32((uint)(m_updateData.UnitData?.StateSpellVisualID ?? 0));        // StateSpellVisualID
         // >>> StateAnimID. Same field, same value and same reason as GameObjectData's

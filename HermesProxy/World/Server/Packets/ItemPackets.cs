@@ -66,6 +66,40 @@ public class BuyBackItem : ClientPacket
 
 public class BuyItem : ClientPacket
 {
+    /// <summary>
+    /// HERMES_256_BUYITEM553=1 reads the CMSG_BUY_ITEM layout this build's client actually writes.
+    /// </summary>
+    /// <remarks>
+    /// This leg had a reference disagreement and no measurement: we read the 9.x/3.4.3 shape
+    /// (two guids, three u32, ItemInstance, then ReadBits(3) ItemType) while WowPacketParser 5.5.0
+    /// (ItemHandler.cs:388-396) reads two guids, FOUR u32, then ItemInstance last. No capture on
+    /// disk contains a CMSG_BUY_ITEM — capture #13's player sold, repaired and trained but never
+    /// bought — so it was settled instead against the client's own serialiser, which is the same
+    /// class of evidence and does not need a session.
+    ///
+    /// The writer is at RVA 0x65A450, identified by the opcode constant it emits rather than by
+    /// position: <c>mov edx, 0x3F002F; call 0x2D9EFA0</c> at 0x65A468, and 0x3F002F is
+    /// CMSG_BUY_ITEM. It then writes, in order, guid [obj+0x20], guid [obj+0x30], u32 [obj+0xB8],
+    /// u32 [obj+0xBC], u32 [obj+0xC0], u32 [obj+0xC4], and tail-jumps to the ItemInstance writer
+    /// 0x6D1F40 with the sub-object at [obj+0x40]. Four u32, ItemInstance last, and no trailing
+    /// bit field at all.
+    ///
+    /// The identification was controlled against a measured sibling: the same pattern gives
+    /// CMSG_SELL_ITEM's writer as 0x65A360 (opcode, guid, guid, u32), whose body is 11+11+4 = 26
+    /// bytes, exactly the 26-byte CMSG_SELL_ITEM in capture #13; and CMSG_TRAINER_BUY_SPELL's as
+    /// 0x65A730 (opcode, guid, u32, u32), whose body is 10+4+4 = 18, exactly the 18-byte
+    /// CMSG_TRAINER_BUY_SPELL at [1013].
+    ///
+    /// So WowPacketParser is right and we are wrong: today Item.ItemID is read 4 bytes late off
+    /// the ItemType word, and the id forwarded to cmangos is garbage. Default OFF anyway.
+    ///
+    /// Note the knob also changes what reaches ItemHandler.HandleBuyItem: the measured layout has
+    /// no BagSlot field (the container is the second guid), so BagSlot stays 0 and the legacy
+    /// 2.4.3 packet's trailing byte — cmangos' unused <c>unk1</c> — goes out as 0.
+    /// </remarks>
+    private static readonly bool Use553Layout =
+        System.Environment.GetEnvironmentVariable("HERMES_256_BUYITEM553") == "1";
+
     public BuyItem(WorldPacket packet) : base(packet)
     {
         Item = new ItemInstance();
@@ -75,6 +109,17 @@ public class BuyItem : ClientPacket
     {
         VendorGUID = _worldPacket.ReadPackedGuid128();
         ContainerGUID = _worldPacket.ReadPackedGuid128();
+
+        if (Use553Layout)
+        {
+            Quantity = _worldPacket.ReadUInt32();
+            Muid = _worldPacket.ReadUInt32();
+            Slot = _worldPacket.ReadUInt32();
+            ItemType = (ItemVendorType)_worldPacket.ReadInt32();
+            Item.Read(_worldPacket);
+            return;
+        }
+
         Quantity = _worldPacket.ReadUInt32();
         Slot = _worldPacket.ReadUInt32();
         BagSlot = _worldPacket.ReadUInt32();
@@ -86,6 +131,7 @@ public class BuyItem : ClientPacket
     public ItemInstance Item;
     public uint Slot;
     public uint BagSlot;
+    public uint Muid;
     public ItemVendorType ItemType;
     public uint Quantity;
     public WowGuid128 ContainerGUID;

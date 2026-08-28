@@ -129,6 +129,48 @@ public partial class ObjectUpdateBuilder
         System.Environment.GetEnvironmentVariable("HERMES_256_QUESTLOGFULL") == "1";
 
     /// <summary>
+    /// HERMES_256_BUYBACKVALUES=1 emits BuybackPrice and BuybackTimestamp on the values path, so a
+    /// sold item actually renders in the vendor's buyback tab.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Measured 29 Aug against the ten sells in <c>ground-truth/w13_s2.bin</c>, decoded at the
+    /// FIFTEEN-bit APD mask width this build uses. Symptom first: selling worked — money came back
+    /// and the item guid reached the client — but the buyback tab stayed empty, because the guid
+    /// alone is not enough. Our live log showed <c>[94]=&lt;guid&gt;</c> and <c>[95]=&lt;guid&gt;</c>
+    /// arriving with no price and no timestamp behind them.
+    /// </para>
+    /// <para>
+    /// The numbering is read off Blizzard's own bytes, not derived from 553:
+    /// <code>
+    /// gate 338
+    /// BuybackPrice[12]      bits 339..350   u32
+    /// BuybackTimestamp[12]  bits 351..362   i64
+    /// </code>
+    /// Ten sells produced ten APD blocks, every one consuming to its last byte with zero slack, and
+    /// each set exactly <c>{32, 42, 149, &lt;the bag slot vacated&gt;, &lt;InvSlots 94+n&gt;, 338,
+    /// 339+n, 351+n}</c> — the buyback slot, its price and its timestamp advancing together from
+    /// n=0 to n=9. The two arrays are exactly 12 apart in all ten pairs, which is what forces the
+    /// first to have twelve elements and puts the second at 351.
+    /// </para>
+    /// <para>
+    /// The identification does not rest on that pattern alone. <c>Coinage</c> travels in the same
+    /// block, and its delta between consecutive sells IS the price in the later block: 6+5=11,
+    /// 11+3=14, 14+4=18, 24+7=31, 31+12=43, 55+3=58, 58+15=73. Seven consecutive exact closures,
+    /// so the u32 at bit 339+n is the sale price and nothing else. (The two gaps are packet ranges
+    /// where the player also spent money.) Timestamps are Unix seconds from the capture's own day
+    /// and are eight bytes wide, matching <c>WriteActivePlayerData</c>'s existing
+    /// <c>WriteInt64</c> on the create path.
+    /// </para>
+    /// <para>
+    /// One gate, not two: every one of the ten blocks set 338 and nothing else in that region, so a
+    /// separate timestamp gate would have to sit at 350 or 351 and would break the exact +12 pairing.
+    /// </para>
+    /// </remarks>
+    static readonly bool s_buybackValues =
+        System.Environment.GetEnvironmentVariable("HERMES_256_BUYBACKVALUES") == "1";
+
+    /// <summary>
     /// One quest-log slot rebuilt from the merged LEGACY field cache, so a create-form entry is
     /// written from complete state instead of from whatever the last delta happened to carry.
     /// Field layout mirrors UpdateHandler.ReadQuestLogEntry exactly - 4 dwords per entry from 2.4.0
@@ -711,7 +753,11 @@ public partial class ObjectUpdateBuilder
         if (m.Get(5)) w.WriteInt64(d.Health!.Value);
         if (m.Get(6)) w.WriteInt64(d.MaxHealth!.Value);
         if (m.Get(7)) w.WriteInt32(d.DisplayID!.Value);
-        if (m.Get(8)) w.WriteUInt32(d.NpcFlags[0]!.Value);
+        // Must apply here too, not only in the create writer: cmangos re-sends NpcFlags whenever a
+        // quest becomes available or is turned in, so a values update carrying the raw legacy value
+        // would clear the Gossip bit the create announced and make the NPC unclickable mid-session.
+        // Same class of trap as fixing Write() but not WriteToSpan().
+        if (m.Get(8)) w.WriteUInt32(NpcGossipBit256.Apply(d.NpcFlags[0]!.Value));
         if (m.Get(9)) w.WriteUInt32(d.NpcFlags[1]!.Value);
         if (m.Get(10)) w.WriteUInt32(d.StateSpellVisualID!.Value);
         if (m.Get(11)) w.WriteUInt32(d.StateAnimID!.Value);
@@ -1270,6 +1316,26 @@ public partial class ObjectUpdateBuilder
                 foreach (int i in slots) m69.Set(150 + i);
             }
 
+            // Buyback: gate 338, BuybackPrice[12] at 339+i (u32), BuybackTimestamp[12] at 351+i
+            // (i64). Read off the ten live sells in w13_s2.bin - see s_buybackValues. Without these
+            // the sold item's guid reaches InvSlots[94+n] and the tab still renders empty.
+            var buyPrice = new System.Collections.Generic.List<int>();
+            var buyStamp = new System.Collections.Generic.List<int>();
+            if (s_buybackValues)
+            {
+                for (int i = 0; i < 12; ++i)
+                {
+                    if (i < d.BuybackPrice.Length && d.BuybackPrice[i].HasValue) buyPrice.Add(i);
+                    if (i < d.BuybackTimestamp.Length && d.BuybackTimestamp[i].HasValue) buyStamp.Add(i);
+                }
+            }
+            if (buyPrice.Count > 0 || buyStamp.Count > 0)
+            {
+                m69.Set(338);
+                foreach (int i in buyPrice) m69.Set(339 + i);
+                foreach (int i in buyStamp) m69.Set(351 + i);
+            }
+
             if (!m69.Any)
                 return null;
 
@@ -1286,6 +1352,18 @@ public partial class ObjectUpdateBuilder
                     w69.WritePackedGuid128(g);
                     log.Append($" [{i}]={g}");
                 }
+            // Ascending bit order, so buyback follows InvSlots (338 > 295). That is also the order
+            // Blizzard's own ten blocks decode in.
+            foreach (int i in buyPrice)
+            {
+                w69.WriteUInt32(d.BuybackPrice[i]!.Value);
+                log.Append($" Price[{i}]={d.BuybackPrice[i]}");
+            }
+            foreach (int i in buyStamp)
+            {
+                w69.WriteInt64(d.BuybackTimestamp[i]!.Value);
+                log.Append($" Stamp[{i}]={d.BuybackTimestamp[i]}");
+            }
             Framework.Logging.Log.Print(Framework.Logging.LogType.Warn,
                 $"[256-spike] APD-VALUES(69110):{log}");
             return w69;

@@ -89,28 +89,71 @@ Full evidence in `REFERENCE-256-CLIENT.md` §137. Headline: **the vendor leg is 
 end** and needs one visual confirmation, not development. The trainer leg fails three ways, and
 repair is not a packet problem at all.
 
-#### START HERE (fresh session, 29 Aug onward)
+#### STATE (updated 29 Aug, end of the vendor/trainer session)
 
-**The work is already written. This is a test-and-confirm session, not a build session.**
+**Trainer, vendor and buyback all work end to end.** Eight knobs are now default on in `run256.sh`
+and every one was confirmed in a live session, not inferred: `TRAINEROPCODE`, `TRAINER553`,
+`LEARNEDSPELLS3`, `NPCGOSSIPBIT`, `BUYITEM553`, `BUYBACKVALUES`, `INVSLOTMAP` (plus the quest chain
+that was already committed). Raw logs kept as `proxy-trainer-run1.log` … `run5.log`.
 
-State of the tree: **four files are modified and uncommitted, deliberately** —
-`World/Enums/V2_5_6_69110/Opcode.cs`, `World/Server/Packets/NPCPackets.cs`,
-`World/Server/Packets/SpellPackets.cs`, `World/Server/Packets/ItemPackets.cs`. They compile clean,
-every knob defaults OFF, and **none of them has ever run live.** `git status` will also show
-`activeplayer-dump.*` and `wireshark/` — those are scratch, ignore them.
+What now works: the trainer list renders and spells train and reach the spellbook immediately;
+vendors, repairers and bankers are clickable; buying delivers the item clicked; selling returns the
+money and files the item into the buyback tab with its price; buying back returns it to the bag.
 
-Read before touching anything: `REFERENCE-256-CLIENT.md` §137 (the measurements) and the T-rows
-below (the register). Then:
+**Three results worth not re-deriving, each an exclusion as much as a fix:**
 
-1. **Stop the proxy, build, restart.** The proxy is the user's and needs no permission to
-   stop/build/restart. Build with `"$LOCALAPPDATA/Microsoft/dotnet/dotnet.exe" build
-   HermesProxy/HermesProxy.csproj` — and read the build-environment trap at the end of this section
-   *first*, it has cost two live tests.
-2. **Run:** `HERMES_256_TRAINEROPCODE=1 HERMES_256_TRAINER553=1 bash tools-256-spike/run256.sh`.
-   These two go together and neither works alone; see "The session, batched" below. The quest knobs
-   are already default-on in `run256.sh` and should stay on — the quest chain is committed and
-   working (`b0f8f95`), so a regression there is a signal, not noise.
-3. **Then** add `LEARNEDSPELLS3=1`, **then** `BUYITEM553=1`, one at a time.
+1. **The two trainer symptoms had ONE cause.** "The spell does not appear in the spellbook" and "the
+   spell does not leave the trainer list" both came from `SMSG_LEARNED_SPELLS` being 4 bytes short.
+   The client filters the trainer list against **its own spellbook**, not against the `Usable` byte —
+   the server was already sending `Usable = 0 (Known)` while the spell still showed. There is no
+   separate list-refresh mechanism to find. Relatedly, `SMSG_TRAINER_BUY_SUCCEEDED` staying unhandled
+   is **correct**: the modern engine has no such opcode (CypherCore carries only `TrainerBuyFailed`),
+   so the `No handler` line in the log is not a gap.
+2. **It is bit 0 specifically, not "any service bit".** Adlin Pridedrift carries `QuestGiver` and the
+   client would not interact with him either. Only `Gossip` starts an interaction on this engine.
+3. **"Item not found" on buyback was not a buyback bug** but an era mismatch in `AdjustInventorySlot`
+   — see T-O. Expect the same class elsewhere: any modern→legacy index table written against the
+   wrong era's constants fails silently, on the ranges that happen to differ.
+
+**Still open in this subsystem:**
+
+* **Repair (T-F) — never reached in the session, so still entirely unconfirmed.** The repairers are
+  clickable now, so it is testable. It is a values-update problem, not a packet problem, and
+  `ItemData` has no measured values numbering; expect "money went down, the durability bar did not
+  move".
+* ~~T-P: the ground-truth tooling decodes `ActivePlayerData` at 14 bits~~ — **fixed 29 Aug**, both
+  tools corrected and `bit-inventory.md` regenerated; APD identification 27/58 -> 48/59. Note this
+  never affected the proxy: the shipped encoder always used 15. It was a poisoned *reference*, and it
+  had already cost one round of confusion (the "Coinage = 9" vs "Coinage = 42" contradiction). **The
+  `ItemData` section T-F needs still does not exist** — `gt_bitinventory.py`'s `BLOCKS` decodes only
+  Object/Unit/Player/ActivePlayer, so repair remains blocked on adding `ItemData` to that tool.
+* Buyback timestamps are relative rather than Unix on our path (see the last register row).
+* `LfgDungeonsID` (OQ-3), `GossipOptionID` resolution (OQ-4), `ItemExtendedCost` misses (T-G2).
+
+**A retail capture is NOT needed for any of the above.** Capture #13 already carried the ten sells
+that settled T-N and the `CMSG_REPAIR_ITEM` that T-F needs; what was missing was never data, it was
+the tool's mask width. The one thing #13 provably does not contain is a `CMSG_BUY_BACK_ITEM` — and
+that has now been settled live instead. Before asking for a new capture, name the packet #13 lacks.
+
+**Two traps found on 29 Aug, both fixed, both worth knowing:**
+
+* **`run256.sh` had dead exports.** The five quest knobs sat *after* `exec "$DOTNET"`, which replaces
+  the shell — so they never ran, and since they default OFF in C# the script alone launched with the
+  whole committed quest chain disabled while the file read as if it were on. Moved above `exec`, with
+  a barrier comment. **Nothing may be added below that line.**
+* **"the proxy is not running" is not something `tasklist | grep hermes` can tell you.** The process
+  is `.NET Host` / `dotnet.exe`. A build against a running proxy fails only at the *copy* step with
+  `MSB3027 ... locked by ".NET Host"`, and piping the build through `tail` hides the exit code, so it
+  can look like a clean build. Kill by command line (`Win32_Process ... CommandLine -like
+  '*HermesProxy.dll*'`), as `run256.sh` itself does. A real build reports ~60 warnings; **0 warnings
+  means the resource-less no-op build** described in the build-environment trap below.
+
+**`gate256.py` is FAILING today, and it is NOT from this work.** Three reader legs and `frag-bit`
+fail (`UnitData emit 892 / reader 898`, `PlayerData 2652 / 990`, `ActivePlayerData 6568 / 6294`).
+The gate reads none of the files this session touched — verified. Note the gate calls `streamwalk.py`
+with a hardcoded `flags=1` while the writer now ships `0x07` (VEJB=1), which is exactly the "compare
+like with like" trap: **that is a hypothesis, not a finding — it has not been checked.** Either way
+the gate needs a session of its own before it can guard anything again.
 
 **Do not re-derive these — they are measured and closed:**
 * the vendor leg (gossip, vendor inventory, sell, repair reads, `ItemInstance`) is byte-correct
@@ -126,11 +169,11 @@ repair visibility, which needs an `ItemData` values-bit inventory that does not 
 | # | finding | status | evidence |
 |---|---|---|---|
 | — | **Gossip, `SMSG_VENDOR_INVENTORY`, `SMSG_SELL_RESPONSE`, `CMSG_SELL_ITEM`, `CMSG_REPAIR_ITEM` and the 14-byte `ItemInstance` are all measured correct** | **confirm visually, do not re-derive** | §137.1 — 3 vendor packets tile exactly (19 B header, 47 B element, 301/395 B totals); 10 sell responses byte-for-byte |
-| T-A | **`SMSG_TRAINER_LIST` is shipped as `0x460188`, which is `SMSG_THREAT_UPDATE`.** The real opcode is `0x46018D`. The comment at `Opcode.cs:979-983` already predicted the threat shape and said the trainer list was "squatting" on it. Delivered under the wrong number it lands in the client's threat reader — the harmless-sink pattern §125 diagnosed for the old vendor number, which is why "trainers do nothing" never produced a crash report. | **open — do first, zero risk** | §137.2: 29 packets of exactly 32 B all decode as threat; 0x46018D identified over-determined (same guid across 5 client packets, `TrainerID=22` echoed back, 5 Dun Morogh warrior spells with matching levels, 41-byte greeting matching its own 11-bit length, 232 B with zero slack) |
-| T-B | **`TrainerList` layout wrong twice:** header 3 B too long (`i32 TrainerType` where the wire has 1 byte), element 4 B too short (30 vs **34**). WPP 5.5.0 independently reads the extra `Unk440`. `SpellID` is a **resolved** field, so this is crash-shaped, not cosmetic. **`MaxSize` uses `SpellSize = 30`: raising the element without raising it overruns a pooled buffer.** | **open** | §137.2 |
-| T-C | **`SMSG_LEARNED_SPELLS` is 4 B short** — live is 18 B with **three** header u32; we write two. A 69110 deviation from 5.5.0, visible only in the capture. The spell id lands at offset 9 instead of 13, so the client learns a garbage id. | **open** | §137.3 |
+| T-A | **`SMSG_TRAINER_LIST` is shipped as `0x460188`, which is `SMSG_THREAT_UPDATE`.** The real opcode is `0x46018D`. The comment at `Opcode.cs:979-983` already predicted the threat shape and said the trainer list was "squatting" on it. Delivered under the wrong number it lands in the client's threat reader — the harmless-sink pattern §125 diagnosed for the old vendor number, which is why "trainers do nothing" never produced a crash report. | **SOLVED — confirmed live 29 Aug, `HERMES_256_TRAINEROPCODE` now default on** | §137.2: 29 packets of exactly 32 B all decode as threat; 0x46018D identified over-determined (same guid across 5 client packets, `TrainerID=22` echoed back, 5 Dun Morogh warrior spells with matching levels, 41-byte greeting matching its own 11-bit length, 232 B with zero slack) |
+| T-B | **`TrainerList` layout wrong twice:** header 3 B too long (`i32 TrainerType` where the wire has 1 byte), element 4 B too short (30 vs **34**). WPP 5.5.0 independently reads the extra `Unk440`. `SpellID` is a **resolved** field, so this is crash-shaped, not cosmetic. **`MaxSize` uses `SpellSize = 30`: raising the element without raising it overruns a pooled buffer.** | **SOLVED — confirmed live 29 Aug, `HERMES_256_TRAINER553` now default on** | §137.2, plus a wire proof the capture could not give: with the 34-byte stride the `Usable` byte of element 0 lands at offset **48**, and offset 48 is the **only** byte that differed between the trainer list before and after a purchase (`01` Available -> `00` Known). Header decodes as guid 7 B + `u8 TrainerType = 0` + `TrainerID 912` + `Count 5`; elements are 6673 Battle Shout (9c, lvl 1), 6343 Thunder Clap (95c, lvl 6), 3127 Parry (95c) |
+| T-C | **`SMSG_LEARNED_SPELLS` is 4 B short** — live is 18 B with **three** header u32; we write two. A 69110 deviation from 5.5.0, visible only in the capture. The spell id lands at offset 9 instead of 13, so the client learns a garbage id. | **SOLVED — confirmed live 29 Aug, `HERMES_256_LEARNEDSPELLS3` now default on** | §137.3; live wire `bodyLen=18 01000000 00000000 00000000 00 64000000 00` — spell **100 Charge** at offset 13, byte-identical in shape to Blizzard's [5432] |
 | T-D | **The `ISpanWritable` trap.** `TrainerList`, `LearnedSpells`, `BuyFailed` and `BuySucceeded` are all `ISpanWritable`, and `Packet.cs:158` prefers `WriteToSpan`. **Fixing `Write()` alone changes nothing on the wire** — the same trap that hid the `BagResult` width fix. | **rule** | §137.4 |
-| T-E | **`CMSG_BUY_ITEM`: reference disagreement, no measurement.** We read the 9.x/3.4.3 shape (3-bit `ItemType` after the instance); WPP 5.5.0 has `i32 ItemType` before it. If WPP is right the item id forwarded to cmangos is garbage. `BuyFailed.Reason` is u8 where WPP reads i32 — the same bug class as the already-fixed `SellResponse`. | **open — needs the session's buy** | §137.5 |
+| T-E | **`CMSG_BUY_ITEM`: reference disagreement, no measurement.** We read the 9.x/3.4.3 shape (3-bit `ItemType` after the instance); WPP 5.5.0 has `i32 ItemType` before it. If WPP is right the item id forwarded to cmangos is garbage. `BuyFailed.Reason` is u8 where WPP reads i32 — the same bug class as the already-fixed `SellResponse`. | **SOLVED — confirmed live 29 Aug, `HERMES_256_BUYITEM553` now default on** | §137.5; bought from a vendor and the right item arrived |
 | T-F | **Repair is not a packet problem.** Neither era sends a response; both mutate durability and money. It is entirely a values-update problem, and **`ItemData` has no measured values numbering at all** (`bit-inventory.md` has no `ItemData` section). Expect "money went down, durability bar did not move". Do it **last**. | **open — lowest priority** | §137.7 |
 | T-G | **`TrainerList.TrainerID` is SAFE — no seam-rule trap. Measured 28 Aug, do not spend a session on it.** The client has **no `Trainer` DB2 store to resolve against**: `db2map.py` enumerated **940** stores from the client image and none is named Trainer; our own `DB2Hash.cs` has **886** entries and none; TrinityCore's `DB2Stores.cpp`/`DB2Metadata.h` have none either and keep trainers in the world DB (`Entities/Creature/Trainer.cpp`). The only bare `Trainer\0` in the binary (`.rdata` RVA 0x034474A0) sits inside the `GossipOptionNpc` enum-name table. Confirmed **positively** as an echo token: capture #13 [1013] sends `TrainerID = 22` straight back in `CMSG_TRAINER_BUY_SPELL`. The cmangos creature entry at `NPCHandler.cs:155` is fine. | **CLOSED — safe** | `db2map.py` reproduced §129's controls exactly (`AnimationData 0..801 / 802 rows`, `SpellVisualKit 12 rows`), so the readings are sound |
 | T-G2 | **`VendorItem.ExtendedCostID` IS exposed — the real §129 risk here.** Store `0x04141740`, ids **1..11456** over only **371 rows** — 3.2 % dense, so a legacy id almost certainly *misses*. Unlike the Blizzard capture (0 on all 14 items) the exposure is live on our path: `Client/NPCHandler.cs:132` forwards cmangos' `ExtendedCost` column **verbatim**. Hits honour/badge vendors, not food and water. **Whether a miss is fatal or a benign null is still open.** `ItemExtendedCost` *could* be hotfix-served — `DB2Hash.ItemExtendedCost = 0xBB858355` exists and `CMSG_HOTFIX_REQUEST` already pre-pushes 18 tables — but cmangos 2.4.3 has no server-side source, so the data would have to come from a 2.4.3 DBC dump. | **open** | `db2map.py`; `HotfixHandler` paths verified, not assumed: `CMSG_DB_QUERY_BULK` serves 3 tables, `CMSG_HOTFIX_REQUEST` 18, neither includes it |
@@ -138,7 +181,13 @@ repair visibility, which needs an `ItemData` values-bit inventory that does not 
 | T-I | **New lead from the relabelling: `UnitData` bit 21's top neighbour flipped to `threatx11`** (was `meleex8`). Its 68 solo samples are packed guids of 2/9/10/11/12/14 bytes — a guid-valued field that changes with threat. That is **`Target`-shaped**, and it is the strongest new lead in the file. | **open, unworked** | regenerated `bit-inventory.md` |
 | T-J | **OQ-1 SETTLED: the byte at offset 10 is a plain `u8 TrainerType`,** not a 2-bit field. The reader calls the u8 primitive once and stores the whole byte with **no shift and no mask**. The contrast is inside the same function: the greeting length reads two bytes and assembles 11 bits MSB-first, discarding the low 5 — that is what bit-reading looks like here, and a `WriteBits(2)+FlushBits` field would need a `>>6` that does not exist. | **CLOSED** | client reader `0x5BBB90`, reached via GetId stub `0x5BBDA0` (`mov dword ptr [rdx], 0x46018D`) → dispatcher `0x6229DC` → ctor `0x5BBDB0`; `.pdata` 3 chunks, 470 B |
 | T-K | **OQ-2 SETTLED: WPP 5.5.0's field names and order are right.** The element is stride 0x24 / 34 B on the wire, and a **three-trip inner loop** (esi=3) pins `ReqAbility[3]` at +0x10/+0x14/+0x18 *structurally*, which forces `ReqSkillLine, ReqSkillRank` before it and `Unk440` after — exactly `NpcHandler.cs:279-288`. Bonus: `0x460188`'s own reader is `GUID U32 GUID U64`, so the client independently confirms the T-A eviction. | **CLOSED** | same reader walk |
-| T-L | **T-E SETTLED — WPP is right and we are wrong.** No capture on disk contains a `CMSG_BUY_ITEM` (`w13_c2s`, `w15_c2s`, `world11_c2s` all checked), so it was settled against the **client's serialiser**: `mov edx, 0x3F002F` at `0x65A468`, function `0x65A450` writes `opcode, guid, guid, u32 x4, then ItemInstance last, with no trailing bit field`. Controlled against two measured siblings by the same method: `CMSG_SELL_ITEM` = `0x65A360` → 26 B (matches the ten live sells) and `CMSG_TRAINER_BUY_SPELL` = `0x65A730` → 18 B (matches [1013]). Today `ItemPackets.cs` reads three u32, so `Item.ItemID` lands on the `ItemType` word and the id forwarded to cmangos is garbage. | **CLOSED — fix behind `BUYITEM553`** | client writer walk |
+| T-L | **T-E SETTLED — WPP is right and we are wrong.** No capture on disk contains a `CMSG_BUY_ITEM` (`w13_c2s`, `w15_c2s`, `world11_c2s` all checked), so it was settled against the **client's serialiser**: `mov edx, 0x3F002F` at `0x65A468`, function `0x65A450` writes `opcode, guid, guid, u32 x4, then ItemInstance last, with no trailing bit field`. Controlled against two measured siblings by the same method: `CMSG_SELL_ITEM` = `0x65A360` → 26 B (matches the ten live sells) and `CMSG_TRAINER_BUY_SPELL` = `0x65A730` → 18 B (matches [1013]). Today `ItemPackets.cs` reads three u32, so `Item.ItemID` lands on the `ItemType` word and the id forwarded to cmangos is garbage. | **CLOSED and CONFIRMED LIVE 29 Aug** | client writer walk; the buy round-trips and the item that arrives is the one clicked |
+
+| T-M | **Nothing with a cmangos vendor/repair/banker flag was clickable at all — SOLVED, confirmed live 29 Aug.** The client selected the unit (`CMSG_SET_SELECTION`) and then sent **nothing**: no `CMSG_TALK_TO_GOSSIP`, no `CMSG_LIST_INVENTORY`. Cause: **this engine reaches every NPC service through gossip, and cmangos does not set the `Gossip` bit on a plain vendor** because the 2.4.3 client had a direct path this one no longer has. Live agrees — capture #13 opens the vendor via `CMSG_GOSSIP_SELECT_OPTION`, never a bare `CMSG_LIST_INVENTORY` (§137.1). **Not an alignment fault:** the create blocks of the working and non-working NPCs are identical apart from `NpcFlags`, and the right value was on the wire. Applied in **both** the create and values writers — cmangos re-sends `NpcFlags` on quest-state changes and would otherwise clear the bit mid-session. | **SOLVED — `HERMES_256_NPCGOSSIPBIT`, now default on** | Anvilmar, 29 Aug: all seven trainers carry `19 = Gossip\|QuestGiver\|Trainer` and work; Adlin Pridedrift (`130 = QuestGiver\|Vendor`), Wren Darkspring (130), Rybrad Coldbank and Grundel Harkin (`4224 = Vendor\|Repair`) carry no bit 0 and were dead. Durnan Furcutter (`4227`, has bit 0) worked. **Exclusion worth keeping: Adlin carries `QuestGiver` and the client does not act on that either — it is bit 0 specifically, not "any service bit".** |
+| T-N | **Buyback tab always empty — SOLVED, confirmed live 29 Aug.** Selling worked (money returned, the item guid reached `InvSlots[94+n]`) but nothing rendered, because **`BuybackPrice` and `BuybackTimestamp` were never emitted on the values path at all.** Numbering measured, not derived: **gate 338, `BuybackPrice[12]` at 339+i (u32), `BuybackTimestamp[12]` at 351+i (i64)**, one gate for both arrays. | **SOLVED — `HERMES_256_BUYBACKVALUES`, now default on** | ten sells in `ground-truth/w13_s2.bin` decoded at the **15-bit** APD mask width: ten blocks, every one consuming to its last byte, each setting `{32, 42, 149, <bag slot vacated>, <InvSlots 94+n>, 338, 339+n, 351+n}` with n advancing 0→9. The two arrays are exactly 12 apart in all ten pairs. **Confirmed by arithmetic rather than pattern-match:** `Coinage` rides in the same block and its delta between consecutive sells IS the price in the later block — 6+5=11, 11+3=14, 14+4=18, 24+7=31, 31+12=43, 55+3=58, 58+15=73, seven exact closures |
+| T-O | **Buying back failed with "item not found" — SOLVED, confirmed live 29 Aug.** Not a buyback bug: `AdjustInventorySlot`'s 69110 arm maps its **tail against Vanilla's slot table** while the legacy server is TBC 2.4.3, and **omitted the buyback range entirely**, so modern slot 94 fell through to `return slot` — and TBC slot 94 sits inside its **keyring** range 86-117, so cmangos looked up a keyring slot. Two more of the same defect corrected together and **explicitly not separately tested**: bank bags targeted 63 (Vanilla `BankBagStart`; TBC is 67) and the keyring targeted 69, which is Vanilla's *buyback* start (TBC's keyring is 86). Bank items only looked correct because Vanilla and TBC both start at 39. Bounds now resolve through the legacy build's own constants so this cannot drift again. | **SOLVED — `HERMES_256_INVSLOTMAP`, now default on** | full round trip logged: guid leaves bag slot 45 -> `InvSlots[94]` + `Price[0]=1`, then returns to bag slot 39 while 94 and its price clear; `Coinage` 9991->9990 closes against the price. Zero inventory-change failures in the session |
+| T-P | **`bit-inventory.md`'s entire `ActivePlayerData` section is decoded at the WRONG mask width.** `gt_apddec.py:31` and `gt_bitinventory.py:24` both use **14**, while `befc8d2` established the APD mask header is **15 bits** and the shipped encoder uses 15. Decoding at 14 shifts every observed bit down by 33 — the file's "Coinage = bit 9" is the encoder's bit 42, the same field. **Any APD bit read out of that file today is wrong**, which also blocks the `ItemData`/repair track (T-F), since it needs the same tool. | **SOLVED 29 Aug — tools corrected and `bit-inventory.md` regenerated** | width 14->15 in both tools, `is_gate`/`proven` renumbered, and `SMSG_SELL_RESPONSE` added to `EVENTS` (it was missing, so every sell-correlated bit was invisible). Control: the regenerated file now reproduces the shipped encoder independently — Coinage at **42** with an 8-byte solo payload, InvSlots gate **149**, Buyback gate **338** appearing exactly **10** times for the ten sells. APD identification went 27/58 -> **48/59** |
+| — | **Buyback timestamps are not Unix time on our path.** Blizzard sends Unix seconds (`1787865557`); cmangos' value arrives as `108007`, apparently relative. The item renders regardless, so display does not depend on it — but WoW expires buyback entries after 30 minutes, so if entries never expire or vanish immediately, this is where to look. **Not touched: what the client does with the field is unmeasured.** | **open, low priority** | `Stamp[0]=108007` in the 29 Aug log vs live `1787865557` |
 
 **Built 28 Aug, all four knobs default OFF, compile-checked out of tree, not committed:**
 

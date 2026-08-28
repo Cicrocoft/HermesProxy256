@@ -897,12 +897,29 @@ public class SpellCastRequest
                 OptionalCurrencies.Add(currency);
             }
 
-            SendCastFlags = data.ReadBits<uint>(6);
-            if (data.HasBit())
-                MoveUpdate = new();
-            weightCount = data.ReadBits<uint>(2);
-            data.HasBit();              // HasCraftingOrderID
-            Target.Read(data);
+            // Read out from the client's OWN serialiser for this opcode (FUN@0x69FCF0, reached from
+            // the sender at 0x657C60 that sets opcode 0x3E0160). Its bit section is exactly eight
+            // bits — bool, bool, a FIVE-bit value, bool — and it then FLUSHES the accumulator
+            // (0x5837A0) before writing the target, so the target starts byte-aligned.
+            data.HasBit();
+            data.HasBit();
+            SendCastFlags = data.ReadBits<uint>(5);
+            data.HasBit();
+
+            // And the target block (writer FUN@0x69E140) is nothing like this file's generic one:
+            // a PLAIN u32 Flags, then THREE packed guids — no bit-packed flag field, no name
+            // length. Confirmed byte-for-byte against a real Blizzard cast: the flush byte lands at
+            // 50, Flags at 51-54 read 0x00000002 = TARGET_FLAG_UNIT, and the Unit guid follows at
+            // 55, which is exactly where the creature guid sits in the capture.
+            Target.Flags = (SpellCastTargetFlags)data.ReadUInt32();
+            Target.Unit = data.ReadPackedGuid128();
+            Target.Item = data.ReadPackedGuid128();
+            data.ReadPackedGuid128();          // third guid, unnamed on this build
+
+            // Everything past the target (the writer's own bit section and its optional u32/u64)
+            // is not needed to translate a cast for the legacy server, and its shape is unverified,
+            // so stop here rather than consume bytes on a guess.
+            return;
         }
         else
         {

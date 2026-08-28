@@ -386,6 +386,10 @@ public partial class ObjectUpdateBuilder
     static readonly bool s_questState0 =
         System.Environment.GetEnvironmentVariable("HERMES_256_QUESTSTATE0") == "1";
 
+    // See the HERMES_256_QUESTIDMAP note after the QuestLog loop. Default off (length change).
+    static readonly bool s_questIdMap =
+        System.Environment.GetEnvironmentVariable("HERMES_256_QUESTIDMAP") == "1";
+
     static readonly bool s_maxLevel70 =
         System.Environment.GetEnvironmentVariable("HERMES_256_MAXLEVEL70") == "1";
 
@@ -936,7 +940,61 @@ public partial class ObjectUpdateBuilder
             // NEW on this build: a u32->u32 map follows QuestLog inside the same PartyMember
             // gate (client reader 0x73F600, hash-inserts key/value pairs at object+0xB0).
             // Empty is one zero count.
-            w.WriteUInt32(0);        // QuestLogExtraMap size (count * { u32 key, u32 value })
+            //
+            // HERMES_256_QUESTIDMAP: send the map Blizzard actually sends. REFERENCE-256-CLIENT.md
+            // section "Two dormant corrections" recorded this map as "unknown and safe as zeros";
+            // decoding ap_rowine.bin on 28 Aug shows it is NOT semantically empty - it is the
+            // questID -> quest-log-slot lookup:
+            //     count=3   313 -> 0   384 -> 2   317 -> 1
+            // and those values are exactly the slots those quests occupy in the same block
+            // (313@slot0, 317@slot1, 384@slot2). The pair ORDER in the capture is neither slot nor
+            // id order because the client hash-inserts by key, so any order is equivalent; we emit
+            // slot order for determinism.
+            //
+            // Why this is the candidate: the entry layout itself is now EXCLUDED. Walking the same
+            // capture, Blizzard's 25x66 region parses byte-for-byte with the field order this
+            // writer already uses - QuestID@+0, StateFlags@+4, ObjectiveProgress@+6 (quest 317
+            // carries [4,2] at +6/+8), 12-byte tail@+54 - and the region ends exactly where this
+            // map's count begins. So the 66 bytes are right and the emptiness after them is the
+            // only structural divergence left. It fits the symptom precisely: the quest renders
+            // (the log UI walks slots by index) and the objective renders (client's own template
+            // cache plus its own bag count), but anything that resolves a quest BY ID finds
+            // nothing, and isComplete comes back nil rather than false.
+            //
+            // Verified against the client's own reader (0x73F600 via _disx.py): it reads the count,
+            // then loops count times reading two u32s and hash-inserting with the MurmurHash3
+            // finalizer constants 0xff51afd7ed558ccd / 0xc4ceb9fe1a85ec53 over the FIRST u32. So
+            // the pairs are consumed, and writing them cannot shift the block.
+            //
+            // This IS a create-block length change (+8 per logged quest), which is the dangerous
+            // class on this unmasked build - hence default off, and hence gate256.py before a
+            // session. Only the create path is maintained here: a quest accepted mid-session goes
+            // through the values path, which has no bit for this map, so the map is correct as of
+            // the last create until that is wired.
+            if (s_questIdMap)
+            {
+                uint mapCount = 0;
+                for (int i2 = 0; i2 < 25; ++i2)
+                {
+                    var qm = pd != null && i2 < pd.QuestLog.Length ? pd.QuestLog[i2] : null;
+                    if (qm?.QuestID != null && qm.QuestID != 0)
+                        mapCount++;
+                }
+                w.WriteUInt32(mapCount);        // QuestLogExtraMap size
+                for (int i2 = 0; i2 < 25; ++i2)
+                {
+                    var qm = pd != null && i2 < pd.QuestLog.Length ? pd.QuestLog[i2] : null;
+                    if (qm?.QuestID == null || qm.QuestID == 0)
+                        continue;
+                    w.WriteUInt32((uint)qm.QuestID.Value);   // key   - quest id
+                    w.WriteUInt32((uint)i2);                 // value - quest-log slot index
+                }
+                if (mapCount != 0)
+                    Framework.Logging.Log.Print(Framework.Logging.LogType.Warn,
+                        $"[256-spike] questidmap: wrote {mapCount} questID->slot pair(s)");
+            }
+            else
+                w.WriteUInt32(0);        // QuestLogExtraMap size (count * { u32 key, u32 value })
         }
         // NOTE: VisibleItems[19] does NOT go here on this build. The client reads it at the
         // end of PlayerData, right before the name/flags bits byte - see below.

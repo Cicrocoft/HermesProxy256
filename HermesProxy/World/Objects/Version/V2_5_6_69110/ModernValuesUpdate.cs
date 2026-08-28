@@ -114,6 +114,106 @@ public partial class ObjectUpdateBuilder
     static readonly bool s_pdShift1 =
         System.Environment.GetEnvironmentVariable("HERMES_256_PDSHIFT1") == "1";
 
+    // See the HERMES_256_QUESTMAPVALUES note at bit 25 in BuildPlayerDataUpdate. Default off.
+    static readonly bool s_questMapValues =
+        System.Environment.GetEnvironmentVariable("HERMES_256_QUESTMAPVALUES") == "1";
+
+    // See the HERMES_256_QUESTKEEPPLAYER note at the APDINV116 drop in WriteModernValuesUpdate.
+    // Default off.
+    static readonly bool s_questKeepPlayer =
+        System.Environment.GetEnvironmentVariable("HERMES_256_QUESTKEEPPLAYER") == "1";
+
+    // See the HERMES_256_QUESTLOGFULL note in the QuestLog writer in BuildPlayerDataUpdate.
+    // Default off.
+    static readonly bool s_questLogFull =
+        System.Environment.GetEnvironmentVariable("HERMES_256_QUESTLOGFULL") == "1";
+
+    /// <summary>
+    /// One quest-log slot rebuilt from the merged LEGACY field cache, so a create-form entry is
+    /// written from complete state instead of from whatever the last delta happened to carry.
+    /// Field layout mirrors UpdateHandler.ReadQuestLogEntry exactly - 4 dwords per entry from 2.4.0
+    /// (id / stateFlags / four u8 counters / timer), 3 before it with the counters packed as four
+    /// 6-bit values and the state in the top byte. Returns null when the slot cannot be read, in
+    /// which case the caller keeps the delta-derived entry it already had.
+    /// </summary>
+    QuestLog? ReadQuestLogEntryFromCache(int slot)
+    {
+        // Self only. BuildPlayerDataUpdate also runs for OTHER players, and the cache we read here
+        // is the active player's - sourcing a party member's quest log from it would be worse than
+        // the bug being fixed.
+        if (m_updateData.Guid != m_gameState.CurrentPlayerGuid)
+            return null;
+        var cached = m_gameState.GetCachedObjectFieldsLegacy(m_gameState.CurrentPlayerGuid);
+        if (cached == null)
+            return null;
+        int baseField = LegacyVersion.GetUpdateField(HermesProxy.World.Enums.PlayerField.PLAYER_QUEST_LOG_1_1);
+        if (baseField < 0)
+            return null;
+
+        bool tbc = LegacyVersion.AddedInVersion(HermesProxy.Enums.ClientVersionBuild.V2_4_0_8089);
+        int stride = tbc ? 4 : 3;
+        int index = baseField + slot * stride;
+
+        var entry = new QuestLog();
+        if (cached.TryGetValue(index, out var idField))
+            entry.QuestID = idField.Int32Value;
+
+        if (tbc)
+        {
+            if (cached.TryGetValue(index + 1, out var stateField))
+                entry.StateFlags = stateField.UInt32Value;
+            if (cached.TryGetValue(index + 2, out var progField))
+            {
+                uint raw = progField.UInt32Value;
+                for (int j = 0; j < 4; ++j)
+                    entry.ObjectiveProgress[j] = (short)((raw >> (8 * j)) & 0xFF);
+            }
+            if (cached.TryGetValue(index + 3, out var timerField))
+                entry.EndTime = timerField.UInt32Value;
+        }
+        else
+        {
+            if (cached.TryGetValue(index + 1, out var packed))
+            {
+                uint raw = packed.UInt32Value;
+                for (int j = 0; j < 4; ++j)
+                    entry.ObjectiveProgress[j] = (short)((raw >> (6 * j)) & 0x3F);
+                entry.StateFlags = (raw >> 24) & 0xFF;
+            }
+            if (cached.TryGetValue(index + 2, out var timerField))
+                entry.EndTime = timerField.UInt32Value;
+        }
+        return entry;
+    }
+
+    /// <summary>
+    /// The player's live questID -> quest-log-slot pairs, read from the merged LEGACY field cache
+    /// rather than from PlayerData.QuestLog, because a values update carries only the slots that
+    /// changed and the map is replaced whole. Returns null when the log cannot be read.
+    /// </summary>
+    List<(uint QuestId, uint Slot)>? BuildQuestIdSlotPairs()
+    {
+        // Self only - see the note on ReadQuestLogEntryFromCache.
+        if (m_updateData.Guid != m_gameState.CurrentPlayerGuid)
+            return null;
+        var cached = m_gameState.GetCachedObjectFieldsLegacy(m_gameState.CurrentPlayerGuid);
+        if (cached == null)
+            return null;
+        int baseField = LegacyVersion.GetUpdateField(HermesProxy.World.Enums.PlayerField.PLAYER_QUEST_LOG_1_1);
+        if (baseField < 0)
+            return null;
+        // Same stride ReadQuestLogEntry uses: 4 dwords per entry from 2.4.0, 3 before it.
+        int stride = LegacyVersion.AddedInVersion(HermesProxy.Enums.ClientVersionBuild.V2_4_0_8089) ? 4 : 3;
+        int slots = Math.Min(LegacyVersion.GetQuestLogSize(), 25);
+        var pairs = new List<(uint, uint)>();
+        for (int i = 0; i < slots; ++i)
+        {
+            if (cached.TryGetValue(baseField + i * stride, out var f) && f.Int32Value != 0)
+                pairs.Add(((uint)f.Int32Value, (uint)i));
+        }
+        return pairs;
+    }
+
     // See the HERMES_256_UNITARR1 ground-truth note in BuildUnitDataUpdate. Default off.
     static readonly bool s_unitArr1 =
         System.Environment.GetEnvironmentVariable("HERMES_256_UNITARR1") == "1";
@@ -302,12 +402,45 @@ public partial class ObjectUpdateBuilder
 
                 if (m_objectType != Enums.ObjectTypeBCC.Unit)
                 {
+                    // HERMES_256_QUESTKEEPPLAYER: the APDINV116 drop rule above rests on an
+                    // assumption its own comment states - "A QuestLog update carries no APD part,
+                    // so quests keep their live Player update" - and that assumption is FALSE for a
+                    // quest that hands the player an item on accept. Measured 28 Aug (proxy7.log):
+                    // accepting a quest that grants a "stack of letters" changes InvSlots in the
+                    // same batch, so an APD part exists, the Player part carrying QuestLog[slot] is
+                    // dropped, and the quest never appears in the client's log at all. cmangos had
+                    // accepted it - SMSG_QUEST_GIVER_QUEST_DETAILS [1606] and
+                    // SMSG_QUEST_UPDATE_ADD_ITEM [1635] both arrived, and the item landed. This is
+                    // NOT specific to quest-item quests being rare: it is every accept that grants
+                    // an item, and it predates the quest-map work entirely.
+                    //
+                    // The rule exists to stop an equip's Player part (VisibleItems) desyncing the
+                    // cursor ahead of the APD part. Keeping the Player part ONLY when it carries
+                    // QuestLog entries is the narrow form of that: an equip still drops it.
+                    //
+                    // Worth knowing when judging the risk: bit 25 is the QuestLogExtraMap on this
+                    // build, not ChosenTitle, and our encoder wrote ChosenTitle there. A title of 0
+                    // makes the client's map reader take the delta arm and consume 3 bytes where we
+                    // wrote 4 - a ONE-BYTE desync of everything after it in the Player part. That is
+                    // a concrete mechanism for the very "Player part desyncs the cursor" measurement
+                    // this drop rule was built to work around, and HERMES_256_QUESTMAPVALUES removes
+                    // it. Pair the two knobs.
+                    bool playerCarriesQuestLog = false;
+                    if (s_questKeepPlayer && m_updateData.PlayerData != null)
+                    {
+                        for (int i = 0; i < 25; ++i)
+                            if (m_updateData.PlayerData.QuestLog[i] != null) { playerCarriesQuestLog = true; break; }
+                    }
                     bool dropPlayerSelf = s_apdInv116
                         && m_objectType == Enums.ObjectTypeBCC.ActivePlayer
-                        && active != null;
+                        && active != null
+                        && !playerCarriesQuestLog;
                     if (dropPlayerSelf && m_updateData.PlayerData != null)
                         Framework.Logging.Log.Print(Framework.Logging.LogType.Warn,
                             "[256-spike] APDINV116: suppressed Player part on self APD update (equip/unequip renders via InvSlots)");
+                    if (playerCarriesQuestLog)
+                        Framework.Logging.Log.Print(Framework.Logging.LogType.Warn,
+                            "[256-spike] QUESTKEEPPLAYER: kept Player part alongside APD part because it carries QuestLog");
                     var player = dropPlayerSelf ? null : BuildPlayerDataUpdate();
                     if (player != null)
                         Add(0x0040u, player);
@@ -844,7 +977,27 @@ public partial class ObjectUpdateBuilder
         if (d.PvPRank.HasValue) m.Set(21);
         if (d.DuelTeam.HasValue) m.Set(23);
         if (d.GuildTimeStamp.HasValue) m.Set(24);
-        if (d.ChosenTitle.HasValue) m.Set(25);       // PlayerTitle
+        // HERMES_256_QUESTMAPVALUES: bit 25 is NOT ChosenTitle on this build - it is the
+        // QuestLogExtraMap, read straight from the client's own values dispatcher:
+        //     0x073D378  bt   esi, 0x19          ; changes-mask bit 25
+        //     0x073D37C  jae  0x073D38D
+        //     0x073D37E  lea  rcx, [r15 + 0xb0]  ; the map, same object slot the create fills
+        //     0x073D385  mov  rdx, r12
+        //     0x073D388  call 0x073F040          ; map values reader
+        //     0x073D38D  bt   esi, 0x1a          ; the NEXT field is bit 26
+        // So 69110 inserted this field at 25 and pushed 553's ChosenTitle to 26 - that is the same
+        // insertion HERMES_256_PDSHIFT1 already compensates for on the array gates (44/47/73/93),
+        // now explained rather than just measured.
+        //
+        // CONSEQUENCE, and it is a latent hazard independent of this knob: writing ChosenTitle at
+        // bit 25 makes the client run the MAP reader over a title value. With a title of 0 that
+        // decodes as fullReplace=0 then changeCount=0 and is inert, which is why it has never been
+        // seen; with a non-zero title the reader takes the fullReplace arm, reads a u32 count from
+        // whatever follows and calls reserve() on it - the same unbounded-count shape as the
+        // ERROR #109 freeze. Dropping ChosenTitle from the values path costs a cosmetic title
+        // refresh until the 25..31 scalars are renumbered +1, which needs each one identified
+        // individually (only bit 26's existence is proven, not what it is).
+        if (!s_questMapValues && d.ChosenTitle.HasValue) m.Set(25);       // PlayerTitle
         if (d.FakeInebriation.HasValue) m.Set(26);
         if (d.VirtualPlayerRealm.HasValue) m.Set(27);
         if (d.CurrentSpecID.HasValue) m.Set(28);
@@ -866,6 +1019,18 @@ public partial class ObjectUpdateBuilder
                 if (d.VisibleItems[i].HasValue) m.Set(73 + s + i);
             for (int i = 0; i < 6; ++i)
                 if (d.AvgItemLevel[i].HasValue) m.Set(93 + s + i);
+        }
+        // HERMES_256_QUESTMAPVALUES: keep the questID->slot map in step with QuestLog. The map is
+        // create-only today, which is why abandoning a quest leaves it in the log until relog: the
+        // values update clears the slot but the client's map still resolves the id. Set the bit
+        // whenever this update touches the quest log at all - membership may have changed, and the
+        // full-replace form is idempotent, so an unnecessary one costs bytes and nothing else.
+        bool writeQuestMap = false;
+        if (s_questMapValues && m_updateData.Guid == m_gameState.CurrentPlayerGuid)
+        {
+            for (int i = 0; i < 25; ++i)
+                if (d.QuestLog[i] != null) { writeQuestMap = true; break; }
+            if (writeQuestMap) m.Set(25);
         }
         if (ModernValuesQuestLog)
         {
@@ -908,7 +1073,45 @@ public partial class ObjectUpdateBuilder
         if (m.Get(21)) w.WriteUInt8(d.PvPRank!.Value);
         if (m.Get(23)) w.WriteUInt32(d.DuelTeam!.Value);
         if (m.Get(24)) w.WriteInt32(d.GuildTimeStamp!.Value);
-        if (m.Get(25)) w.WriteInt32(d.ChosenTitle!.Value);
+        if (m.Get(25))
+        {
+            if (s_questMapValues)
+            {
+                // QuestLogExtraMap, values form. Read from the client's own reader at 0x073F040:
+                //     u8  fullReplace
+                //     if (fullReplace != 0)  -> 0x073F600: u32 count, count x {u32 key, u32 value}
+                //     else                      u16 changeCount, then per change:
+                //                               u32 key, u8 verb, and if verb != 2 a u32 value
+                //                               (verb 2 removes the key and carries NO value)
+                // Both arms verified against Blizzard bytes in ground-truth/w15_s1.bin: packet
+                // [359] (accept 179) decodes at part byte 9 as
+                //     00 | 02 00 | 00000000 02 | b3000000 01 00000000
+                // = delta, 2 changes, remove key 0, then insert 179 -> slot 0; and packet [4612]
+                // inserts 170 -> slot 2 the same way.
+                //
+                // We take the fullReplace arm deliberately. 0x073F600 does clear() then
+                // reserve(count) then insert, so it REPLACES the map outright - which makes this
+                // idempotent and self-correcting: no delta bookkeeping to drift, and any missed
+                // update is repaired by the next one. Blizzard's own "remove key 0" change is not
+                // reproduced; there is no quest 0, and the remove arm walks an empty bucket chain
+                // and falls through, so it is a no-op we do not need.
+                var pairs = BuildQuestIdSlotPairs();
+                w.WriteUInt8(1);                       // fullReplace
+                w.WriteUInt32((uint)(pairs?.Count ?? 0));
+                if (pairs != null)
+                {
+                    foreach (var (questId, slot) in pairs)
+                    {
+                        w.WriteUInt32(questId);        // key
+                        w.WriteUInt32(slot);           // value
+                    }
+                }
+                Framework.Logging.Log.Print(Framework.Logging.LogType.Warn,
+                    $"[256-spike] questmapvalues: replaced map with {pairs?.Count ?? 0} pair(s)");
+            }
+            else
+                w.WriteInt32(d.ChosenTitle!.Value);
+        }
         if (m.Get(26)) w.WriteInt32(d.FakeInebriation!.Value);
         if (m.Get(27)) w.WriteUInt32(d.VirtualPlayerRealm!.Value);
         if (m.Get(28)) w.WriteUInt32(d.CurrentSpecID!.Value);
@@ -930,6 +1133,29 @@ public partial class ObjectUpdateBuilder
                 // ReadCreateQuestLog - the arm noQuestLogChangesMask == 1 selects, and the same
                 // 66-byte shape WritePlayerData emits on the create path.
                 var q = d.QuestLog[i];
+                // HERMES_256_QUESTLOGFULL: these entries go out in CREATE form, so every field is
+                // written whether or not the legacy delta carried it - and `?? 0` turns a field the
+                // delta simply did not mention into a real zero on the wire.
+                //
+                // For QuestID that is fatal, and it is a PRE-EXISTING bug in this path, not a
+                // consequence of the quest-map work (it is `q.QuestID ?? 0` at HEAD too). On a mob
+                // kill cmangos updates ONLY PLAYER_QUEST_LOG_x_2, the counter, so ReadQuestLogEntry
+                // returns an entry with QuestID null and we ship QuestID = 0 - which is precisely
+                // "no quest in this slot". Measured 28 Aug (proxy11.log:8359, the first kill of a
+                // kill quest):
+                //     questlog[0] id= stateFlags= progress=[1,0,0,0,,] endTime=
+                // `id=` is EMPTY, not 0 - the field was absent. The quest vanished from the log.
+                // Contrast the accept at :6794 (`id=170`) and a genuine abandon at :1434
+                // (`id=0`, present and really zero). Any kill quest is unplayable without this.
+                //
+                // The fix is to source a create-form entry from the merged legacy cache rather than
+                // from the delta: ReadValuesUpdateBlock merges each update INTO the cached
+                // dictionary in place (UpdateHandler `var dict = oldValues ?? new ...`), so the
+                // cache is the complete, current state at the moment this runs. Fields the delta
+                // omitted come back with their real values instead of zeros.
+                var cached = s_questLogFull ? ReadQuestLogEntryFromCache(i) : null;
+                if (cached != null)
+                    q = cached;
                 // Diagnostic: a finished quest does not show as complete and cannot be tracked, so
                 // record what the legacy server actually gave us per entry before guessing at the
                 // modern meaning of StateFlags.

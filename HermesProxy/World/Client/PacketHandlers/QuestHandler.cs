@@ -351,7 +351,43 @@ public partial class WorldClient
             toast.Type = 2;
         }
         SendPacketToClient(toast);
+
+        // HERMES_256_TURNINCLOSE: the reward frame does not close after a turn-in. The reward lands
+        // and SMSG_QUEST_GIVER_QUEST_COMPLETE reaches the client, so nothing is missing from the
+        // grant - what is missing is the packet that dismisses the frame.
+        //
+        // Measured, not derived. A real Blizzard turn-in of this same quest 179 is on disk in
+        // tools-256-spike/ground-truth/w15_s0.bin, and the server sequence is:
+        //     [285] SMSG_GOSSIP_COMPLETE                    (closes the previous frame)
+        //     [286] SMSG_GOSSIP_MESSAGE
+        //     [288] SMSG_QUEST_GIVER_REQUEST_ITEMS
+        //     [289] SMSG_QUEST_GIVER_OFFER_REWARD_MESSAGE
+        //     [290] SMSG_QUEST_GIVER_QUEST_COMPLETE         (39 bytes)
+        //     [291] SMSG_GOSSIP_COMPLETE                    <-- one byte, 0x00: this is the one
+        //     [292] SMSG_GOSSIP_MESSAGE                     (gossip reopens with what is left)
+        // A 2.4.3 client closed its own frame, so cmangos sends nothing after the complete and the
+        // modern frame stays up. This emits the packet Blizzard emits, in the same position.
+        //
+        // CMSG_CLOSE_INTERACTION is EXCLUDED as the cause by the same capture: the client sends it
+        // four times in Blizzard's own working turn-in too (w15_c2s.bin [812] [816] [822] [825],
+        // and after accept at [52] [54]), and it arrives AFTER the server's GOSSIP_COMPLETE. It is
+        // the client reporting a frame it has already closed, not a request awaiting an answer, so
+        // our "No handler" line for it is noise rather than the fault.
+        //
+        // The 39-byte completion body was checked byte-for-byte against Blizzard's and is NOT
+        // implicated: only the XP value (80 vs our 100 - different server) and the reward-item echo
+        // at +25 differ; the 0x40 at +24 matches. Default off.
+        if (s_turnInClose)
+        {
+            SendPacketToClient(new GossipComplete());
+            Framework.Logging.Log.Print(Framework.Logging.LogType.Warn,
+                $"[256-spike] turninclose: sent SMSG_GOSSIP_COMPLETE after quest {quest.QuestID} complete");
+        }
     }
+
+    // See the HERMES_256_TURNINCLOSE note in HandleQuestGiverQuestComplete. Default off.
+    static readonly bool s_turnInClose =
+        System.Environment.GetEnvironmentVariable("HERMES_256_TURNINCLOSE") == "1";
 
     [PacketHandler(Opcode.SMSG_QUEST_GIVER_QUEST_FAILED)]
     void HandleQuestGiverQuestFailed(WorldPacket packet)

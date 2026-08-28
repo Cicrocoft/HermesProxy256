@@ -930,6 +930,13 @@ public partial class ObjectUpdateBuilder
                 // ReadCreateQuestLog - the arm noQuestLogChangesMask == 1 selects, and the same
                 // 66-byte shape WritePlayerData emits on the create path.
                 var q = d.QuestLog[i];
+                // Diagnostic: a finished quest does not show as complete and cannot be tracked, so
+                // record what the legacy server actually gave us per entry before guessing at the
+                // modern meaning of StateFlags.
+                Framework.Logging.Log.Print(Framework.Logging.LogType.Warn,
+                    $"[256-spike] questlog[{i}] id={q.QuestID} stateFlags={q.StateFlags} " +
+                    $"progress=[{string.Join(",", System.Linq.Enumerable.Take(q.ObjectiveProgress, 6))}] " +
+                    $"endTime={q.EndTime}");
                 w.WriteInt32(q.QuestID ?? 0);
                 w.WriteUInt16((ushort)(q.StateFlags ?? 0));
                 for (int j = 0; j < 24; ++j)

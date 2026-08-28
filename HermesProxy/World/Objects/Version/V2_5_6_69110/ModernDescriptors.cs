@@ -382,6 +382,10 @@ public partial class ObjectUpdateBuilder
 
     // ON writes ActivePlayerData.MaxLevel = 70 in the create so the client shows the XP bar (a
     // character at MaxLevel 0 is treated as max-level and the bar is hidden). See WriteActivePlayerData.
+    // See the HERMES_256_QUESTSTATE0 note in the QuestLog loop. Default off.
+    static readonly bool s_questState0 =
+        System.Environment.GetEnvironmentVariable("HERMES_256_QUESTSTATE0") == "1";
+
     static readonly bool s_maxLevel70 =
         System.Environment.GetEnvironmentVariable("HERMES_256_MAXLEVEL70") == "1";
 
@@ -896,8 +900,28 @@ public partial class ObjectUpdateBuilder
                 // The wire slot count matches the model (25), but on a legacy core with a
                 // smaller log (vanilla: 20) the tail entries simply stay null - guarded anyway.
                 var q = pd != null && i1 < pd.QuestLog.Length ? pd.QuestLog[i1] : null;
+                // Diagnostic: a quest the server considers complete does not show as complete and
+                // cannot be shift-click tracked. Record what actually reaches the wire per entry —
+                // whether StateFlags carries the completion bit, or whether the objective counters
+                // arrive at all — before assuming which of the two the client reads.
+                if (q?.QuestID != null && q.QuestID != 0)
+                    Framework.Logging.Log.Print(Framework.Logging.LogType.Warn,
+                        $"[256-spike] questlog-create[{i1}] id={q.QuestID} stateFlags={q.StateFlags} " +
+                        $"progress=[{string.Join(",", System.Linq.Enumerable.Take(q.ObjectiveProgress, 6))}] " +
+                        $"endTime={q.EndTime}");
                 w.WriteInt32(q?.QuestID ?? 0);        // QuestID
-                w.WriteUInt16((ushort)(q?.StateFlags ?? 0));        // StateFlags
+                // HERMES_256_QUESTSTATE0: do not pass the legacy quest state through. cmangos sets
+                // its QUEST_STATE_COMPLETE (1) on a finished quest and this writer forwarded that
+                // number into a modern field whose meaning here was never checked — the same class
+                // of unverified passthrough that has caused every other fault in this build.
+                // Ground truth says the field is simply not used that way: in a real Blizzard
+                // self-create (tools-256-spike/ap_rowine.bin) EVERY quest carries stateFlags 0x0000
+                // and the real counts live in ObjectiveProgress (quest 313 -> [8], 317 -> [4,2],
+                // 384 -> [6]). Measured symptom that fits: with our 1 on the wire the client had
+                // the objective at 8/8 and finished=true — it counts item objectives from the bags
+                // itself, and GetItemCount(750) returned 8 — yet IsQuestComplete stayed false.
+                // Default off; on, the field is written as Blizzard writes it.
+                w.WriteUInt16(s_questState0 ? (ushort)0 : (ushort)(q?.StateFlags ?? 0));        // StateFlags
                 for (int i2 = 0; i2 < 24; ++i2)
                 {
                     // 24 wire slots; the legacy field packs at most 4 objective counters

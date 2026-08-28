@@ -89,6 +89,40 @@ Full evidence in `REFERENCE-256-CLIENT.md` §137. Headline: **the vendor leg is 
 end** and needs one visual confirmation, not development. The trainer leg fails three ways, and
 repair is not a packet problem at all.
 
+#### START HERE (fresh session, 29 Aug onward)
+
+**The work is already written. This is a test-and-confirm session, not a build session.**
+
+State of the tree: **four files are modified and uncommitted, deliberately** —
+`World/Enums/V2_5_6_69110/Opcode.cs`, `World/Server/Packets/NPCPackets.cs`,
+`World/Server/Packets/SpellPackets.cs`, `World/Server/Packets/ItemPackets.cs`. They compile clean,
+every knob defaults OFF, and **none of them has ever run live.** `git status` will also show
+`activeplayer-dump.*` and `wireshark/` — those are scratch, ignore them.
+
+Read before touching anything: `REFERENCE-256-CLIENT.md` §137 (the measurements) and the T-rows
+below (the register). Then:
+
+1. **Stop the proxy, build, restart.** The proxy is the user's and needs no permission to
+   stop/build/restart. Build with `"$LOCALAPPDATA/Microsoft/dotnet/dotnet.exe" build
+   HermesProxy/HermesProxy.csproj` — and read the build-environment trap at the end of this section
+   *first*, it has cost two live tests.
+2. **Run:** `HERMES_256_TRAINEROPCODE=1 HERMES_256_TRAINER553=1 bash tools-256-spike/run256.sh`.
+   These two go together and neither works alone; see "The session, batched" below. The quest knobs
+   are already default-on in `run256.sh` and should stay on — the quest chain is committed and
+   working (`b0f8f95`), so a regression there is a signal, not noise.
+3. **Then** add `LEARNEDSPELLS3=1`, **then** `BUYITEM553=1`, one at a time.
+
+**Do not re-derive these — they are measured and closed:**
+* the vendor leg (gossip, vendor inventory, sell, repair reads, `ItemInstance`) is byte-correct
+  against live Blizzard packets. One visual confirmation, no development.
+* `TrainerID` is safe: the client has **no `Trainer` DB2** and echoes the id back. T-G.
+* OQ-1 is a plain `u8`, OQ-2 is WPP's order, `CMSG_BUY_ITEM` is 4×u32-then-`ItemInstance`. T-J/K/L.
+* `bit-inventory.md` has already been regenerated with the corrected opcode; do not regenerate again.
+
+**Still genuinely open:** whether an `ItemExtendedCost` miss is fatal or a benign null (T-G2),
+`LfgDungeonsID` (OQ-3), whether the client resolves `GossipOptionID` or only echoes it (OQ-4), and
+repair visibility, which needs an `ItemData` values-bit inventory that does not exist yet (T-F).
+
 | # | finding | status | evidence |
 |---|---|---|---|
 | — | **Gossip, `SMSG_VENDOR_INVENTORY`, `SMSG_SELL_RESPONSE`, `CMSG_SELL_ITEM`, `CMSG_REPAIR_ITEM` and the 14-byte `ItemInstance` are all measured correct** | **confirm visually, do not re-derive** | §137.1 — 3 vendor packets tile exactly (19 B header, 47 B element, 301/395 B totals); 10 sell responses byte-for-byte |

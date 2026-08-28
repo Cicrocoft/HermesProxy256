@@ -853,6 +853,21 @@ public class SpellCastRequest
         CastID = data.ReadPackedGuid128();
         Misc[0] = data.ReadUInt32();
         Misc[1] = data.ReadUInt32();
+        // 69110 puts FIVE more bytes between Misc[1] and SpellID than WPP's 5.5.0 reader (and this
+        // one) expect — a 13-byte gap, not 8. Reading at the 5.5.0 offset landed SpellID on the
+        // following zeros, so every cast reached the legacy server as spellId=0 and cmangos
+        // answered nothing at all: the reason no spell could be used. Measured on two live client
+        // packets, and only a 13-byte gap decodes both:
+        //   CastID 6 B -> SpellID @19 = 78    (Heroic Strike)
+        //   CastID 7 B -> SpellID @20 = 20594 (Stoneform, a dwarf racial)
+        // In both, the SpellXSpellVisualID immediately after is a sane modern visual id, which is
+        // what confirms the alignment rather than the spell id alone. How the five bytes split into
+        // fields is not established — they are zero in every sample — so they are consumed, not named.
+        if (ModernVersion.Uses550Engine)
+        {
+            data.ReadUInt32();
+            data.ReadUInt8();
+        }
         SpellID = data.ReadUInt32();
 
         SpellXSpellVisualID = data.ReadUInt32();
@@ -860,28 +875,60 @@ public class SpellCastRequest
         MissileTrajectory.Read(data);
         CraftingNPC = data.ReadPackedGuid128();
 
-        var optionalReagents = data.ReadUInt32();
-        var optionalCurrencies = data.ReadUInt32();
-
-        for (var i = 0; i < optionalReagents; ++i)
+        uint optionalReagents, optionalCurrencies, weightCount;
+        if (ModernVersion.Uses550Engine)
         {
-            var reagent = new SpellOptionalReagent();
-            reagent.Read(data);
-            OptionalReagents.Add(reagent);
-        }
+            // Follow WPP's 5.5.0 ReadSpellCastRequest exactly here. This reader was missing four
+            // things the reference has — a third count (RemovedModifications), the CraftingFlags
+            // byte, a sixth SendCastFlags bit, and the HasCraftingOrderID bit — and it also had the
+            // currency/reagent counts the other way round. Everything after that landed off, which
+            // is why the target came through empty and the flags decoded as "String" (the legacy
+            // packet even carried a UTF-8 replacement char, written from misread bytes). The server
+            // then answered "invalid target" for anything that needs one.
+            optionalCurrencies = data.ReadUInt32();
+            optionalReagents = data.ReadUInt32();
+            data.ReadUInt32();          // RemovedModifications count
+            data.ReadUInt8();           // CraftingFlags
 
-        for (var i = 0; i < optionalCurrencies; ++i)
+            for (var i = 0; i < optionalCurrencies; ++i)
+            {
+                var currency = new SpellExtraCurrencyCost();
+                currency.Read(data);
+                OptionalCurrencies.Add(currency);
+            }
+
+            SendCastFlags = data.ReadBits<uint>(6);
+            if (data.HasBit())
+                MoveUpdate = new();
+            weightCount = data.ReadBits<uint>(2);
+            data.HasBit();              // HasCraftingOrderID
+            Target.Read(data);
+        }
+        else
         {
-            var currency = new SpellExtraCurrencyCost();
-            currency.Read(data);
-            OptionalCurrencies.Add(currency);
-        }
+            optionalReagents = data.ReadUInt32();
+            optionalCurrencies = data.ReadUInt32();
 
-        SendCastFlags = data.ReadBits<uint>(5);
-        if (data.HasBit())
-            MoveUpdate = new();
-        var weightCount = data.ReadBits<uint>(2);
-        Target.Read(data);
+            for (var i = 0; i < optionalReagents; ++i)
+            {
+                var reagent = new SpellOptionalReagent();
+                reagent.Read(data);
+                OptionalReagents.Add(reagent);
+            }
+
+            for (var i = 0; i < optionalCurrencies; ++i)
+            {
+                var currency = new SpellExtraCurrencyCost();
+                currency.Read(data);
+                OptionalCurrencies.Add(currency);
+            }
+
+            SendCastFlags = data.ReadBits<uint>(5);
+            if (data.HasBit())
+                MoveUpdate = new();
+            weightCount = data.ReadBits<uint>(2);
+            Target.Read(data);
+        }
 
         if (MoveUpdate != null)
         {
@@ -1154,6 +1201,22 @@ public class SpellStart : ServerPacket
 {
     public SpellCastData Cast;
 
+    // HERMES_256_SPELLSTART: SMSG_SPELL_START is held back on this build (WorldSocket's
+    // s_underSized set) because the gate rated our body too short for the client's reader, and
+    // under-sending is what crashes it. Two things now argue the row is stale, as its own comment
+    // suspected: SMSG_SPELL_GO writes the SAME SpellCastData body and goes out every session
+    // without faulting, and the live Blizzard capture shows SPELL_START bodies of 104-122 bytes
+    // against our ~100 (tools-256-spike/ground-truth/w13_s2.bin, 38 samples). Releasing it alone
+    // would still leave a short body, so this pads to the largest observed length with zeros:
+    // trailing zeros make any packed guid the reader reaches Empty and any count 0, which are the
+    // safe values, while over-sending is harmless. Without SPELL_START the client never shows a
+    // cast bar, so spells with a cast time look like they do nothing even though the server casts
+    // them (power is spent and the aura lands). Default off.
+    static readonly bool s_spellStart =
+        System.Environment.GetEnvironmentVariable("HERMES_256_SPELLSTART") == "1";
+
+    const int Min550BodyBytes = 128;   // largest live body seen is 122
+
     public SpellStart() : base(Opcode.SMSG_SPELL_START, ConnectionType.Instance)
     {
         Cast = new SpellCastData();
@@ -1162,6 +1225,13 @@ public class SpellStart : ServerPacket
     public override void Write()
     {
         Cast.Write(_worldPacket);
+
+        if (s_spellStart && ModernVersion.Uses550Engine)
+        {
+            int pad = Min550BodyBytes - (int)_worldPacket.GetSize();
+            for (int i = 0; i < pad; ++i)
+                _worldPacket.WriteUInt8(0);
+        }
     }
 }
 

@@ -523,7 +523,15 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
             // the packed-guid assembler dereferences a null buffer (REFERENCE-256-CLIENT.md 118).
             // These four are the ones we provably send shorter than the client's own reader consumes
             // and that go out during a normal session. Over-sending is harmless and is not listed.
-            if (ModernVersion.Uses550Engine && !s_noSendGuard && s_underSized.Contains(universalOpcode))
+            // HERMES_256_SPELLSTART lifts the hold-back for SMSG_SPELL_START only: the live 69110
+            // capture supplies the session its comment was waiting for (38 real bodies, 104-122
+            // bytes), SMSG_SPELL_GO already ships the same SpellCastData body every session without
+            // faulting, and SpellStart.Write pads to 128 bytes so the reader cannot run off the end.
+            // Held back, there is no cast bar and spells with a cast time look like they do nothing
+            // even though the server casts them.
+            bool releasedByKnob = s_spellStart && universalOpcode == Opcode.SMSG_SPELL_START;
+            if (ModernVersion.Uses550Engine && !s_noSendGuard && !releasedByKnob
+                && s_underSized.Contains(universalOpcode))
             {
                 Log.Print(LogType.Warn,
                     $"[256-spike] holding back {universalOpcode}: our body is shorter than the " +
@@ -1498,6 +1506,8 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
             // body. The capture is from the old writer at the old opcode, so it is very likely a
             // stale row - but the criterion is the one that has predicted every crash so far, and
             // this fires 153x a session. Remove once one session's capture clears it.
+            // HERMES_256_SPELLSTART=1 releases it at the guard below (the live 69110 capture is the
+            // session this row was waiting for).
             Opcode.SMSG_SPELL_START,
             Opcode.SMSG_MAIL_QUERY_NEXT_TIME_RESULT,   // number known (0x460205) but the body is 8
                                                        // bytes against a 26-byte minimum; move both
@@ -1508,6 +1518,10 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
 
     static readonly bool s_noSendGuard =
         System.Environment.GetEnvironmentVariable("HERMES_256_NOGUARD") == "1";
+
+    // See the guard in SendPacket and SpellStart.Write. Releases only SMSG_SPELL_START.
+    static readonly bool s_spellStart =
+        System.Environment.GetEnvironmentVariable("HERMES_256_SPELLSTART") == "1";
 
     public void SendFeatureSystemStatus()
     {

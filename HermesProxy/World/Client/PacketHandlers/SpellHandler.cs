@@ -10,12 +10,25 @@ namespace HermesProxy.World.Client;
 
 public partial class WorldClient
 {
+    // See the HERMES_256_KNOWNSPELLSLOGIN note in HandleSendKnownSpells. Default off.
+    static readonly bool s_knownSpellsLogin =
+        System.Environment.GetEnvironmentVariable("HERMES_256_KNOWNSPELLSLOGIN") == "1";
+
     // Handlers for SMSG opcodes coming the legacy world server
     [PacketHandler(Opcode.SMSG_SEND_KNOWN_SPELLS)]
     void HandleSendKnownSpells(WorldPacket packet)
     {
         SendKnownSpells spells = new SendKnownSpells();
         spells.InitialLogin = packet.ReadBool();
+
+        // HERMES_256_KNOWNSPELLSLOGIN: the legacy 2.4.3 SMSG_INITIAL_SPELLS opens with a byte that
+        // cmangos always sends as 0, so InitialLogin reaches the modern client as FALSE. The live
+        // Blizzard 69110 capture sends this packet ONCE with the bit SET (body byte 0 = 0x80,
+        // MSB-first; ours is 0x00 — tools-256-spike/ground-truth/w13_s2.bin). On the modern client
+        // that bit is what marks the spellbook's initial population rather than an incremental
+        // change. Default off.
+        if (s_knownSpellsLogin && ModernVersion.Build == ClientVersionBuild.V2_5_6_69110)
+            spells.InitialLogin = true;
         ushort spellCount = packet.ReadUInt16();
         for (ushort i = 0; i < spellCount; i++)
         {

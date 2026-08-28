@@ -320,6 +320,14 @@ public partial class ObjectUpdateBuilder
         if (typeFlag == 0)
             return false;
 
+        // Diagnostic: parts are concatenated with no length prefix, so if any part's payload does
+        // not match what its own mask promises, every later part is read at the wrong offset. This
+        // prints each part's byte length so a seam can be located without guessing.
+        if (parts.Count > 1)
+            Framework.Logging.Log.Print(Framework.Logging.LogType.Warn,
+                $"[256-spike] values parts flag=0x{typeFlag:X} lengths=[{string.Join(",", parts.ConvertAll(p => p.Length))}]" +
+                $" hex={string.Join("|", parts.ConvertAll(p => System.Convert.ToHexString(p)))}");
+
         body.WriteUInt32(typeFlag);
         foreach (var part in parts)
             body.WriteBytes(part);

@@ -187,6 +187,13 @@ public partial class WorldSocket
             packet.WriteUInt8((byte)cast.Cast.SendCastFlags);
         }
         WriteSpellTargets(cast.Cast.Target, targetFlags, packet);
+        // Diagnostic: the legacy server answered three Heroic Strike casts with nothing at all, so
+        // record what we actually put on its wire — the spell id, which routing branch was taken,
+        // the translated target flags and the final bytes.
+        Framework.Logging.Log.Print(Framework.Logging.LogType.Warn,
+            $"[256-spike] CAST spellId={cast.Cast.SpellID} nextMelee={isNextMelee} autoRepeat={isAutoRepeat}" +
+            $" modernFlags={cast.Cast.Target?.Flags} legacyFlags={targetFlags} unit={cast.Cast.Target?.Unit}" +
+            $" -> legacy bytes={System.Convert.ToHexString(packet.GetData())}");
         SendPacketToServer(packet);
     }
     [PacketHandler(Opcode.CMSG_PET_CAST_SPELL)]

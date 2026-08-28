@@ -997,35 +997,44 @@ public partial class ObjectUpdateBuilder
         // the InvSlots array is UNGATED (proven: the InvSlots-only body works without any group gate).
         if (s_apdInv116)
         {
-            var m69 = new UfMask(14);
+            // ActivePlayerData's block-presence header is FIFTEEN bits on this build, not fourteen.
+            // The reader calls its mask setup with 0xf and loops 15 times, and its field tests reach
+            // mask word 14 — bits a 14-word mask cannot address at all. Decoding a capture with 14
+            // shifts every observed bit down by exactly 33 (one missing block plus one leftover
+            // header bit), which is the whole reason "Coinage = 9, no gate" and "Coinage = 42, gated
+            // by 32" ever looked like different answers: they are the SAME field, and re-decoding
+            // the same packets at width 15 turns {9} into {32, 42} with the identical u64 payload.
+            // So this uses the client's real numbering throughout.
+            var m69 = new UfMask(15);
             var log = new System.Text.StringBuilder();
 
-            // Coinage is bit 9, with NO group gate. Measured from the live capture, which is the
-            // only authority that has held up here: across the session bit 9's u64 payload runs
-            // 6, 11, 14, 18, 24, 31, 43, 55, 58, 73 — a player looting money repeatedly — and drops
-            // to 17 and 63 exactly where the capture also shows vendor traffic, i.e. purchases. One
-            // block carries bit 9 ALONE, which is what proves no gate is needed.
-            // The earlier 42-with-gate-32 came from reading the update reader's decompile and was
-            // WRONG: it produced a body that decodes perfectly yet left GetMoney on the old value,
-            // while the create path (a different layout) delivered the right one. Bit numbering on
-            // this build shifts by a different amount per region — Coinage 33->9 is -24 where
-            // InvSlots 136->116 is -20 — so nothing here may be derived; it has to be measured.
-            // XP and NextLevelXP are therefore NOT emitted: their numbers were derived the same
-            // discredited way, and a wrong bit does not merely lose the field, it can desync the
-            // whole body. They stay out until a capture pins them the way bit 9 was pinned.
+            // Scalars 33-63 sit behind group gate 32. Contiguous run, confirmed both by the reader's
+            // own ascending object offsets and by field-shape alignment to 5.5.3:
+            //   42 Coinage u64 (+0x58), 43 AccountBankCoinage (+0x60), 44 XP (+0x68),
+            //   45 NextLevelXP (+0x6C).
             bool wantCoinage = d.Coinage.HasValue;
-            if (wantCoinage) { m69.Set(9); log.Append($" Coinage={d.Coinage}"); }
-            if (d.XP.HasValue || d.NextLevelXP.HasValue)
-                log.Append(" (XP/NextXP held back — bit numbers unverified)");
+            bool wantXP = d.XP.HasValue;
+            bool wantNextXP = d.NextLevelXP.HasValue;
+            if (wantCoinage || wantXP || wantNextXP)
+            {
+                m69.Set(32);
+                if (wantCoinage) { m69.Set(42); log.Append($" Coinage={d.Coinage}"); }
+                if (wantXP)      { m69.Set(44); log.Append($" XP={d.XP}"); }
+                if (wantNextXP)  { m69.Set(45); log.Append($" NextXP={d.NextLevelXP}"); }
+            }
 
+            // InvSlots: gate 149, entries 150+i. Under the old 14-bit reading these were 116 and
+            // 117+i — the same bits, 33 lower. That numbering happened to work because a gate and
+            // its entries share one mask word and therefore shift together; Coinage did not, because
+            // its gate lives in the word before it, which no 14-bit encoding can reach.
             var slots = new System.Collections.Generic.List<int>();
             if (s_invSlots && (ModernValuesArrays || m_updateData.ForceApdValuesTest))
                 for (int i = 0; i < 146; ++i)
                     if (GetModern69110InvSlot(d, i) != null) slots.Add(i);
             if (slots.Count > 0)
             {
-                m69.Set(116);                      // InvSlots gate (ungated array — no group gate)
-                foreach (int i in slots) m69.Set(117 + i);
+                m69.Set(149);
+                foreach (int i in slots) m69.Set(150 + i);
             }
 
             if (!m69.Any)
@@ -1034,9 +1043,10 @@ public partial class ObjectUpdateBuilder
             var w69 = new WorldPacket();
             m69.WriteHierarchical(w69);
             w69.FlushBits();
-            // Payloads in ascending bit order: scalars (dword-1) then InvSlots guids (dword-3+).
-            if (m69.Get(9)) w69.WriteUInt64(d.Coinage!.Value);
-            if (m69.Get(116))
+            if (m69.Get(42)) w69.WriteUInt64(d.Coinage!.Value);
+            if (m69.Get(44)) w69.WriteInt32(d.XP!.Value);
+            if (m69.Get(45)) w69.WriteInt32(d.NextLevelXP!.Value);
+            if (m69.Get(149))
                 foreach (int i in slots)
                 {
                     var g = GetModern69110InvSlot(d, i)!.Value;

@@ -658,7 +658,17 @@ public class InventoryChangeFailure : ServerPacket, ISpanWritable
 
     public override void Write()
     {
-        _worldPacket.WriteInt8((sbyte)BagResult);
+        // 69110 reads BagResult as an int32, not the int8 every other build here uses. Looting with
+        // full bags CRASHED the client: the one-byte result left the body three bytes short at the
+        // very front, so both packed-guid mask bytes came from the wrong place and a length-variable
+        // read ran off the end — the documented way to fault this client (REFERENCE 118).
+        // Blizzard's own body is 18 bytes and decodes exactly under the int32 reading:
+        //   3d000000 | 9fe04dc1117e034024640c | 0000 | 00
+        //   result 61  item packed guid (11 B)   empty  ContainerBSlot
+        if (ModernVersion.Uses550Engine)
+            _worldPacket.WriteInt32((int)BagResult);
+        else
+            _worldPacket.WriteInt8((sbyte)BagResult);
         _worldPacket.WritePackedGuid128(Item[0]);
         _worldPacket.WritePackedGuid128(Item[1]);
         _worldPacket.WriteUInt8(ContainerBSlot); // bag type subclass, used with EQUIP_ERR_EVENT_AUTOEQUIP_BIND_CONFIRM and EQUIP_ERR_WRONG_BAG_TYPE_2
@@ -690,7 +700,12 @@ public class InventoryChangeFailure : ServerPacket, ISpanWritable
     public int WriteToSpan(Span<byte> buffer)
     {
         var writer = new SpanPacketWriter(buffer);
-        writer.WriteInt8((sbyte)BagResult);
+        // Must match Write() above — see the note there. This is the path that actually ran when
+        // looting with full bags crashed the client, because ISpanWritable takes precedence.
+        if (ModernVersion.Uses550Engine)
+            writer.WriteInt32((int)BagResult);
+        else
+            writer.WriteInt8((sbyte)BagResult);
         writer.WritePackedGuid128(Item[0].Low, Item[0].High);
         writer.WritePackedGuid128(Item[1].Low, Item[1].High);
         writer.WriteUInt8(ContainerBSlot);

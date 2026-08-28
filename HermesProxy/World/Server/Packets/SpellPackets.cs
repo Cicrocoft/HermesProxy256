@@ -267,6 +267,25 @@ public class SupercededSpells : ServerPacket, ISpanWritable
 
 public class LearnedSpells : ServerPacket, ISpanWritable
 {
+    /// <summary>
+    /// HERMES_256_LEARNEDSPELLS3=1 writes a THIRD leading uint32 in the 5.5.x arm.
+    /// </summary>
+    /// <remarks>
+    /// A 69110 deviation from the 5.5.0 reference, visible only in the live capture: packet
+    /// [5432] of capture #13 is
+    /// <c>01000000 | 00000000 | 00000000 | 00 | 111a0000 | 00</c> = 18 bytes for one spell —
+    /// three u32, then the flushed SuppressMessaging byte, then a 5-byte LearnedSpellInfo
+    /// (u32 SpellID + 4 presence bits). We write two u32 before the bit byte, giving 14, and
+    /// WowPacketParser 5.5.0's HandleLearnedSpells also reads only two — so no reference carries
+    /// this, and the capture is the only witness. Spell 6673 sits at offset 13 live and at
+    /// offset 9 in ours, so today the client learns a garbage id.
+    ///
+    /// Both candidate names for the extra field are zero in the capture, so the byte stream is
+    /// identical whichever it is and the naming cannot affect correctness. Default OFF.
+    /// </remarks>
+    private static readonly bool UseThirdHeaderWord =
+        System.Environment.GetEnvironmentVariable("HERMES_256_LEARNEDSPELLS3") == "1";
+
     // Practical cap - usually 1 spell per trainer click, hunter pet quest ~5
     private const int MaxSpells = 8;
 
@@ -283,6 +302,8 @@ public class LearnedSpells : ServerPacket, ISpanWritable
             // list does not exist on this engine.
             _worldPacket.WriteInt32(Spells.Count);
             _worldPacket.WriteUInt32(SpecializationID);
+            if (UseThirdHeaderWord)
+                _worldPacket.WriteUInt32(0);    // 69110-only third header word; zero on live
             _worldPacket.WriteBit(SuppressMessaging);
             _worldPacket.FlushBits();
 
@@ -312,8 +333,10 @@ public class LearnedSpells : ServerPacket, ISpanWritable
         _worldPacket.FlushBits();
     }
 
-    // MaxSize: 3 int32 (12) + 2 lists capped at 8 (5 bytes each on 5.5.x) + 1 bit byte = 77
-    public int MaxSize => 12 + MaxSpells * 5 * 2 + 1;
+    // MaxSize: 3 int32 (12) + the optional 69110 third header word (4) + 2 lists capped at 8
+    // (5 bytes each on 5.5.x) + 1 bit byte. Counted unconditionally so LEARNEDSPELLS3 cannot
+    // under-rent the pooled buffer.
+    public int MaxSize => 12 + 4 + MaxSpells * 5 * 2 + 1;
 
     public int WriteToSpan(Span<byte> buffer)
     {
@@ -324,9 +347,12 @@ public class LearnedSpells : ServerPacket, ISpanWritable
 
         if (ModernVersion.Uses550Engine)
         {
-            // Keep in lockstep with Write()'s 5.5.x arm.
+            // Keep in lockstep with Write()'s 5.5.x arm. LearnedSpells is ISpanWritable, so
+            // Packet.WritePacketData prefers THIS arm and fixing Write() alone ships nothing.
             writer.WriteInt32(Spells.Count);
             writer.WriteUInt32(SpecializationID);
+            if (UseThirdHeaderWord)
+                writer.WriteUInt32(0);          // 69110-only third header word; zero on live
             writer.WriteBit(SuppressMessaging);
             writer.FlushBits();
 

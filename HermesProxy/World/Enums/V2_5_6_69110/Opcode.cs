@@ -981,18 +981,44 @@ public enum Opcode : uint
     // ONCE in the whole dispatcher index. Its sibling 0x460188 is the equally unique
     // guid, u32, guid, u64 of SMSG_THREAT_UPDATE, which cannot move there yet because
     // SMSG_TRAINER_LIST is squatting on it; see the Phase 0 report.
+    //
+    // 28 Aug: the squatter is evicted. The prediction above was confirmed twice over, and
+    // both confirmations are measurements rather than alignments:
+    //   * live capture #13 carries 29 packets on 0x460188, every one exactly 32 bytes
+    //     decoding as packed guid + u32 count=1 + packed guid + int64 - one unit, one
+    //     entry, one threat value. No trainer list is 32 bytes.
+    //   * the client's own reader for 0x460188 (dispatcher case 0x622897, class stub
+    //     0x5BB8E0) reads GUID U32 GUID U64 and nothing else.
+    // The real trainer list is 0x46018D: capture #13 [5424] is 232 bytes with zero slack,
+    // carrying TrainerID 22, five Dun Morogh warrior-trainer spells and the greeting, and
+    // the client's reader for it (0x5BBB90, reached from the dispatcher case 0x6229DC via
+    // the constructor 0x5BBDB0, whose GetId stub 0x5BBDA0 is literally
+    // `mov dword ptr [rdx], 0x46018D`) reads exactly that layout. The old counter-claim
+    // that "0x46018D is the auction family" is contradicted by both.
+    //
+    // Nothing in the proxy SENDS a threat message, so moving SMSG_THREAT_UPDATE onto its
+    // correct number is inert on the wire. The trainer list IS sent, so which number it
+    // goes out under stays behind HERMES_256_TRAINEROPCODE in NPCPackets.cs; with the knob
+    // off, TrainerList is constructed as SMSG_THREAT_UPDATE and still ships 0x460188.
     SMSG_HIGHEST_THREAT_UPDATE = 0x460187u,
-    SMSG_THREAT_UPDATE = 0x460184u,
+    SMSG_THREAT_UPDATE = 0x460188u,   // measured live + client reader (was 0x460184)
+    // Unverified: 0x460185 has never been observed in any capture on disk and its reader
+    // is undecoded. 0x460189 reads GUID GUID, which is the shape THREAT_REMOVE wants and
+    // would put the family contiguously at 187/188/189/18A. Shape evidence only - left
+    // alone rather than moved on inference.
     SMSG_THREAT_REMOVE = 0x460185u,
     SMSG_THREAT_CLEAR = 0x46018Au,   // aligned to CypherCore, not individually verified
     SMSG_CANCEL_AUTO_REPEAT = 0x46018Bu,   // aligned to CypherCore, not individually verified
-    SMSG_TRAINER_LIST = 0x460188u,
+    SMSG_TRAINER_LIST = 0x46018Du,   // measured live [5424] + client reader 0x5BBB90 (was 0x460188)
     SMSG_TRAINER_BUY_FAILED = 0x46018Eu,   // aligned to CypherCore, not individually verified
     SMSG_CRITERIA_UPDATE = 0x460062u,   // displaced placeholder, real value unknown
     SMSG_CHAR_CUSTOMIZE_FAILURE = 0x460190u,   // aligned to CypherCore, not individually verified
     SMSG_CHAR_CUSTOMIZE_SUCCESS = 0x460191u,   // aligned to CypherCore, not individually verified
-    // 0x46018D is the auction family: its reader takes a guid then ~40 bytes, so an 8-byte
-    // time body starved it and faulted the guid assembler twice today. 0x460183 is the
+    // 0x46018D was called "the auction family: its reader takes a guid then ~40 bytes", and
+    // an 8-byte time body starved it and faulted the guid assembler twice. That reasoning
+    // was never discriminating - a trainer-list header is also a guid then 19+ bytes - and
+    // 28 Aug's capture shows 0x46018D IS SMSG_TRAINER_LIST. The conclusion below is
+    // unaffected and stands on its own evidence. 0x460183 is the
     // client's own compile-time id for this class (GetId stub at RVA 0x5BB540), its reader
     // at 0x5BB550 takes u32, u32 and one bit, and WowPacketParser 5.5.0 agrees at index
     // 0x183 with zero drift. See REFERENCE-256-CLIENT.md section 118.

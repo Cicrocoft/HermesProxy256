@@ -443,14 +443,72 @@ public class BuyBankSlot : ClientPacket
     public WowGuid128 Guid;
 }
 
+/// <summary>
+/// Knobs for the two independent faults in SMSG_TRAINER_LIST on build 69110. Both default OFF,
+/// so turning neither on reproduces the wire bytes this build has always shipped.
+/// </summary>
+/// <remarks>
+/// They are separate because they fail differently. TRAINEROPCODE only changes which number the
+/// packet goes out under; TRAINER553 only changes the body. Turning on the opcode alone delivers
+/// a wrongly-shaped body to the real trainer reader; turning on the body alone delivers a
+/// correctly-shaped trainer list to the threat-update reader. Neither is expected to work by
+/// itself — the point of splitting them is that a negative result then says WHICH half was wrong.
+/// </remarks>
+internal static class Trainer256
+{
+    /// <summary>
+    /// HERMES_256_TRAINEROPCODE=1 ships the trainer list under 0x46018D, the number the client's
+    /// own GetId stub (RVA 0x5BBDA0) returns for the class whose reader parses a trainer list.
+    /// With the knob off it ships under 0x460188, which capture #13 and the client's reader both
+    /// show is SMSG_THREAT_UPDATE — see the comment block in V2_5_6_69110/Opcode.cs.
+    /// </summary>
+    public static readonly bool UseTrainerOpcode =
+        System.Environment.GetEnvironmentVariable("HERMES_256_TRAINEROPCODE") == "1";
+
+    /// <summary>
+    /// HERMES_256_TRAINER553=1 writes the header and element the client actually reads.
+    /// </summary>
+    /// <remarks>
+    /// Measured off the client's reader at RVA 0x5BBB90 and corroborated byte-for-byte by capture
+    /// #13 [5424] (232 B, no slack). Two independent deviations from what we ship today, and in a
+    /// linear unmasked body either one is fatal from its own offset onward:
+    ///
+    ///   * the header's TrainerType is <b>one byte</b>, not an int32. The reader calls the u8
+    ///     primitive (0x2D9E4B0) once at 0x5BBBBD and stores the whole byte to [obj+0x30] with no
+    ///     shift and no mask — so it is a plain u8, not WriteBits(2)+FlushBits, which would have
+    ///     needed a >>6 to recover. That makes our header 3 bytes too long.
+    ///   * the element is <b>34 bytes</b>, not 30: an extra u32 sits between ReqAbility[2] and
+    ///     Usable. The reader writes object offsets 0x00,0x04,0x08,0x0C, then a three-trip inner
+    ///     loop into 0x10/0x14/0x18 (that loop is what pins ReqAbility[3] rather than naming it by
+    ///     analogy), then 0x1C, then two u8 at 0x20/0x21, and advances r15 by 0x24 per element.
+    ///     WowPacketParser 5.5.0 NpcHandler.cs:279-288 reads the same order and calls the extra
+    ///     field Unk440.
+    ///
+    /// Unk440 has no 2.4.3 source and is 0 in all five live elements, so it is written as zero and
+    /// must stay that way: filling a field with a plausible value is how two of this project's
+    /// crashes happened.
+    /// </remarks>
+    public static readonly bool Use553Layout =
+        System.Environment.GetEnvironmentVariable("HERMES_256_TRAINER553") == "1";
+}
+
 public class TrainerList : ServerPacket, ISpanWritable
 {
-    public TrainerList() : base(Opcode.SMSG_TRAINER_LIST, ConnectionType.Instance) { }
+    // With TRAINEROPCODE off this resolves to 0x460188 — the same number, and therefore the same
+    // wire behaviour, as before the enum was corrected. See Trainer256.UseTrainerOpcode.
+    public TrainerList()
+        : base(Trainer256.UseTrainerOpcode ? Opcode.SMSG_TRAINER_LIST : Opcode.SMSG_THREAT_UPDATE,
+               ConnectionType.Instance) { }
 
     public override void Write()
     {
         _worldPacket.WritePackedGuid128(TrainerGUID);
-        _worldPacket.WriteInt32(TrainerType);
+
+        if (Trainer256.Use553Layout)
+            _worldPacket.WriteUInt8((byte)TrainerType);
+        else
+            _worldPacket.WriteInt32(TrainerType);
+
         _worldPacket.WriteUInt32(TrainerID);
 
         _worldPacket.WriteInt32(Spells.Count);
@@ -464,6 +522,9 @@ public class TrainerList : ServerPacket, ISpanWritable
             for (uint i = 0; i < 3; ++i)
                 _worldPacket.WriteUInt32(spell.ReqAbility[i]);
 
+            if (Trainer256.Use553Layout)
+                _worldPacket.WriteUInt32(0);    // Unk440 — no 2.4.3 source, zero on live, keep it zero
+
             _worldPacket.WriteUInt8((byte)spell.Usable);
             _worldPacket.WriteUInt8(spell.ReqLevel);
         }
@@ -473,10 +534,14 @@ public class TrainerList : ServerPacket, ISpanWritable
         _worldPacket.WriteString(Greeting);
     }
 
-    // MaxSize: GUID(18) + 2 ints(8) + count(4) + max 200 spells (30 each) + bits(2) + greeting(256) = 6288
-    // TrainerListSpell: 4 uints(16) + 3 reqAbility(12) + 2 bytes(2) = 30
+    // MaxSize: GUID(18) + header(12) + max 200 spells + bits(2) + greeting(256).
+    // SpellSize is the 553 element (34) unconditionally rather than per-knob: it only sizes the
+    // pooled rent, and under-renting is the failure mode that matters. The pre-553 element is
+    // 4 uints(16) + 3 ReqAbility(12) + 2 bytes(2) = 30; the 553 element adds Unk440 -> 34.
+    // The header is 12 with the knob off (int32 TrainerType + uint32 TrainerID + int32 Count) and
+    // 9 with it on, so 12 covers both.
     private const int MaxSpells = 200;
-    private const int SpellSize = 30;
+    private const int SpellSize = 34;
     private const int MaxGreetingBytes = 256;
     public int MaxSize => PackedGuidHelper.MaxPackedGuid128Size + 12 + MaxSpells * SpellSize + 2 + MaxGreetingBytes;
 
@@ -488,7 +553,14 @@ public class TrainerList : ServerPacket, ISpanWritable
 
         var writer = new SpanPacketWriter(buffer);
         writer.WritePackedGuid128(TrainerGUID.Low, TrainerGUID.High);
-        writer.WriteInt32(TrainerType);
+
+        // Keep in lockstep with Write(). Packet.WritePacketData prefers this arm whenever the
+        // packet fits MaxSize, so fixing Write() alone would change nothing on the wire.
+        if (Trainer256.Use553Layout)
+            writer.WriteUInt8((byte)TrainerType);
+        else
+            writer.WriteInt32(TrainerType);
+
         writer.WriteUInt32(TrainerID);
 
         writer.WriteInt32(Spells.Count);
@@ -501,6 +573,9 @@ public class TrainerList : ServerPacket, ISpanWritable
 
             for (int i = 0; i < 3; ++i)
                 writer.WriteUInt32(spell.ReqAbility[i]);
+
+            if (Trainer256.Use553Layout)
+                writer.WriteUInt32(0);          // Unk440
 
             writer.WriteUInt8((byte)spell.Usable);
             writer.WriteUInt8(spell.ReqLevel);

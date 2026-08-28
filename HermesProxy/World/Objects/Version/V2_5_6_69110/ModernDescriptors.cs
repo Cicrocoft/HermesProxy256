@@ -1190,9 +1190,39 @@ public partial class ObjectUpdateBuilder
         return null;
     }
 
+    /// <summary>
+    /// HERMES_256_APDOFFSETS=1 logs the wire offset of the ActivePlayerData block start, of every
+    /// dynamic-array count in the chain, and of the block end. Diagnostic only - it writes nothing.
+    /// </summary>
+    /// <remarks>
+    /// Needed to place `QuestCompleted`. Blizzard carries it as a dynamic array in this very chain
+    /// (`u32 count` + `count x u64`, count 64 live), verified in two independent captures of the
+    /// same character - `ap_rowine.bin` @9174 and `ap_w16.bin` @9211, byte-identical, and its bits
+    /// decode to that character's real quest history including 179. Its count sits 1641 bytes
+    /// before the end of the descriptor once its own 512-byte payload is discounted. Byte-aligning
+    /// our block against Blizzard's does NOT settle which of our 24 counts it is - our tail writes
+    /// zeros where Blizzard writes values, so only the zero runs match and that is not evidence.
+    /// This prints the offsets so the match is made on field order instead of on bytes.
+    /// </remarks>
+    static readonly bool s_apdOffsets =
+        System.Environment.GetEnvironmentVariable("HERMES_256_APDOFFSETS") == "1";
+
+    /// <summary>
+    /// HERMES_256_QUESTCOMPLETED=1 fills BitVectors[11] with the completed-quest bitfield, so
+    /// `C_QuestLog.IsQuestFlaggedCompleted` stops returning false for every quest. See the write
+    /// site for the measurement. Default off: it is a +516 byte create-block length change.
+    /// </summary>
+    static readonly bool s_questCompleted =
+        System.Environment.GetEnvironmentVariable("HERMES_256_QUESTCOMPLETED") == "1";
+
+    /// <summary>Words in BitVectors[11]. 64 is what live sends; TBC's highest quest bit is 3894 (61 words).</summary>
+    const uint QuestCompletedWords = 64;
+
     void WriteActivePlayerData(WorldPacket w)
     {
         var apd = m_updateData.ActivePlayerData;
+        uint apdStart = w.GetSize();
+        var apdCounts = s_apdOffsets ? new System.Collections.Generic.List<uint>() : null;
         for (int i0 = 0; i0 < 146; ++i0)
         {
             // Full slot mapping, VERIFIED against the live 69110 ActivePlayer create
@@ -1293,6 +1323,47 @@ public partial class ObjectUpdateBuilder
         // Consequence: the map shows no explored zones. Report, do not guess.
         for (int i0 = 0; i0 < 14; ++i0)
         {
+            // HERMES_256_QUESTCOMPLETED: BitVectors[11] is QuestCompleted - the bitfield the
+            // client's IsQuestFlaggedCompleted reads. Measured 29 Aug, three ways:
+            //   * in Blizzard's live ActivePlayer create the count sits at descriptor offset 9207
+            //     with 64 u64 words after it, and the client's reader stores that count to
+            //     obj+0x13A8 - which is entry 11 of this very loop (obj+0x1140 + 11*0x38);
+            //   * the 512 bytes are byte-identical across two independent captures of the same
+            //     character (ap_rowine.bin @9174, ap_w16.bin @9211);
+            //   * decoded through QuestV2.UniqueBitFlag the bits are that character's real quest
+            //     history - 170, 179, 182, 183, 218, 233, 234, 282, 400, 420, 2160, 3112, 3361,
+            //     3364, 3365, 5541 - and quest 179's bit lands exactly where the client's own bit
+            //     test says it must (bit 188 -> word (188-1)>>6 = 2, bit 187&63 = 59, set).
+            //
+            // No new logic is needed anywhere else: CompletedQuestTracker already indexes with the
+            // same (questBit-1)>>6 / &63, its store is persisted per character, and
+            // UpdateHandler.cs already fills ActivePlayerData.QuestCompleted from it.
+            //
+            // WORD COUNT is 64 because that is what live sends; TBC's highest UniqueBitFlag is
+            // 3894, which needs 61, so 64 covers the era with margin and matches the wire. This is
+            // a create-block LENGTH change (+4 +64*8 = 516 B), hence the knob. It does not widen
+            // the existing APD overhang: the client's reader consumes this field either way, so
+            // emit and consumption grow together.
+            // INDEX 9, NOT 11, AND THAT IS A SYMPTOM. The client stores this count to obj+0x13A8,
+            // which is entry 11 of ITS BitVectors array - but its cursor is 8 bytes AHEAD of our
+            // loop when it gets here: `clientfields` (walked over our own block) shows the reader
+            // taking its first BitVectors count at APD-rel 4794 while our loop's first write lands
+            // at 4802. So it consumes 8 bytes we emit BEFORE the loop as its entries 0 and 1, and
+            // its entry 11 is our entry 9. Measured, not reasoned: at i0==11 the payload came out
+            // at APD-rel 4846 and the count the client read at 4838 was still 0, and
+            // IsQuestFlaggedCompleted stayed false.
+            //
+            // Those 8 bytes are part of the ~271-byte APD overhang (the reader consumes 6288 of
+            // the 6559 we emit). When that is fixed this index MUST become 11 - it is pinned to
+            // the bug, not to the format.
+            if (s_questCompleted && i0 == 9)
+            {
+                var qc = m_updateData.ActivePlayerData?.QuestCompleted;
+                w.WriteUInt32(QuestCompletedWords);
+                for (int k = 0; k < QuestCompletedWords; ++k)
+                    w.WriteUInt64(qc != null && k < qc.Length ? (qc[k] ?? 0) : 0);
+                continue;
+            }
             w.WriteUInt32(0);        // BitVectors[i].Values size
         }
         w.WriteUInt32(0);        // CharacterDataElements size (obj+0x1450, elements deferred)
@@ -1424,29 +1495,53 @@ public partial class ObjectUpdateBuilder
         // + a separate TraitConfigs count). Names for the first 14 follow WPP's V2_5_5 order;
         // the mapping of the remaining 10 to names is unverified (shapes are known - see
         // header comment - but which name goes with which offset is not).
+        apdCounts?.Add(w.GetSize());
         w.WriteUInt32(0);        // #1  obj+0x1580  u32 elems   (DailyQuestsCompleted?)
+        apdCounts?.Add(w.GetSize());
         w.WriteUInt32(0);        // #2  obj+0x15B8  u32 elems   (Field_1000?)
+        apdCounts?.Add(w.GetSize());
         w.WriteUInt32(0);        // #3  obj+0x15F0  u32 elems   (AvailableQuestLineXQuestIDs?)
+        apdCounts?.Add(w.GetSize());
         w.WriteUInt32(0);        // #4  obj+0x1628  u32 elems   (Heirlooms?)
+        apdCounts?.Add(w.GetSize());
         w.WriteUInt32(0);        // #5  obj+0x1660  u32 elems   (HeirloomFlags?)
+        apdCounts?.Add(w.GetSize());
         w.WriteUInt32(0);        // #6  obj+0x1698  u32 elems   (Toys?)
+        apdCounts?.Add(w.GetSize());
         w.WriteUInt32(0);        // #7  obj+0x16D0  u32 elems   (Transmog?)
+        apdCounts?.Add(w.GetSize());
         w.WriteUInt32(0);        // #8  obj+0x1708  u32 elems   (ConditionalTransmog?)
+        apdCounts?.Add(w.GetSize());
         w.WriteUInt32(0);        // #9  obj+0x1740  u32 elems   (SelfResSpells? - the handler fills ActivePlayerData.SelfResSpells, but the slot name is unverified and elements would grow the block; kept 0 DELIBERATELY)
+        apdCounts?.Add(w.GetSize());
         w.WriteUInt32(0);        // #10 obj+0x1778  u32 elems   (WarbandScenes?)
+        apdCounts?.Add(w.GetSize());
         w.WriteUInt32(0);        // #11 obj+0x17B0  u32 elems
+        apdCounts?.Add(w.GetSize());
         w.WriteUInt32(0);        // #12 obj+0x17E8  u32 elems
+        apdCounts?.Add(w.GetSize());
         w.WriteUInt32(0);        // #13 obj+0x1820  u32 elems
+        apdCounts?.Add(w.GetSize());
         w.WriteUInt32(0);        // #14 obj+0x1858  u32 elems
+        apdCounts?.Add(w.GetSize());
         w.WriteUInt32(0);        // #15 obj+0x1890  u32 elems
+        apdCounts?.Add(w.GetSize());
         w.WriteUInt32(0);        // #16 obj+0x18C8  u32 elems
+        apdCounts?.Add(w.GetSize());
         w.WriteUInt32(0);        // #17 obj+0x1900  u32 elems   (CharacterRestrictions?)
+        apdCounts?.Add(w.GetSize());
         w.WriteUInt32(0);        // #18 obj+0x1938  25-byte wire elems u32,u32,u32,u8,u32,u32,u32 (TraitConfigs? read at END)
+        apdCounts?.Add(w.GetSize());
         w.WriteUInt32(0);        // #19 obj+0x1970  12-byte elems u32,u32,u32 (SpellPctModByLabel?)
+        apdCounts?.Add(w.GetSize());
         w.WriteUInt32(0);        // #20 obj+0x19A8  12-byte elems (SpellFlatModByLabel?)
+        apdCounts?.Add(w.GetSize());
         w.WriteUInt32(0);        // #21 obj+0x19E0  12-byte elems
+        apdCounts?.Add(w.GetSize());
         w.WriteUInt32(0);        // #22 obj+0x1A18  12-byte elems
+        apdCounts?.Add(w.GetSize());
         w.WriteUInt32(0);        // #23 obj+0x1AC0  struct elems via 0x742110 (TaskQuests shape)
+        apdCounts?.Add(w.GetSize());
         w.WriteUInt32(0);        // #24 obj+0x1AF8  u32 elems
         w.WriteInt32(0);        // TimerunningSeasonID (obj+0x1B30)
         w.WriteInt32(0);        // TransportServerTime (obj+0x1B34)
@@ -1590,6 +1685,16 @@ public partial class ObjectUpdateBuilder
         {
             for (int i0 = 0; i0 < s_apdPad; ++i0)
                 w.WriteUInt8(0);
+        }
+
+        if (apdCounts != null)
+        {
+            uint end = w.GetSize();
+            var sb = new System.Text.StringBuilder();
+            sb.Append($"[256-spike] APD-OFFSETS start={apdStart} end={end} len={end - apdStart}");
+            for (int i = 0; i < apdCounts.Count; ++i)
+                sb.Append($" #{i + 1}@{apdCounts[i]}(rel {apdCounts[i] - apdStart}, fromEnd {end - apdCounts[i]})");
+            Framework.Logging.Log.Print(Framework.Logging.LogType.Warn, sb.ToString());
         }
     }
 

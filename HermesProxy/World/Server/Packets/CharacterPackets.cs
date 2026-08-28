@@ -831,6 +831,26 @@ public class CreateCharacter : ClientPacket
 {
     public CreateCharacter(WorldPacket packet) : base(packet) { }
 
+    /// <summary>
+    /// HERMES_256_CHARCREATE553=1 reads the two fields WowPacketParser's 5.5.0 handler has and this
+    /// reader does not: a FOURTH leading bit (`HardcoreSelfFound`) and an `i32 TimerunningSeasonID`
+    /// between the customization count and the name.
+    /// </summary>
+    /// <remarks>
+    /// Measured 29 Aug from the server's own refusal, not guessed: creating a character produced
+    /// `SMSG_CREATE_CHAR` code 26 (`CharCreateFailed`), and cmangos' Server.log says
+    /// `Account:[5] attempted to create character of invalid Class (0) or Race (0)` - so race and
+    /// class reach the emulator as ZERO and the reader is misaligned, not the server.
+    ///
+    /// Note the fourth bit alone cannot explain that: `ReadUInt8` calls `ResetBitPos()`, and 6+3
+    /// and 6+4 bits both flush to byte 2, so race/class are read from the same offset either way.
+    /// `TimerunningSeasonID` sits after them and cannot either. Both are still corrected here
+    /// because the reference has them and they demonstrably shift the NAME and the customizations;
+    /// the diagnostic below is what will actually identify the race/class fault.
+    /// </remarks>
+    private static readonly bool Use553Layout =
+        System.Environment.GetEnvironmentVariable("HERMES_256_CHARCREATE553") == "1";
+
     public override void Read()
     {
         CreateInfo = new CharacterCreateInfo();
@@ -838,11 +858,15 @@ public class CreateCharacter : ClientPacket
         bool hasTemplateSet = _worldPacket.HasBit();
         CreateInfo.IsTrialBoost = _worldPacket.HasBit();
         CreateInfo.UseNPE = _worldPacket.HasBit();
+        if (Use553Layout)
+            _worldPacket.HasBit();          // HardcoreSelfFound - WPP 5.5.0 reads a 4th bit
 
         CreateInfo.RaceId = (Race)_worldPacket.ReadUInt8();
         CreateInfo.ClassId = (Class)_worldPacket.ReadUInt8();
         CreateInfo.Sex = (Gender)_worldPacket.ReadUInt8();
         var customizationCount = _worldPacket.ReadUInt32();
+        if (Use553Layout)
+            _worldPacket.ReadUInt32();      // TimerunningSeasonID
 
         CreateInfo.Name = _worldPacket.ReadString(nameLength);
         if (hasTemplateSet)
@@ -854,6 +878,14 @@ public class CreateCharacter : ClientPacket
         }
 
         CreateInfo.Customizations.Sort();
+
+        // The whole body, so the layout can be settled from bytes rather than from a reference.
+        var raw = _worldPacket.GetData();
+        Framework.Logging.Log.Print(Framework.Logging.LogType.Warn,
+            $"[256-spike] CHARCREATE nameLen={nameLength} race={(byte)CreateInfo.RaceId} " +
+            $"class={(byte)CreateInfo.ClassId} sex={(byte)CreateInfo.Sex} " +
+            $"customizations={customizationCount} name='{CreateInfo.Name}' " +
+            $"hasTemplateSet={hasTemplateSet} body={(raw == null ? "<null>" : Convert.ToHexString(raw))}");
     }
 
     public CharacterCreateInfo CreateInfo = null!;

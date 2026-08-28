@@ -1308,10 +1308,45 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
         SendPacket(response);
     }
 
+    /// <summary>
+    /// HERMES_256_EXPANSIONENUM=1 sends SMSG_AUTH_RESPONSE's two expansion-level bytes as Blizzard's
+    /// <c>Expansion</c> enum (Classic 0, TBC 1) instead of <see cref="LegacyVersion.ExpansionVersion"/>.
+    ///
+    /// The two are not the same number and never were. <c>ExpansionVersion</c> is the leading digit
+    /// of the version string - <c>VersionChecker.cs:315</c> parses <c>"V2_4_3_8606"</c> and returns
+    /// <b>2</b> - while the wire field is the expansion enum, where TBC is <b>1</b>. It is off by one
+    /// for every legacy build. This repo already knows that: <c>CharacterHandler.cs:340</c> writes
+    /// <c>ServerExpansionLevel = ExpansionVersion - 1</c> for SMSG_INITIAL_SETUP. This site did not.
+    ///
+    /// It is fatal specifically on 69110 because the client RESOLVES the value rather than storing
+    /// it. From the client binary (wow-256-ingame.bin):
+    ///   <c>GetMaxLevelForPlayerExpansion</c> (rva 0x0C36B40) reads the expansion level, then
+    ///   <c>cmp edi,eax / jae -> return 0</c> against the bound at rva 0x245EF0, which is literally
+    ///   <c>mov eax,2; ret</c>; only in range does it index the table at rva 0x2F7DCC8 =
+    ///   <c>{ [0]=60, [1]=70 }</c> (entry [2] onward is unrelated string data - hence the bound).
+    /// So an announced level of 2 is out of range and the call returns <b>0</b>, and every FrameXML
+    /// max-level test ("is the player at max level?") then compares the real level against 0 and is
+    /// true at every level - which hides the XP bar permanently. This is the same class of fault as
+    /// WatchedFactionIndex: a legacy-sized id in a field the client resolves against an era-sized
+    /// table (CLAUDE.md, "a legacy id is safe only in a field the client stores").
+    ///
+    /// Length-neutral: both fields are u8 either way. Default off.
+    /// </summary>
+    static readonly bool s_expansionEnum =
+        System.Environment.GetEnvironmentVariable("HERMES_256_EXPANSIONENUM") == "1";
+
     public void SendAuthResponse(BattlenetRpcErrorCode code, uint queuePos = 0)
     {
+        // Blizzard's Expansion enum is zero-based (Classic 0, TBC 1, WotLK 2); ExpansionVersion is
+        // the version string's leading digit, so it is exactly one too high. Clamp at 0 so a 1.12
+        // legacy server maps to Classic rather than underflowing a byte.
+        byte expansionLevel = s_expansionEnum
+            ? (byte)Math.Max(0, LegacyVersion.ExpansionVersion - 1)
+            : (byte)LegacyVersion.ExpansionVersion;
+
         Log.Print(LogType.Trace,
             $"[Trace] SendAuthResponse: code={code} queuePos={queuePos} legacyExpansion={LegacyVersion.ExpansionVersion} " +
+            $"sentExpansionLevel={expansionLevel} expansionEnum={s_expansionEnum} " +
             $"realmAddress=0x{_realmId.GetAddress():X8}");
         AuthResponse response = new();
         response.Result = code;
@@ -1319,8 +1354,8 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
         if (code == BattlenetRpcErrorCode.Ok)
         {
             response.SuccessInfo = new AuthResponse.AuthSuccessInfo();
-            response.SuccessInfo.ActiveExpansionLevel = (byte)LegacyVersion.ExpansionVersion;
-            response.SuccessInfo.AccountExpansionLevel = (byte)LegacyVersion.ExpansionVersion;
+            response.SuccessInfo.ActiveExpansionLevel = expansionLevel;
+            response.SuccessInfo.AccountExpansionLevel = expansionLevel;
             response.SuccessInfo.VirtualRealmAddress = _realmId.GetAddress();
             response.SuccessInfo.Time = (uint)Time.UnixTime;
 

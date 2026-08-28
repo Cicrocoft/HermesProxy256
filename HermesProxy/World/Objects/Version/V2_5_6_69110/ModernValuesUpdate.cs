@@ -118,6 +118,10 @@ public partial class ObjectUpdateBuilder
     static readonly bool s_unitArr1 =
         System.Environment.GetEnvironmentVariable("HERMES_256_UNITARR1") == "1";
 
+    // See the HERMES_256_APDONLYSELF note in WriteModernValuesUpdate. Default off.
+    static readonly bool s_apdOnlySelf =
+        System.Environment.GetEnvironmentVariable("HERMES_256_APDONLYSELF") == "1";
+
     /// <summary>
     /// A changes mask over <c>blocks * 32</c> bits, written the way 553's decoder reads it and
     /// TrinityCore's <c>WriteUpdate</c> writes it.
@@ -258,6 +262,25 @@ public partial class ObjectUpdateBuilder
                 // HERMES_256_UNITARR1 fixes it from ground truth, so it ships again when that is on.
                 bool suppressUnitSelf = s_apdInv116 && !s_unitArr1
                     && m_objectType == Enums.ObjectTypeBCC.ActivePlayer;
+
+                // HERMES_256_APDONLYSELF: a self values body carrying an APD part applies it only
+                // when the APD part stands ALONE. Measured: InvSlots updates (flag 0x80) render,
+                // while a looted-coin update (flag 0xA0 = Unit+APD) leaves GetMoney on the old value
+                // even though the body decodes perfectly — Unit part 20 B (mask 13 + Target 2 +
+                // Flags 4 + PvpFlags 1), then APD bits {32, 42} with Coinage as a u64. So the client
+                // consumes our Unit part to a different length than we wrote it, and the APD part
+                // behind it lands off. The one unverified field in it is bit 79 (PvpFlags): the live
+                // capture NEVER sets 79 — it uses 78 for the one-byte sheathe value, 35 times — so
+                // 79's width on this build is unknown. Dropping the self Unit part when an APD part
+                // is present is the same rule already applied to PlayerData, and costs only live
+                // self health/power updates (creature health is a different object and unaffected).
+                if (s_apdOnlySelf && m_objectType == Enums.ObjectTypeBCC.ActivePlayer
+                    && m_updateData.ActivePlayerData != null && m_updateData.UnitData != null)
+                {
+                    Framework.Logging.Log.Print(Framework.Logging.LogType.Warn,
+                        "[256-spike] APDONLYSELF: dropped self Unit part so the APD part stands alone");
+                    suppressUnitSelf = true;
+                }
                 if (suppressUnitSelf && m_updateData.UnitData != null)
                     Framework.Logging.Log.Print(Framework.Logging.LogType.Warn,
                         "[256-spike] APDINV116: suppressed 553-numbered Unit part on self values update");
@@ -977,16 +1000,23 @@ public partial class ObjectUpdateBuilder
             var m69 = new UfMask(14);
             var log = new System.Text.StringBuilder();
 
+            // Coinage is bit 9, with NO group gate. Measured from the live capture, which is the
+            // only authority that has held up here: across the session bit 9's u64 payload runs
+            // 6, 11, 14, 18, 24, 31, 43, 55, 58, 73 — a player looting money repeatedly — and drops
+            // to 17 and 63 exactly where the capture also shows vendor traffic, i.e. purchases. One
+            // block carries bit 9 ALONE, which is what proves no gate is needed.
+            // The earlier 42-with-gate-32 came from reading the update reader's decompile and was
+            // WRONG: it produced a body that decodes perfectly yet left GetMoney on the old value,
+            // while the create path (a different layout) delivered the right one. Bit numbering on
+            // this build shifts by a different amount per region — Coinage 33->9 is -24 where
+            // InvSlots 136->116 is -20 — so nothing here may be derived; it has to be measured.
+            // XP and NextLevelXP are therefore NOT emitted: their numbers were derived the same
+            // discredited way, and a wrong bit does not merely lose the field, it can desync the
+            // whole body. They stay out until a capture pins them the way bit 9 was pinned.
             bool wantCoinage = d.Coinage.HasValue;
-            bool wantXP = d.XP.HasValue;
-            bool wantNextXP = d.NextLevelXP.HasValue;
-            if (wantCoinage || wantXP || wantNextXP)
-            {
-                m69.Set(32);                       // group gate for dword-1 scalars (33-63)
-                if (wantCoinage) { m69.Set(42); log.Append($" Coinage={d.Coinage}"); }
-                if (wantXP)      { m69.Set(44); log.Append($" XP={d.XP}"); }
-                if (wantNextXP)  { m69.Set(45); log.Append($" NextXP={d.NextLevelXP}"); }
-            }
+            if (wantCoinage) { m69.Set(9); log.Append($" Coinage={d.Coinage}"); }
+            if (d.XP.HasValue || d.NextLevelXP.HasValue)
+                log.Append(" (XP/NextXP held back — bit numbers unverified)");
 
             var slots = new System.Collections.Generic.List<int>();
             if (s_invSlots && (ModernValuesArrays || m_updateData.ForceApdValuesTest))
@@ -1005,9 +1035,7 @@ public partial class ObjectUpdateBuilder
             m69.WriteHierarchical(w69);
             w69.FlushBits();
             // Payloads in ascending bit order: scalars (dword-1) then InvSlots guids (dword-3+).
-            if (m69.Get(42)) w69.WriteUInt64(d.Coinage!.Value);
-            if (m69.Get(44)) w69.WriteInt32(d.XP!.Value);
-            if (m69.Get(45)) w69.WriteInt32(d.NextLevelXP!.Value);
+            if (m69.Get(9)) w69.WriteUInt64(d.Coinage!.Value);
             if (m69.Get(116))
                 foreach (int i in slots)
                 {

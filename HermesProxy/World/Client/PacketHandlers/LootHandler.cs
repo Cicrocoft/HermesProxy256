@@ -11,6 +11,17 @@ namespace HermesProxy.World.Client;
 
 public partial class WorldClient
 {
+    /// <summary>
+    /// HERMES_256_LOOTREASON: send a correct `FailureReason` on a loot response.
+    ///
+    /// `LootResponse.FailureReason` defaults to `LootError.NoLoot` (17) with the comment "Most
+    /// common value", and the success path never overwrote it. So every loot response this proxy
+    /// has sent told the client there is no loot. Off by default because the field has evidently
+    /// been tolerated for a long time on other builds - turn it on, confirm, then promote.
+    /// </summary>
+    static readonly bool s_lootReason =
+        System.Environment.GetEnvironmentVariable("HERMES_256_LOOTREASON") == "1";
+
     // Handlers for SMSG opcodes coming the legacy world server
     [PacketHandler(Opcode.SMSG_LOOT_RESPONSE)]
     void HandleLootResponse(WorldPacket packet)
@@ -23,8 +34,18 @@ public partial class WorldClient
         if (loot.AcquireReason == LootType.None)
         {
             loot.FailureReason = (LootError)packet.ReadUInt8();
+            // HERMES_256_LOOTREASON: actually tell the client. Returning here swallowed a genuine
+            // "you can't loot that" in silence - the player got no message and no closed window.
+            if (s_lootReason)
+                SendPacketToClient(loot);
             return;
         }
+        // The success path never touched FailureReason, so every loot response we have ever sent
+        // carried the field's default - `LootError.NoLoot` (17), "There is no loot." Measured on
+        // the wire 29 Aug: a chest that really did contain a quest item went out as
+        // FailureReason=17, ItemCount=0, and the client sent CMSG_LOOT_RELEASE in the same second.
+        if (s_lootReason)
+            loot.FailureReason = LootError.None;
         loot.LootMethod = GetSession().GameState.GetCurrentLootMethod();
 
         loot.Coins = packet.ReadUInt32();

@@ -42,7 +42,9 @@ public enum LootError
     MasterOther = 14,   // Can't assign item to that player
     AlreadPickPocketed = 15,   // Your target has already had its pockets picked
     NotWhileShapeShifted = 16,    // You can't do that while shapeshifted.
-    NoLoot = 17    // There is no loot.
+    NoLoot = 17,   // There is no loot.
+    None = 18      // Success — nothing went wrong. WPP marks 17/18 "NC"; 18 is what a real
+                   // loot response carries, and it is what we never sent until 30 Aug.
 }
 
 // type of Loot Item in Loot View

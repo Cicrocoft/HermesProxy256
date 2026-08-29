@@ -337,6 +337,11 @@ public partial class WorldClient
         
         SendPacketToClient(quest);
 
+        // HERMES_256_QCRECREATE (default off): the completed-quest bitfield only ever applies over
+        // the create path, so push a fresh player create right after the turn-in. Sent AFTER the
+        // turn-in packet so the client has already applied the reward and removed the log entry.
+        TryReemitPlayerAsCreate($"quest {quest.QuestID} turned in");
+
         DisplayToast toast = new();
         toast.QuestID = quest.QuestID;
         if (itemId != 0 && itemCount != 0)

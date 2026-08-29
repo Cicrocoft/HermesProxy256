@@ -237,6 +237,24 @@ public partial class WorldClient
         System.Environment.GetEnvironmentVariable("HERMES_256_VALUESASCREATE") == "1";
 
     /// <summary>
+    /// HERMES_256_QCRECREATE: when a quest is turned in, re-emit the ACTIVE PLAYER as a create so
+    /// the completed-quest bitfield goes out over the path that demonstrably lands.
+    ///
+    /// Six encodings of the QuestCompleted VALUES update were tested live and all failed
+    /// identically, while a relog - which is a create - works every time. The wire format has since
+    /// been checked against TrinityCore's own `BitVector::WriteUpdate(ignoreChangesMask: true)` and
+    /// matches, and a bit-accurate emulation of the client's reader accepts our bytes, so the
+    /// remaining suspicion is that `IsQuestFlaggedCompleted` reads a cache (obj+0x14C60) that only
+    /// the create path populates - not that the encoding is wrong. Rather than keep guessing,
+    /// use the path that is byte-verified.
+    ///
+    /// This is the heavy hammer: it re-sends the whole ActivePlayerData block (~6.5 KB), so it is
+    /// worth doing on a turn-in and nowhere else. Default off.
+    /// </summary>
+    static readonly bool s_qcRecreate =
+        System.Environment.GetEnvironmentVariable("HERMES_256_QCRECREATE") == "1";
+
+    /// <summary>
     /// FIXME(256-spike): diagnostic. Prints, per player update, whether the legacy XP, next-level
     /// XP, coinage and quest-log fields are present in the incoming field set and whether the
     /// update is a create. PLAN-256 Track C asks that this be settled before the empty quest log,
@@ -1426,7 +1444,7 @@ public partial class WorldClient
             // this unit can be re-emitted as a create on 2.5.6. Snapshot a copy - the create
             // builder mutates MoveInfo via InitializePlaceholders. Only while the knob is on,
             // so other builds and the default path incur no overhead.
-            if (s_valuesAsCreate256)
+            if (s_valuesAsCreate256 || s_qcRecreate)
             {
                 lock (GetSession().GameState.ObjectCacheLock)
                     GetSession().GameState.CachedCreateMoveInfo[guid] = moveInfo.CopyFromMe();
@@ -1709,6 +1727,92 @@ public partial class WorldClient
         StoreObjectUpdateInternal(guid, type, fullMask, updates, throwawayAuras, null, true, createUpdate);
 
         updateObject.ObjectUpdates.Add(createUpdate);
+        return true;
+    }
+
+    /// <summary>
+    /// Re-emit the active player as a CreateObject1 rebuilt from the merged field cache, with the
+    /// completed-quest bitfield filled from our own tracker exactly as the real create path does.
+    /// See the HERMES_256_QCRECREATE note above for why this exists.
+    ///
+    /// On the recorded hazard: the note on TryReemitValuesUpdateAsCreate says re-creating the
+    /// active player "risks the WowCS::Archetype fault (section 32)". That fault is narrower than
+    /// the phrasing suggests - section 32 says it comes from ADDING Tag_ActivePlayer to the
+    /// fragment list, which our writer never does: a player is [CGObject, Tag_Unit, Tag_Player] and
+    /// being the active player is carried by fieldFlags = Owner instead. A relog sends exactly this
+    /// block and works. It stays behind a knob until a session confirms it.
+    /// </summary>
+    private bool TryReemitPlayerAsCreate(string reason)
+    {
+        if (!s_qcRecreate || ModernVersion.Build != ClientVersionBuild.V2_5_6_69110)
+            return false;
+
+        // Every bail-out below SAYS why. A silent `return false` here is indistinguishable from
+        // "the feature does not work", and two live test rounds were spent on 29 Aug discovering
+        // that the knob had not arrived and then that a field-end constant was missing.
+        WowGuid128 guid = GetSession().GameState.CurrentPlayerGuid;
+        if (guid == null || guid == WowGuid128.Empty)
+        {
+            Log.Print(LogType.Network, "[256-spike] QCRECREATE: no CurrentPlayerGuid");
+            return false;
+        }
+
+        // We must have created the player before, so we hold the create-time movement.
+        MovementInfo? moveInfo;
+        lock (GetSession().GameState.ObjectCacheLock)
+            GetSession().GameState.CachedCreateMoveInfo.TryGetValue(guid, out moveInfo);
+        if (moveInfo == null)
+        {
+            Log.Print(LogType.Network, "[256-spike] QCRECREATE: no cached create movement for the "
+                                       + "player - was the knob set before login?");
+            return false;
+        }
+
+        Dictionary<int, UpdateField>? updates = GetSession().GameState.GetCachedObjectFieldsLegacy(guid);
+        if (updates == null || updates.Count == 0)
+        {
+            Log.Print(LogType.Network, "[256-spike] QCRECREATE: no cached legacy fields for the player");
+            return false;
+        }
+
+        // The whole descriptor has to be repopulated from the merged state - that is what makes
+        // this equivalent to a relog's create. The LEGACY side is 2.4.3, which has no separate
+        // ActivePlayer block (that is a modern split), so ACTIVE_PLAYER_END is not defined there
+        // and PLAYER_END is the real end of the player's legacy field space.
+        int end = LegacyVersion.GetUpdateField(ActivePlayerField.ACTIVE_PLAYER_END);
+        if (end <= 0)
+            end = LegacyVersion.GetUpdateField(PlayerField.PLAYER_END);
+        if (end <= 0)
+        {
+            Log.Print(LogType.Network, "[256-spike] QCRECREATE: neither ACTIVE_PLAYER_END nor "
+                                       + "PLAYER_END resolves on the legacy build - cannot size the mask");
+            return false;
+        }
+        var fullMask = new BitArray(end);
+        foreach (var key in updates.Keys)
+        {
+            if (key >= 0 && key < end)
+                fullMask.Set(key, true);
+        }
+
+        ObjectUpdate createUpdate = new ObjectUpdate(guid, UpdateTypeModern.CreateObject1, GetSession());
+        createUpdate.CreateData.ObjectType = ObjectType.ActivePlayer;
+        // Copy: the create builder mutates MoveInfo via InitializePlaceholders.
+        createUpdate.CreateData.MoveInfo = moveInfo.CopyFromMe();
+
+        AuraUpdate throwawayAuras = new AuraUpdate(guid, true);
+        StoreObjectUpdateInternal(guid, ObjectType.ActivePlayer, fullMask, updates,
+                                  throwawayAuras, null, true, createUpdate);
+
+        // The completed-quest bitfield is not in the legacy field cache - it comes from our own
+        // tracker. This is the same line the real CreateObject1 path runs.
+        GetSession().GameState.CurrentPlayerStorage.CompletedQuests
+            .WriteAllCompletedIntoArray(createUpdate.ActivePlayerData.QuestCompleted);
+
+        UpdateObject updateObject = new UpdateObject(GetSession().GameState);
+        updateObject.ObjectUpdates.Add(createUpdate);
+        SendPacketToClient(updateObject);
+        Log.Print(LogType.Network, $"[256-spike] QCRECREATE: re-emitted the active player as a create ({reason})");
         return true;
     }
 

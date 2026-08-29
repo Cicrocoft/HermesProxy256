@@ -82,6 +82,9 @@ do not delete — move to Done with the evidence.**
 | — | **`StateFlags` excluded as the completion mechanism.** Blizzard sends `0x0000` on every quest (`ap_rowine.bin`); `HERMES_256_QUESTSTATE0` writes Blizzard's 0 and changed nothing, and the map flipped completion with `StateFlags` left at cmangos' 1. | quest log | **excluded** | two live tests |
 | P6 | **`QUESTIDMAP` regression: abandon does not clear until relog.** The map is maintained on the **create path only**; the values path has no bit for it, so after an abandon the stale pair still resolves `179 → slot 0` and the entry stays in the log. Bounded — the map is rebuilt on every create, so a relog clears it (confirmed). **A stale pair is worse than a missing one:** abandon-then-accept-something-else makes a by-id lookup return the *wrong* quest's data. | `PlayerData.QuestLogExtraMap` values path | **open — blocks committing QUESTIDMAP** | user-reported, reproduced, clears on relog as predicted |
 | P7 | **The values-mask bit for `QuestLogExtraMap` is bit 25 — measured; its payload encoding is NOT.** Bit 25 appears on all five quest-membership events in `w15_s1.bin` (packets 359, 4403, 4573, 4588, 4612) and on **none** of the progress-only or AvgItemLevel-only blocks, and those bodies carry the quest id **twice** (one is `QuestLog`'s own `QuestID`; the second has no other home). **This also explains `HERMES_256_PDSHIFT1`:** bit 25 in 553 is `ChosenTitle`, the field our create writer emits immediately *after* the map — a field inserted there takes bit 25 and pushes everything after it by one, which is the empirical +1 PDSHIFT1 already applies to `PartyType` 44, `QuestLog` 47, `VisibleItems` 73, `AvgItemLevel` 93. **The shift and the map are the same fact.** Payload is variable-length in an unresolved way (quest id at tail offset 8 in packets 359/4588, offset 3 in 4573/4612), so the bit is **not** shipped: a mis-encoded mask desyncs the cursor for every later part in the same block. | `PlayerData` values path | **open — bit measured, payload open** | `gt_pdscan.py` over 52 PlayerData values blocks; framing self-validated (7-byte progress tail ending in the 2/3/5/6/8 series) |
+| — | **Projectile spells arrive instantly — the `MissileTrajectory.TravelTime = 0` diagnosis is FALSIFIED; a computed value would deviate from the engine reference.** Measured 29 Aug, no live session. (1) `TravelTime` *is* assigned — `SpellHandler.cs:608`, but only on a legacy ≥3.0.2 stream **and** under `CastFlag.AdjustMissile`, so it is dead on the 2.4.3 path; on the wire it is 0 (`proxy-trainer.log` 03:03:21, `SMSG_SPELL_GO` 106 B decoded: SpellID `85000000`=133, Visual `859C0300`=236677, CastFlags `00010000`=0x100, CastFlagsEx/Ex2 0, CastTime `EA67B01A`, then **TravelTime 0, Pitch 0.0**, Target.Flags=2 Unit with the mob guid — structurally identical to what retail sends). (2) **The modern engine does not send a travel time for this spell class either.** TrinityCore `Spell.cpp:4796` sets `CAST_FLAG_ADJUST_MISSILE` only when `m_targets.HasTraj()`, and `4847-4851` fills `MissileTrajectory` only under that flag; `CalculateDelayMomentForDst` (`Spell.cpp:879-901`) additionally needs `HasDst()`. A unit-targeted Fireball has neither, so **retail sends TravelTime 0 and the missile still flies** — the client derives the flight from its own `SpellMisc.db2` `Speed`. **Pitch 0.0 is likewise correct**, not a gap. (3) Server side confirmed fine: `SMSG_SPELL_GO` 03:00:23 → `SMSG_SPELL_NON_MELEE_DAMAGE_LOG` 03:00:24, so cmangos already delays the damage by the flight time. **Two axes:** 2.4.3 has no such field *and does not need one*. Shipped as a probe, not a fix: `HERMES_256_MISSILETRAVEL=<ms>` (suggest 1500) writes a flat TravelTime on any `SPELL_GO` with a non-self unit hit target whose TravelTime is 0, and `HERMES_256_MISSILETRAVELFLAG=1` additionally ORs in `CastFlag.AdjustMissile` (0x00020000, identical in TrinityCore `Spell.h:111`). Length-neutral (the u32 is written on every cast). **Run value-only first, then value+flag.** If the bolt visibly takes 1.5 s, the 69110 client reads SPELL_GO's TravelTime where 3.3.5/11.x clients do not, and the distance/speed work below becomes worth doing; if nothing changes, SPELL_GO's TravelTime is **excluded** and the cause is client-side (visual / db2 resolution). | `SMSG_SPELL_GO` · `SpellHandler.cs` | **probe shipped, default off — needs one live A/B** | TrinityCore `Spell.cpp` 4796/4847-4851/879-901; wire decode of `proxy-trainer.log` 03:03:21; WPP 5.5.0 `ReadMissileTrajectoryResult` (unconditional in the body, so length-neutral) |
+| — | **If the probe comes back positive, the blocker is distance, not speed.** Inventoried, not grepped: **missile speed is on disk** — `HermesProxy/CSV/Hotfix/SpellMisc3.csv`, 51 100 rows with a `Speed` and `LaunchDelay` column keyed by `SpellID` (Fireball 133 → **24**, Frostbolt 116 → **28**, 4 715 rows with `Speed != 0`); it is the WotLK-era extract, and `SpellMisc{ModernVersion.ExpansionVersion}.csv` for our run is `SpellMisc2.csv` with **one** row, so the loader would have to name file 3 explicitly and would need gating on the knob (`GameData.LoadSpellMiscHotfixes` currently only serialises these rows into hotfix blobs; nothing keeps `Speed` in memory). **Positions are the real gap:** the proxy has no general object-position store. `GameSessionData.CachedCreateMoveInfo` is the only one and it is populated **only while `HERMES_256_VALUESASCREATE` is on** (`UpdateHandler.cs:1430`, refreshed at `MovementHandler.cs:402`). The caster's own position is cheap to add (the modern client's `CMSG_MOVE_*` pass through `World/Server/PacketHandlers/MovementHandler.cs`); the target's would need a `LastKnownPosition` fed from `SMSG_ON_MONSTER_MOVE` `StartPosition` plus create blocks, and would still miss a mob that has never moved. **Do not build either until the probe says the client reads the field.** | `GameData` / position tracking | **scoped, not started — gated on the probe** | `SpellMisc3.csv` row for 133/116; `SpellMisc2.csv` = 1 row; `CachedCreateMoveInfo` write sites |
+| — | **Unrelated but visible in the same window: the proxy locally rejects a queued cast.** `proxy-trainer.log` 03:03:21 — `CMSG_CAST_SPELL` → `SMSG_SPELL_PREPARE` (castID `03A34A…`) → **`SMSG_CAST_FAILED` spell 133 reason `0x7B`**, and the `CMSG_CAST_SPELL` is never forwarded to the legacy server. Happens while the previous cast is still in flight (its `SPELL_GO` is castID `03A349…`). Not investigated; noting it so a future session does not mistake it for a server refusal. | cast queue | **noted, not investigated** | the log window above |
 
 ### Vendors, trainers and repair — scoped 28 Aug against capture #13 (§137)
 
@@ -89,71 +92,63 @@ Full evidence in `REFERENCE-256-CLIENT.md` §137. Headline: **the vendor leg is 
 end** and needs one visual confirmation, not development. The trainer leg fails three ways, and
 repair is not a packet problem at all.
 
-#### STATE (updated 29 Aug, end of the vendor/trainer session)
+#### STATE (29 Aug, ~02:30 — read this first)
 
-**Trainer, vendor and buyback all work end to end.** Eight knobs are now default on in `run256.sh`
-and every one was confirmed in a live session, not inferred: `TRAINEROPCODE`, `TRAINER553`,
-`LEARNEDSPELLS3`, `NPCGOSSIPBIT`, `BUYITEM553`, `BUYBACKVALUES`, `INVSLOTMAP` (plus the quest chain
-that was already committed). Raw logs kept as `proxy-trainer-run1.log` … `run5.log`.
+**Committed and confirmed live tonight.** Nine knobs, all default-on in `run256.sh`, all verified in a
+live session rather than inferred:
 
-What now works: the trainer list renders and spells train and reach the spellbook immediately;
-vendors, repairers and bankers are clickable; buying delivers the item clicked; selling returns the
-money and files the item into the buyback tab with its price; buying back returns it to the bag.
+| commit | what it fixed |
+|---|---|
+| `98e8230` | trainers — list shipped under `SMSG_THREAT_UPDATE`; `u8 TrainerType`; 34-byte element; `LEARNED_SPELLS` 4 B short |
+| `9e8eb84` | vendors/repair/buyback — the `Gossip` bit, `CMSG_BUY_ITEM` layout, buyback price+timestamp, the inventory slot map |
+| `348844a` | character creation — `CMSG_CREATE_CHARACTER` skipped `i32 TimerunningSeasonID` |
+| `6a0f27d` | completed quests on the CREATE path — `QuestCompleted` is `BitVectors[11]` |
 
-**Three results worth not re-deriving, each an exclusion as much as a fix:**
+Working in-game as a result: trainers, vendors, repair access, buy/sell/buyback, character creation,
+and completed quests from previous sessions.
 
-1. **The two trainer symptoms had ONE cause.** "The spell does not appear in the spellbook" and "the
-   spell does not leave the trainer list" both came from `SMSG_LEARNED_SPELLS` being 4 bytes short.
-   The client filters the trainer list against **its own spellbook**, not against the `Usable` byte —
-   the server was already sending `Usable = 0 (Known)` while the spell still showed. There is no
-   separate list-refresh mechanism to find. Relatedly, `SMSG_TRAINER_BUY_SUCCEEDED` staying unhandled
-   is **correct**: the modern engine has no such opcode (CypherCore carries only `TrainerBuyFailed`),
-   so the `No handler` line in the log is not a gap.
-2. **It is bit 0 specifically, not "any service bit".** Adlin Pridedrift carries `QuestGiver` and the
-   client would not interact with him either. Only `Gossip` starts an interaction on this engine.
-3. **"Item not found" on buyback was not a buyback bug** but an era mismatch in `AdjustInventorySlot`
-   — see T-O. Expect the same class elsewhere: any modern→legacy index table written against the
-   wrong era's constants fails silently, on the ranges that happen to differ.
+**IN FLIGHT — one test away from done.** `ModernValuesUpdate.cs` is modified and uncommitted: the
+completed-quest bitfield on the VALUES path, so a turn-in registers without a relog (Q-2). Run it
+with `HERMES_256_QCVALUES=1 bash tools-256-spike/run256.sh`, hand in a quest, and check
+`/run print(C_QuestLog.IsQuestFlaggedCompleted(<id>))` **without relogging**. Everything about it is
+measured except whether the final encoding is right:
 
-**Still open in this subsystem:**
+* the **mechanism** is TrinityCore's (`Player.cpp:16510`): a nested changes mask,
+  `ActivePlayerData -> BitVectors -> BitVector[9] -> Values[(questBit-1)/64]`;
+* the **mask bit is 74**, read off the client at `0x7219B8` (`test dword ptr [rsp+0x40],0x400` then
+  `lea rcx,[r14+0x1140]`), by a method that self-validates — the same enumeration independently
+  reproduces Coinage 42, XP 44, NextLevelXP 45;
+* the **wire format** is the client's own two readers, `0x710090` and `0x741C20`;
+* the last change, untested, removes a `FlushBits` between the struct mask and the entry, because
+  those readers run their bits continuously where TrinityCore 11.x flushes.
 
-* **Repair (T-F) — never reached in the session, so still entirely unconfirmed.** The repairers are
-  clickable now, so it is testable. It is a values-update problem, not a packet problem, and
-  `ItemData` has no measured values numbering; expect "money went down, the durability bar did not
-  move".
-* ~~T-P: the ground-truth tooling decodes `ActivePlayerData` at 14 bits~~ — **fixed 29 Aug**, both
-  tools corrected and `bit-inventory.md` regenerated; APD identification 27/58 -> 48/59. Note this
-  never affected the proxy: the shipped encoder always used 15. It was a poisoned *reference*, and it
-  had already cost one round of confusion (the "Coinage = 9" vs "Coinage = 42" contradiction). **The
-  `ItemData` section T-F needs still does not exist** — `gt_bitinventory.py`'s `BLOCKS` decodes only
-  Object/Unit/Player/ActivePlayer, so repair remains blocked on adding `ItemData` to that tool.
-* Buyback timestamps are relative rather than Unix on our path (see the last register row).
-* `LfgDungeonsID` (OQ-3), `GossipOptionID` resolution (OQ-4), `ItemExtendedCost` misses (T-G2).
+If it still reads false, do NOT guess again — dump the bytes we send and run the client's reader over
+them, the same stream-walk that settled the create block.
 
-**A retail capture is NOT needed for any of the above.** Capture #13 already carried the ten sells
-that settled T-N and the `CMSG_REPAIR_ITEM` that T-F needs; what was missing was never data, it was
-the tool's mask width. The one thing #13 provably does not contain is a `CMSG_BUY_BACK_ITEM` — and
-that has now been settled live instead. Before asking for a new capture, name the packet #13 lacks.
+**BLOCKED ON THE MACHINE, not on us.** The Arctium launcher stopped working around 02:15 with
+`Signature verification failed: InvalidSignature`, so the last test could not run. Ruled out by
+measurement: `WowClassic.exe` untouched since 6 Aug with a valid Authenticode signature, the launcher
+itself intact and signed, no stale processes, cache clean. The failure is inside Arctium, before the
+game starts. Try running it **as administrator** first. Note two of our own 104 MB dumps
+(`wow-256-dump.exe`, `wow-256-live.exe`) sit in the game folder as unsigned PEs — they predate
+tonight, but they do not belong there.
 
-**Two traps found on 29 Aug, both fixed, both worth knowing:**
+**Three lessons from tonight that cost real time — do not repeat them:**
 
-* **`run256.sh` had dead exports.** The five quest knobs sat *after* `exec "$DOTNET"`, which replaces
-  the shell — so they never ran, and since they default OFF in C# the script alone launched with the
-  whole committed quest chain disabled while the file read as if it were on. Moved above `exec`, with
-  a barrier comment. **Nothing may be added below that line.**
-* **"the proxy is not running" is not something `tasklist | grep hermes` can tell you.** The process
-  is `.NET Host` / `dotnet.exe`. A build against a running proxy fails only at the *copy* step with
-  `MSB3027 ... locked by ".NET Host"`, and piping the build through `tail` hides the exit code, so it
-  can look like a clean build. Kill by command line (`Win32_Process ... CommandLine -like
-  '*HermesProxy.dll*'`), as `run256.sh` itself does. A real build reports ~60 warnings; **0 warnings
-  means the resource-less no-op build** described in the build-environment trap below.
+1. **A walk over a block that lacks a thing cannot prove the thing absent.** `QuestCompleted` was
+   declared "not in ActivePlayerData" because `clientfields-*.json` was walked over OUR block, where
+   the count is 0 and the element loop is never entered. It is the CLAUDE.md absence rule wearing a
+   new hat.
+2. **Go to TrinityCore for MECHANISM before going to the binary.** Four capture scans, a 128-site
+   `bts`/`btr` inventory and a caller analysis all hunted a flat mask bit that does not exist. One
+   look at `SetQuestCompletedBit` showed it is a nested mask. CLAUDE.md already says this.
+3. **Read the number, do not interpolate it.** The 553-shift analysis produced a candidate range
+   (74-78) and burned two live tests. The client's values dispatcher states the bit outright, and the
+   method validates against three fields already known.
 
-**`gate256.py` is FAILING today, and it is NOT from this work.** Three reader legs and `frag-bit`
-fail (`UnitData emit 892 / reader 898`, `PlayerData 2652 / 990`, `ActivePlayerData 6568 / 6294`).
-The gate reads none of the files this session touched — verified. Note the gate calls `streamwalk.py`
-with a hardcoded `flags=1` while the writer now ships `0x07` (VEJB=1), which is exactly the "compare
-like with like" trap: **that is a hypothesis, not a finding — it has not been checked.** Either way
-the gate needs a session of its own before it can guard anything again.
+**Also measured tonight, worth keeping:** the APD overhang is real and now partly localised — the
+reader consumes 6288 of the 6559 bytes we emit, and 8 of those bytes sit right before the
+`BitVectors` loop (which is why the create-path entry index is 9 where the client's is 11). See Q-1d.
 
 **Do not re-derive these — they are measured and closed:**
 * the vendor leg (gossip, vendor inventory, sell, repair reads, `ItemInstance`) is byte-correct
@@ -196,6 +191,12 @@ repair visibility, which needs an `ItemData` values-bit inventory that does not 
 | Q-1c | **Capture #16 is a sixth live ActivePlayer create, and it is the SAME character as `ap_rowine.bin`** — "Rowine" is at offset 3583 in `ap_w16.bin` and the QuestCompleted words are byte-identical across both. An earlier version of this row called it "a different character (Gnome warrior)"; measured false. Its value is being a **second capture of one character**, which is what made the byte-identical cross-check possible. Artifacts: `ap_w16.bin` (11360 B), `ground-truth/w16_s2.bin`, `w16.pkt`, `w16_parsed.txt`, `updates_16.bin`, `qcompleted_rowine.bin`. Block map, measured: ObjectData 0-18, UnitData 18-922 (904 B), PlayerData 922-3632 (2710 B), **ActivePlayerData 3632-11360 (7728 B)** — note the APD start is **3632**, not the 3640 this plan documented. | **asset landed** | key in 73 s; 446/446 decrypt |
 
 | C-1 | **Character creation always failed — SOLVED, confirmed live 29 Aug.** `CreateCharacter.Read()` is missing `i32 TimerunningSeasonID` between the customization count and the name (WPP 5.5.0 `CharacterHandler.cs:794` reads it), so the **name** was read as that field's four zero bytes. **One root cause, two symptoms, and the loud one pointed at the wrong thing:** the client showed "failed" with `SMSG_CREATE_CHAR` code 26 (`CharCreateFailed`), while cmangos' own `Server.log` said `Account:[5] attempted to create character of invalid Class (0) or Race (0)` — because the NUL name is forwarded as a cstring, the emulator stops at the first NUL, consumes one byte, and reads race/class out of the remaining padding. Race and class were being read correctly all along. Settled from the raw body, not from the reference: `10 80 | 03 01 01 | 05000000 | 00000000 | 66 67 66 67` = bits, race 3, class 1, sex 1, count 5, **the skipped i32**, then the real name. Note `GetData()` includes the 4-byte opcode; the body starts at +4. Result code 26 -> **24 CharCreateSuccess**, `Create Character:[Dfgd] (guid: 2)` in `Char.log`, row present in `characters`. **The missing field is version-independent, so this is an upstream HermesProxy bug rather than a 69110 deviation — a real PR candidate.** The knob also adds WPP's 4th leading bit (`HardcoreSelfFound`), which is **inert**: `ReadUInt8` calls `ResetBitPos()` and 6+3 and 6+4 bits both flush to byte 2. It is included because the reference has it, not because it fixed anything. | **SOLVED — `HERMES_256_CHARCREATE553`, now default on** | raw body in the log; cmangos `Server.log` + `Char.log`; `characters` table |
+
+| Q-2 | **SOLVED 29 Aug via the CREATE path, not the values path — `HERMES_256_QCRECREATE`.** `UpdateHandler.TryReemitPlayerAsCreate()` re-emits the active player as a `CreateObject1` rebuilt from the merged legacy field cache immediately after `SMSG_QUEST_GIVER_QUEST_COMPLETE`, with `QuestCompleted` filled from `CompletedQuests` exactly as the real create path does. Confirmed live: turn-in of quest 233 at 21:57:04, last `CMSG_PLAYER_LOGIN` at 21:56:01, `IsQuestFlaggedCompleted(233)` **true with no relog**. **The values encoding was never wrong** — it matches TrinityCore's `BitVector::WriteUpdate(ignoreChangesMask: true)` field for field (2 bits `0b11`, 32-bit count, complete element mask, flush, u64s) and a bit-accurate emulation of the client's own reader at 0x710090->0x741C20 accepts our bytes. Six encodings failed identically because the field does not reach what `IsQuestFlaggedCompleted` reads (obj+0x14C60) unless it arrives as a create; the descriptor store (obj+0x13A8) is not the getter's source. Cost is a ~6.5 KB ActivePlayerData block per turn-in, so it fires there and nowhere else. The recorded `WowCS::Archetype` hazard does not apply: section 32 says it comes from ADDING `Tag_ActivePlayer` to the fragment list, which our writer never does. **Method note:** two live rounds were lost to silent failure — the knob never reached the proxy through `Start-Process`, and `ACTIVE_PLAYER_END` does not resolve on the 2.4.3 legacy side (fallback: `PLAYER_END`). `run256.sh` now prints its live knobs and every bail-out in the method logs its reason. | **SOLVED, on by default in run256.sh** | proxy log 21:57:04; login/turn-in ordering |
+| Q-3 | **The QuestCompleted word count is per-character, not the constant 64 we ship.** w17's login create for a brand-new character (gnome rogue, level 1, guid 0x5A21427) carries **count 0** — no words at all — while Rowine's carries 64. Our writer emits 64 words unconditionally. Behaviourally harmless (64 zero words read as "nothing completed", which is correct) but it is a wire deviation and an unnecessary 516 bytes in the create block for a fresh character. Low priority; note it before any PR. | **open, cosmetic** | `ap_w17.bin` (10131 B) vs `ap_w16.bin` |
+| Q-4 | **Blizzard's own turn-in of quest 179 is now on disk, decoded — and it carries no BitVectors.** `w15_s0` is the retail connection where Dwarven Outfitters was handed in on Blizzard's Anniversary server; `worldkey_topcap.py` + WPP give `w15.pkt` / `w15_parsed.txt`. The sequence is #224 `SMSG_QUEST_GIVER_REQUEST_ITEMS` -> #225 `SMSG_QUEST_GIVER_OFFER_REWARD_MESSAGE` -> #226 `SMSG_QUEST_GIVER_QUEST_COMPLETE` (39 B, QuestId 179, XpReward 80, LaunchGossip=1, LaunchQuest=0) -> #227 `SMSG_GOSSIP_COMPLETE` -> #228 `SMSG_GOSSIP_MESSAGE`, with **zero `SMSG_UPDATE_OBJECT` on that connection**. On the object connection (`w15s1`) 683 `UpdateType: Values` blocks decode and none carries BitVectors; BitVectors appears exactly once, in the login create. **THIS IS NOT YET PROOF and must not be quoted as such**: not one ActivePlayerData values update was decoded in the whole capture - no XP anywhere despite the 80-XP turn-in, no Coinage outside the create - and 299 packets aborted mid-parse (`ReadUpdateGameObjectData`). So the APD updates are either on a connection we do not have or inside the failures. What it does establish positively: **our `SMSG_QUEST_GIVER_QUEST_COMPLETE` already matches Blizzard's** - same field set, same 39 bytes, and `QuestHandler.cs:325` already sets LaunchGossip/LaunchQuest by the same rule. If the client turns out to set the bit itself from the turn-in, Q-2 has no encoding to fix. **Next:** `wireshark-5` (the session where the flag flipped with no relog) - key recovery from `WowClassic (7).DMP` searched the full 8-aligned space with 3 oracles at window +-8 (63,923,799 candidates, 15,499 s): **NO KEY**. stride 4 running. Note the first attempt used packet 0 as its oracle, which is unencrypted, so no key could ever verify it - always take oracles from packet 2 onward. | **open — evidence gathered, conclusion withheld** | `w15_parsed.txt` #224-228; `w15s1_parsed.txt` UpdateType counts |
+| Q-6 | **`wireshark-5` is unlocked, and 50 of Blizzard's own ActivePlayerData VALUES blocks decode with bit 74 absent from every one.** Key `ddb46ee1ddef2a64ceb22dc91314be1d6577a66e55f49d52f1228ef5ca0c2183`, counter == packet index. **Two of my own mistakes made this look impossible first, and both are worth not repeating:** (a) the first oracle was packet 0, which is UNENCRYPTED - its 12 bytes are not a GCM tag and no key can ever verify it, so take oracles from the first packet whose tag is not all-zero; (b) I picked the stream by s2c volume and got the one with NO SYN, so the framed index was not the counter - two full searches (63.9M and 127.9M candidates) proved nothing. **Always check `tcp.flags.syn==1` on the stream before trusting the counter.** The world stream is the one with the handshake and heavy c2s, not the one with the most s2c. **The measurement:** `gt_apddec.py`'s 15-bit decoder over `w15_s1.bin` (the session containing the quest 179 turn-in) finds 50 pure-APD blocks (`updateTypeFlag == 0x80`) carrying bits 32, 47, 55, 56, 70, 85, 102, 134, 137, 149, 189, 192-194, 461 - **never 74**. Bit 149 is the InvSlots gate, which confirms the numbering is the shipped encoder's. **NOT YET COMPLETE:** the flag histogram is 0x80 x50, 0xA0 x29, 0xC0 x6, 0xE0 x5 - in the mixed blocks UnitData precedes the APD part and `decode_apd_body` cannot skip it, so ~40 APD-bearing blocks are unread. Do not state 'Blizzard never sends BitVectors on the values path' until those decode. **Next, bounded:** teach the decoder to skip the Unit part, or answer it from the client instead - one Ghidra query for what writes `obj+0x14C60` (the vector `IsQuestFlaggedCompleted` reads). If only the create path writes it, Q-2 has no encoding to fix and the answer is a create re-emit. | **open — 50/90 blocks decoded, bit 74 absent so far** | `w15_s1.bin` via `gt_apddec.decode_apd_body` |
+| Q-5 | **Trap: `(BitVectors) (Values) [1]` in a retail create is NOT QuestCompleted.** WPP prints only non-empty entries, and Q-3 already established that a brand-new character's QuestCompleted has **count 0** - so on a fresh-character create the one entry that does print is a different bitvector. Decoded against `QuestV2.UniqueBitFlag` its 62 words give 541, 1096, 1098, 100, 2338, 4284-4286, 235, 9596, 9612-9652 - quests a level-1 character cannot have completed. Reading it as QuestCompleted would put the entry index at 1 and overturn the measured 11 for no reason. Sanity anchor: quest 179's UniqueBitFlag is 188 -> word 2, bit 59, and word 2 is zero in that block because the character had not done it yet. | **closed — trap recorded** | `HermesProxy/CSV/QuestV2_*.csv` decode of `w15s1_parsed.txt` |
 
 **Built 28 Aug, all four knobs default OFF, compile-checked out of tree, not committed:**
 

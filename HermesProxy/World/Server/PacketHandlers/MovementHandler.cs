@@ -56,7 +56,17 @@ public partial class WorldSocket
             packet.WritePackedGuid(movement.Guid.To64());
         movement.MoveInfo.WriteMovementInfoLegacy(packet);
         SendPacketToServer(packet);
+
+        // Keep the player's LIVE position for anything that has to rebuild a player create.
+        // Without this, HERMES_256_QCRECREATE re-emits the position the character logged in at,
+        // because CachedCreateMoveInfo only refreshes on a server-sent movement block. Gated on
+        // the knob so the default path takes no copy per movement packet.
+        if (s_keepLiveMoveInfo && movement.Guid == GetSession().GameState.CurrentPlayerGuid)
+            GetSession().GameState.LivePlayerMoveInfo = movement.MoveInfo.CopyFromMe();
     }
+
+    static readonly bool s_keepLiveMoveInfo =
+        System.Environment.GetEnvironmentVariable("HERMES_256_QCRECREATE") == "1";
 
     [PacketHandler(Opcode.CMSG_MOVE_TELEPORT_ACK)]
     void HandleMoveTeleportAck(MoveTeleportAck teleport)

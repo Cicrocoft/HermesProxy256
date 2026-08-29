@@ -1757,10 +1757,16 @@ public partial class WorldClient
             return false;
         }
 
-        // We must have created the player before, so we hold the create-time movement.
-        MovementInfo? moveInfo;
-        lock (GetSession().GameState.ObjectCacheLock)
-            GetSession().GameState.CachedCreateMoveInfo.TryGetValue(guid, out moveInfo);
+        // The LIVE position first. CachedCreateMoveInfo is where the character LOGGED IN - it only
+        // refreshes on a server-sent movement block - so using it re-creates the player at the
+        // login spot, and anything reading the player's position downstream (a pathfinder, say)
+        // then works from a position the character left long ago.
+        MovementInfo? moveInfo = GetSession().GameState.LivePlayerMoveInfo;
+        if (moveInfo == null)
+        {
+            lock (GetSession().GameState.ObjectCacheLock)
+                GetSession().GameState.CachedCreateMoveInfo.TryGetValue(guid, out moveInfo);
+        }
         if (moveInfo == null)
         {
             Log.Print(LogType.Network, "[256-spike] QCRECREATE: no cached create movement for the "

@@ -150,6 +150,17 @@ public sealed class GameSessionData
     // we build a create block and refreshed from SMSG_ON_MONSTER_MOVE; keyed under ObjectCacheLock.
     public Dictionary<WowGuid128, MovementInfo> CachedCreateMoveInfo = [];
 
+    /// <summary>
+    /// The active player's LIVE movement, taken from the client's own CMSG_MOVE_* packets.
+    ///
+    /// CachedCreateMoveInfo only updates when the legacy server sends a movement block - login and
+    /// teleports - so for the player it is the login position and goes stale the moment they walk.
+    /// Anything that rebuilds a player CREATE (HERMES_256_QCRECREATE) must use this instead, or it
+    /// hands the client a position from wherever the character logged in.
+    /// Written only while that knob is on; null otherwise.
+    /// </summary>
+    public MovementInfo? LivePlayerMoveInfo;
+
     /// <summary>Updates the cached create-time position for a unit we re-emit as a create, if one exists.</summary>
     public void RefreshCachedCreatePosition(WowGuid128 guid, System.Numerics.Vector3 position)
     {

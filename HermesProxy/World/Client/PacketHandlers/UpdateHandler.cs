@@ -325,6 +325,18 @@ public partial class WorldClient
                     if (powerUpdate.Powers.Count != 0)
                         SendPacketToClient(powerUpdate);
 
+                    // FIXME(256-spike): diagnostic. A bag move produces four blocks from cmangos and
+                    // only two ever reached the client; the block builder logs creates only, so the
+                    // other two were invisible. This names every VALUES block: its guid, the object
+                    // type we resolved it to, and whether ContainerData came out of it. Without it
+                    // "we never build a container update" and "cmangos never sends one" look the same.
+                    if (ModernVersion.Build == ClientVersionBuild.V2_5_6_69110)
+                    {
+                        Log.Print(LogType.Network, $"[256-spike] VALUESBLOCK: guid={guid} " +
+                            $"type={GetSession().GameState.GetOriginalObjectType(guid)} " +
+                            $"container={(updateData.ContainerData != null ? "yes" : "no")}");
+                    }
+
                     // FIXME(phase5a-7c): Same Phase 5a skip filters as CreateObject1. V3_4_3 only —
                     // V1_14/V2_5 paths must keep all object types so zeppelins, mailboxes, chests
                     // etc. still render under Vanilla/TBC clients. Removing the filter requires
@@ -2091,6 +2103,20 @@ public partial class WorldClient
                         updateData.ContainerData.Slots[i] = GetGuidValue(updates, CONTAINER_FIELD_SLOT_1 + i * 2).To128(GetSession().GameState);
                     }
                 }
+            }
+
+            // FIXME(256-spike): diagnostic. A bag move produces a Container values block that we
+            // resolve correctly and still build nothing from, so either cmangos sets no slot bits
+            // or our index arithmetic misses them. Printing the RAW set bits next to the field
+            // bases settles which, and no amount of reading the code did.
+            if (ModernVersion.Build == ClientVersionBuild.V2_5_6_69110 && !isCreate)
+            {
+                var set = new List<int>();
+                for (int b = 0; b < updateMaskArray.Length && set.Count < 24; ++b)
+                    if (updateMaskArray[b]) set.Add(b);
+                Log.Print(LogType.Network, $"[256-spike] CONTAINERMASK: setBits=[{string.Join(",", set)}]"
+                    + $" NUM_SLOTS={LegacyVersion.GetUpdateField(ContainerField.CONTAINER_FIELD_NUM_SLOTS)}"
+                    + $" SLOT_1={CONTAINER_FIELD_SLOT_1} maskLen={updateMaskArray.Length}");
             }
         }
 

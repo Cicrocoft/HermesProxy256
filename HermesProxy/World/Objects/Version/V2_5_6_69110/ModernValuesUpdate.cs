@@ -1,4 +1,4 @@
-// The values-update (updateType 0) encoder for build 69110 - root cause 3, PLAN-256 Track C.
+﻿// The values-update (updateType 0) encoder for build 69110 - root cause 3, PLAN-256 Track C.
 //
 // WHAT THIS REPLACES. Until now the non-create branch of WriteToPacket wrote a modern fragment
 // header followed by the 2.4.3 masked update-field array that BuildValuesUpdate produces. The
@@ -105,6 +105,11 @@ public partial class ObjectUpdateBuilder
     static readonly int s_valuesUpdate =
         int.TryParse(Environment.GetEnvironmentVariable("HERMES_256_VALUESUPDATE"), out var vu) ? vu : 0;
 
+    /// <summary>HERMES_256_CONTAINERONLY=1 sends a bag's values update as the container part
+    /// alone (updateTypeFlag 4), matching Blizzard's own bag move in live4_s3_deb.</summary>
+    static readonly bool s_containerOnly =
+        Environment.GetEnvironmentVariable("HERMES_256_CONTAINERONLY") == "1";
+
     internal static bool ModernValuesEnabled => s_valuesUpdate >= 1;
     static bool ModernValuesArrays => s_valuesUpdate >= 2;
     static bool ModernValuesActive => s_valuesUpdate >= 3;
@@ -167,6 +172,48 @@ public partial class ObjectUpdateBuilder
     /// separate timestamp gate would have to sit at 350 or 351 and would break the exact +12 pairing.
     /// </para>
     /// </remarks>
+    /// <summary>HERMES_256_QCVALUES=1 emits the completed-quest bitfield on the values path.</summary>
+    static readonly bool s_qcValues =
+        System.Environment.GetEnvironmentVariable("HERMES_256_QCVALUES") == "1";
+
+    /// <summary>
+    /// HERMES_256_QCBIT overrides the ActivePlayerData changes-mask bit for `BitVectors`.
+    /// 553 has it at 65; the measured 69110 shifts are +9 (scalars) and +13 (InvSlots), so 74 and
+    /// 78 are the candidates. Default 74. This is the only guessed number in the change.
+    /// </summary>
+    static readonly int s_qcBit =
+        int.TryParse(System.Environment.GetEnvironmentVariable("HERMES_256_QCBIT"), out var _qcb) ? _qcb : 74;
+
+    /// <summary>
+    /// BitVectors entry holding QuestCompleted on the VALUES path: **11**, the client's own index
+    /// (`obj+0x13A8` = `obj+0x1140 + 11*0x38`).
+    /// </summary>
+    /// <remarks>
+    /// Deliberately NOT the 9 the create writer uses. That 9 compensates for an 8-byte offset
+    /// between our create writer's BitVectors loop and where the client's reader starts taking its
+    /// counts - a property of that byte stream. The values path builds the BitVectors changes mask
+    /// from scratch, so no such offset exists and the entry must be numbered the client's way.
+    /// Overridable with HERMES_256_QCENTRY while this is being confirmed.
+    /// </remarks>
+    static readonly int QuestCompletedEntry =
+        int.TryParse(System.Environment.GetEnvironmentVariable("HERMES_256_QCENTRY"), out var _qce) ? _qce : 11;
+
+    /// <summary>
+    /// HERMES_256_QCFLUSH=0 drops the byte-align before the u64 values. Default ON, because the
+    /// values are byte reads; set 0 only to test the alternative if the field still does not take.
+    /// </summary>
+    static readonly bool s_qcFlush =
+        System.Environment.GetEnvironmentVariable("HERMES_256_QCFLUSH") != "0";
+
+    /// <summary>
+    /// HERMES_256_QCMASKFLUSH=0 drops the byte-align between the BitVectors 32-bit block mask and
+    /// the BitVector 2-bit header. Default ON: measured correct (each of 0x710090 / 0x741C20 builds
+    /// a fresh ByteBuffer over the raw stream, so the mask is a byte-aligned unit). Set 0 only to
+    /// reproduce the old broken behaviour without a rebuild.
+    /// </summary>
+    static readonly bool s_qcMaskFlush =
+        System.Environment.GetEnvironmentVariable("HERMES_256_QCMASKFLUSH") != "0";
+
     static readonly bool s_buybackValues =
         System.Environment.GetEnvironmentVariable("HERMES_256_BUYBACKVALUES") == "1";
 
@@ -375,14 +422,36 @@ public partial class ObjectUpdateBuilder
             case Enums.ObjectTypeBCC.Container:
             {
                 var item = BuildItemDataUpdate();
-                if (item != null)
-                    Add(0x0002u, item);
                 if (m_objectType == Enums.ObjectTypeBCC.Container)
                 {
                     var container = BuildContainerDataUpdate();
+                    // HERMES_256_CONTAINERONLY: send the container part ALONE, the way Blizzard
+                    // does. Ground truth is a real bag move in `live4_s3_deb_parsed.txt`: the block
+                    // is `updateTypeFlag: 4` with one `[5] Slots` guid - no ObjectData part, no
+                    // ItemData part, IsOwned true, HasFragmentUpdates false. We prepend an
+                    // ObjectData part whenever one exists, and parts are concatenated with no
+                    // length prefix, so a leading part the client consumes to a different length
+                    // than we wrote leaves the container part reading at the wrong offset. That is
+                    // the same failure APDONLYSELF already works around for the self APD part.
+                    //
+                    // Symptom this targets: moving an item OUT of a bag leaves the source slot
+                    // greyed - the destination (an APD InvSlots update) applies, the bag's own
+                    // slot is never cleared, so the client keeps showing the item as in flight.
+                    if (s_containerOnly && container != null)
+                    {
+                        parts.Clear();
+                        typeFlag = 0;
+                        Add(0x0004u, container);
+                        break;
+                    }
+                    if (item != null)
+                        Add(0x0002u, item);
                     if (container != null)
                         Add(0x0004u, container);
+                    break;
                 }
+                if (item != null)
+                    Add(0x0002u, item);
                 break;
             }
             case Enums.ObjectTypeBCC.Unit:
@@ -521,7 +590,9 @@ public partial class ObjectUpdateBuilder
         // Diagnostic: parts are concatenated with no length prefix, so if any part's payload does
         // not match what its own mask promises, every later part is read at the wrong offset. This
         // prints each part's byte length so a seam can be located without guessing.
-        if (parts.Count > 1)
+        // Container updates are logged even when they stand alone: a bag move is exactly the
+        // case where "did we send anything at all?" was the open question.
+        if (parts.Count > 1 || (typeFlag & 0x0004u) != 0)
             Framework.Logging.Log.Print(Framework.Logging.LogType.Warn,
                 $"[256-spike] values parts flag=0x{typeFlag:X} lengths=[{string.Join(",", parts.ConvertAll(p => p.Length))}]" +
                 $" hex={string.Join("|", parts.ConvertAll(p => System.Convert.ToHexString(p)))}");
@@ -1336,6 +1407,47 @@ public partial class ObjectUpdateBuilder
                 foreach (int i in buyStamp) m69.Set(351 + i);
             }
 
+            // HERMES_256_QCVALUES: the completed-quest bitfield on the VALUES path, so a turn-in
+            // registers without a relog. Mechanism taken from TrinityCore (engine-level, which is
+            // what CLAUDE.md says to use TC for): Player::SetQuestCompletedBit writes through
+            // ActivePlayerData::BitVectors -> BitVector[idx] -> Values[word], i.e. a NESTED changes
+            // mask, which is why four captures showed no flat APD bit for it and why the bit-set
+            // scans found nothing - there is no flat field to find.
+            //
+            // Encoding, from UpdateFields.cpp BitVectors::WriteUpdate / BitVector::WriteUpdate and
+            // UpdateFieldImpl.h WriteDynamicFieldUpdateMask:
+            //   BitVectors : WriteBits(blocksMask,1); WriteBits(block0,32); FlushBits
+            //                block0 bit 0 = "has content", bit 1+entry = that entry changed
+            //   BitVector  : WriteBits(0b11,2); size as WriteBits(count,32);
+            //                count>32 -> WriteBits(maskBlock,32) per 32 entries; FlushBits;
+            //                then each changed u64
+            // We send the whole 64-word vector (all words marked changed) rather than tracking a
+            // delta: fewer branches, and it mirrors the create form we already know is right.
+            //
+            // THE BIT NUMBER IS THE ONE UNKNOWN. 553 has BitVectors at changesMask[65]; the
+            // measured 69110 shifts against 553 are +9 for the scalar region (Coinage 33->42,
+            // XP 35->44, NextLevelXP 36->45), +13 at InvSlots (136->149) and +14 at BuybackPrice
+            // (325->339). 65 sits between the +9 and +13 zones, so the candidates are 74 and 78.
+            // HERMES_256_QCBIT overrides it so a wrong guess costs one restart, not a rebuild.
+            // A wrong bit desyncs only this APD part (the values blob is length-prefixed), so the
+            // test is bounded - but it IS a guess narrowed by measurement, not a measurement.
+            if (s_qcValues && d.QuestCompleted != null)
+            {
+                int words = 0;
+                for (int i = 0; i < d.QuestCompleted.Length && i < 64; ++i)
+                    if (d.QuestCompleted[i].HasValue) words = 64;
+                if (words > 0)
+                {
+                    // NO group gate here. `s_qcBit & ~31` would set bit 64, and bit 64 is a real
+                    // FIELD on this build - the values reader gates it at 0x721596
+                    // (`test byte ptr [rsp+0x40],1`) and then writes `r14+0x111C`. Setting it told
+                    // the client that field had changed and it consumed our payload as that field.
+                    // Only bits 0 and 32 are gates (bit 0 covers 1-31, bit 32 covers 33-63);
+                    // 64 and up are plain fields needing no gate.
+                    m69.Set(s_qcBit);
+                }
+            }
+
             if (!m69.Any)
                 return null;
 
@@ -1345,13 +1457,46 @@ public partial class ObjectUpdateBuilder
             if (m69.Get(42)) w69.WriteUInt64(d.Coinage!.Value);
             if (m69.Get(44)) w69.WriteInt32(d.XP!.Value);
             if (m69.Get(45)) w69.WriteInt32(d.NextLevelXP!.Value);
-            if (m69.Get(149))
-                foreach (int i in slots)
-                {
-                    var g = GetModern69110InvSlot(d, i)!.Value;
-                    w69.WritePackedGuid128(g);
-                    log.Append($" [{i}]={g}");
-                }
+            if (s_qcValues && m69.Get(s_qcBit))
+            {
+                // BitVectors: 1-bit blocks mask, then the 32-bit block. Bit 0 marks "this struct
+                // has content", bit 1+entry marks the entry. Entry index is the same 9 the create
+                // writer uses - see the note at the BitVectors loop in ModernDescriptors.
+                // FlushBits BETWEEN the struct mask and the entry - MEASURED, was previously wrong.
+                // The three readers are NOT one continuous bit run: each builds a FRESH stack
+                // ByteBuffer over the RAW stream, so each mask is its own byte-aligned unit.
+                //   * outer 0x71B4A8 gates bit 74 then `mov rdx,r15` (r15 = the raw stream, from
+                //     0x71B4B0) and `call 0x710090` - passes the stream, not its own ByteBuffer;
+                //   * 0x710090 reads ReadBits(1)+ReadBits(32)=33 bits through a local BB at
+                //     [rbp-0x41], then `mov rdx,rsi` (rsi = the raw stream) and `call 0x741C20`
+                //     at 0x710196 - again the stream, so its 33 bits are consumed as 5 whole bytes
+                //     and the 7 leftover bits of byte 5 are DISCARDED;
+                //   * 0x741C20 builds its own BB at [rbp-0x39] and opens with ReadBits(2), which
+                //     therefore starts at a byte boundary.
+                // Bit-accurate emulation of 0x710090->0x741C20 over our own emitted bytes proved
+                // it: without this flush the entry's ReadBits(2) reads 0b00 (the tail of the
+                // 32-bit block mask) instead of 0b11, the header gate `cmp al,3; jne` fails and the
+                // whole BitVector is thrown away - which is exactly why the field never applied.
+                // With the flush ReadBits(2)=0b11, count=64, and value[0] lands. TrinityCore 11.x
+                // flushes here for the same reason; copying it was right, dropping it was the bug.
+                w69.WriteBits(1u, 1);
+                w69.WriteBits((1u << 0) | (1u << (1 + QuestCompletedEntry)), 32);
+                if (s_qcMaskFlush)
+                    w69.FlushBits();
+                // BitVector (client reader 0x741C20): ReadBits(2) must be 0b11, then ReadBits(32)
+                // for the element count, then `count` bits of update mask - one continuous bit run
+                // inside THIS ByteBuffer, byte-aligned again before the u64 values below.
+                w69.WriteBits(0b11u, 2);
+                w69.WriteBits(64u, 32);
+                w69.WriteBits(0xFFFFFFFFu, 32);
+                w69.WriteBits(0xFFFFFFFFu, 32);
+                // THIS flush stays: the u64 values that follow are byte reads.
+                if (s_qcFlush)
+                    w69.FlushBits();
+                for (int i = 0; i < 64; ++i)
+                    w69.WriteUInt64(i < d.QuestCompleted!.Length ? (d.QuestCompleted[i] ?? 0) : 0);
+                log.Append($" QuestCompleted(bit {s_qcBit}, entry {QuestCompletedEntry})");
+            }
             // Ascending bit order, so buyback follows InvSlots (338 > 295). That is also the order
             // Blizzard's own ten blocks decode in.
             foreach (int i in buyPrice)
@@ -1364,6 +1509,13 @@ public partial class ObjectUpdateBuilder
                 w69.WriteInt64(d.BuybackTimestamp[i]!.Value);
                 log.Append($" Stamp[{i}]={d.BuybackTimestamp[i]}");
             }
+            if (m69.Get(149))
+                foreach (int i in slots)
+                {
+                    var g = GetModern69110InvSlot(d, i)!.Value;
+                    w69.WritePackedGuid128(g);
+                    log.Append($" [{i}]={g}");
+                }
             Framework.Logging.Log.Print(Framework.Logging.LogType.Warn,
                 $"[256-spike] APD-VALUES(69110):{log}");
             return w69;

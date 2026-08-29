@@ -43,6 +43,18 @@ public partial class ObjectUpdateBuilder
         m_gameState = gameState;
 
         Enums.ObjectType objectType = updateData.Guid.GetObjectType();
+        // HERMES_256_CONTAINERONLY, second half. On a VALUES update CreateData is null, so the type
+        // came from the guid alone - and a bag's modern guid is an ITEM guid (Blizzard's own bag in
+        // live4_s3_deb reads `Object Guid: ... Item/0`). So every container values update was built
+        // as an Item, the `case Container` arm never ran, BuildContainerDataUpdate was never called,
+        // and the bag's own Slots never went out. Measured: cmangos sends the block, we resolve it
+        // to Container in the handler and fill Slots (CONTAINERMASK showed the exact set bits -
+        // SLOT_1=62, and a move to bag slot 0 set 62,63), and the builder then dropped it on the
+        // floor. That is why an item moved out of a bag left its source slot greyed for ever.
+        // GetOriginalObjectType falls back to the guid's own type, so this is safe for objects we
+        // never saw created.
+        if (s_containerOnly && updateData.CreateData == null)
+            objectType = gameState.GetOriginalObjectType(updateData.Guid);
         if (updateData.CreateData != null)
         {
             objectType = updateData.CreateData.ObjectType;

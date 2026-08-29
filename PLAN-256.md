@@ -248,6 +248,28 @@ Recipe for an out-of-tree check:
 `-p:DisableGitVersionTask=true` **and** a throwaway `GitVersionInformation` stub, or you get 22
 `CS0103` errors that look like real compile failures.
 
+### Death and resurrection — measured live 29 Aug, all three legs open
+
+The character dies fine. Getting back is what does not work, and it is three separate faults in one
+subsystem that has never been exercised on 2.5.6. Everything below is measured, not reasoned; the
+proxy log for the session is the 23:29-23:36 window and the crash dump is
+`_anniversary_/errors/2026-08-29_23.29.45_Crash_16112.*`.
+
+| id | what | state | evidence |
+|---|---|---|---|
+| D-1 | **The spirit healer needs the proxy to answer for the client, and doing so crashes it — but the resurrect itself SUCCEEDS.** TBC's flow is a handshake: pick the healer's gossip option -> `SMSG_SPIRIT_HEALER_CONFIRM` -> client shows "resurrect with sickness?" -> `CMSG_SPIRIT_HEALER_ACTIVATE` -> server resurrects. **`SMSG_SPIRIT_HEALER_CONFIRM` does not exist on modern builds**: absent from 69110's table, from WPP's V5_5_0 table and from TrinityCore master, which has no such packet or class. So `SendPacketToClient` resolves no opcode and drops it in silence; measured 23:13:40, the client waited two seconds and sent `CMSG_CLOSE_INTERACTION`. `HERMES_256_SPIRITHEALER` answers the legacy server on the player's behalf (they already consented by picking the gossip option). Server-side it WORKS - the character was alive afterwards - but the client took an `ACCESS_VIOLATION` (null read) in the same second, inside the burst that follows: `DEATH_RELEASE_LOC`, `MOVE_SET_LAND_WALK`, two speed changes, `CLEAR_EXTRA_AURA_INFO`, `MOVE_UNROOT`, `WEATHER` + `START_LIGHTNING_STORM`, `INIT_WORLD_STATES`, `ALL_ACCOUNT_CRITERIA`, a full `UPDATE_OBJECT` and **eleven** `AURA_UPDATE`s. The one-line send is not the fault; it is the door into an untranslated path. **Next:** resolve the crash addresses against the dump, and bisect that burst - the knob makes it reproducible on demand. | **knob exists, default OFF - it crashes the client** | proxy log 23:29:45; crash dump 23.29.45 |
+| D-2 | **The corpse is built correctly and still cannot be reclaimed: the client is never told where it is.** Not a missing create - `ObjectUpdateBuilder` emits `type=Corpse` (values=126) and `CorpseData.Owner` is filled from `CORPSE_FIELD_OWNER`. The server has the corpse too (`tbccharacters.corpse` row, type 1, at the death spot). But standing on top of it the client offers no resurrect button and **never sends `CMSG_RECLAIM_CORPSE`** (which IS in our table, 0x3F0070, so it would log by name). The hole is the lookup: **69110 has no `CMSG_QUERY_CORPSE_LOCATION_FROM_CLIENT` and no `SMSG_CORPSE_LOCATION` wiring.** V5_5_0 has them at 0x3A008C and 0x3C00EB. **Do not guess the 69110 values** - the query groups do not map as cleanly as the movement and NPC ones (`CMSG_QUERY_CREATURE` is 0x35012C -> 0x3E0132, +6, while `CMSG_SPIRIT_HEALER_ACTIVATE` is 0x36003A -> 0x3F003B, +1), and 5.5.0 itself splits queries across groups 0x35 and 0x3A. Derive them, or read them off a capture. | **open — the named gap** | proxy log 23:33-23:36; `corpse` table; both opcode tables |
+| D-3 | **`SMSG_CLEAR_EXTRA_AURA_INFO` arrives from legacy and is never forwarded.** Seen at 23:29:45 with no matching send. It sits in the middle of the crash burst, so it is a suspect for D-1 as well as a gap in its own right. | **open** | proxy log 23:29:45 |
+
+**A dead-end recorded so the next session does not repeat it:** the client spams an unmapped opcode
+`0x42007F` while dead. It is NOT the corpse query and NOT the reclaim - the movement group maps 1:1
+(ours 0x42000x, V5_5_0 0x38000x), where index 0x7F is an advanced-flying ack. Noise.
+
+**Unblocking a stuck character** (test server, and only while `online = 0`): a ghost is
+`playerFlags & 16`, `health = 1`, aura 8326, plus a `corpse` row. Clearing the bit, restoring health,
+deleting the aura and the corpse row brings them back. A living level 4 reads `playerFlags = 0,
+health = 147` for comparison.
+
 ### In-world inventory — live on Mememe, 24 Aug (the "fill from truth" phase)
 
 With the freeze gone the client plays, but the legacy→modern **value plumbing** is unfinished. The

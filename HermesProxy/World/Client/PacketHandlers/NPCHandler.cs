@@ -1,5 +1,6 @@
 ﻿using Framework;
 using Framework.GameMath;
+using Framework.Logging;
 using HermesProxy.Enums;
 using HermesProxy.World.Enums;
 using HermesProxy.World.Objects;
@@ -211,11 +212,42 @@ public partial class WorldClient
         SendPacketToClient(respec);
     }
 
+    /// <summary>
+    /// HERMES_256_SPIRITHEALER: answer the legacy confirm ourselves, because the modern client
+    /// cannot.
+    ///
+    /// TBC's flow is a handshake: pick the spirit healer's gossip option -> server sends
+    /// SMSG_SPIRIT_HEALER_CONFIRM -> client shows "resurrect with sickness?" -> client sends
+    /// CMSG_SPIRIT_HEALER_ACTIVATE -> server resurrects. **SMSG_SPIRIT_HEALER_CONFIRM does not
+    /// exist on modern builds** — it is absent from 69110's opcode table, from WPP's 5.5.0 table
+    /// and from TrinityCore master, which has no such packet or class at all. So SendPacketToClient
+    /// resolves no opcode and the packet is dropped in silence, the client waits, and two seconds
+    /// later sends CMSG_CLOSE_INTERACTION and gives up. Observed live 29 Aug 23:13:40-42.
+    ///
+    /// The player already consented by choosing the gossip option, so replying on their behalf is
+    /// completing the handshake, not deciding for them. Same class of fault as the Gossip bit:
+    /// legacy expects a step the modern protocol dropped.
+    /// </summary>
+    static readonly bool s_spiritHealer =
+        System.Environment.GetEnvironmentVariable("HERMES_256_SPIRITHEALER") == "1";
+
     [PacketHandler(Opcode.SMSG_SPIRIT_HEALER_CONFIRM)]
     void HandleSpiritHealerConfirm(WorldPacket packet)
     {
+        WowGuid64 healerLegacy = packet.ReadGuid();
+
         SpiritHealerConfirm confirm = new SpiritHealerConfirm();
-        confirm.Guid = packet.ReadGuid().To128(GetSession().GameState);
+        confirm.Guid = healerLegacy.To128(GetSession().GameState);
         SendPacketToClient(confirm);
+
+        if (s_spiritHealer)
+        {
+            // Same body the modern client's own activate would produce: opcode + the healer guid.
+            WorldPacket activate = new WorldPacket(Opcode.CMSG_SPIRIT_HEALER_ACTIVATE);
+            activate.WriteGuid(healerLegacy);
+            SendPacketToServer(activate);
+            Log.Print(LogType.Network, "[256-spike] SPIRITHEALER: auto-answered the legacy confirm "
+                                       + $"for healer {healerLegacy}");
+        }
     }
 }

@@ -438,6 +438,9 @@ public class PowerUpdate : ServerPacket, ISpanWritable
     // Practical cap is much lower since a unit only has a few power types
     private const int MaxPowerTypes = 16;
 
+    static readonly bool s_powerOrder =
+        System.Environment.GetEnvironmentVariable("HERMES_256_POWERORDER") == "1";
+
     public PowerUpdate(WowGuid128 guid) : base(Opcode.SMSG_POWER_UPDATE)
     {
         Guid = guid;
@@ -448,10 +451,24 @@ public class PowerUpdate : ServerPacket, ISpanWritable
     {
         _worldPacket.WritePackedGuid128(Guid);
         _worldPacket.WriteInt32(Powers.Count);
+        // HERMES_256_POWERORDER: the client reads { u8 powerType, u32 value } per element, not
+        // { u32, u8 }. Read off its own reader at RVA 0x5BB200 in the 69110 dump — the function
+        // that names itself `WowGetRawTypeName<struct ClientPowerUpdatePower>` — which after the
+        // guid and the u32 count does a byte read stored at +0 and then a dword read stored at +4.
+        // Same 5 bytes per element either way, so nothing desyncs; the VALUES are simply swapped,
+        // and the client read powerType 0 with value 16777216 where we meant type 1 value 0.
         foreach (var power in Powers)
         {
-            _worldPacket.WriteInt32(power.Power);
-            _worldPacket.WriteUInt8(power.PowerType);
+            if (s_powerOrder)
+            {
+                _worldPacket.WriteUInt8(power.PowerType);
+                _worldPacket.WriteInt32(power.Power);
+            }
+            else
+            {
+                _worldPacket.WriteInt32(power.Power);
+                _worldPacket.WriteUInt8(power.PowerType);
+            }
         }
     }
 
@@ -469,8 +486,16 @@ public class PowerUpdate : ServerPacket, ISpanWritable
 
         foreach (var power in Powers)
         {
-            writer.WriteInt32(power.Power);
-            writer.WriteUInt8(power.PowerType);
+            if (s_powerOrder)
+            {
+                writer.WriteUInt8(power.PowerType);
+                writer.WriteInt32(power.Power);
+            }
+            else
+            {
+                writer.WriteInt32(power.Power);
+                writer.WriteUInt8(power.PowerType);
+            }
         }
 
         return writer.Position;

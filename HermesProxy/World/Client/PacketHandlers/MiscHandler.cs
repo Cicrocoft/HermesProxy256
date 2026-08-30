@@ -107,8 +107,29 @@ public partial class WorldClient
             weather.Abrupt = packet.ReadBool();
         }
         SendPacketToClient(weather);
-        SendPacketToClient(new StartLightningStorm());
+        // HERMES_256_NOLIGHTNING: do not invent a lightning storm.
+        //
+        // This fires on EVERY SMSG_WEATHER and sends LightningStormId = 0, a field nothing ever
+        // assigns. The legacy server sends no such packet, and Blizzard's own 69110 session -
+        // `w18_parsed.txt`, a full session with two deaths and two resurrections - contains
+        // SMSG_START_LIGHTNING_STORM **zero times**. So we are the only source of it, and the id
+        // we send is not a real storm.
+        //
+        // Suspected, not proven, in the resurrect crash: the client dies with
+        // ACCESS_VIOLATION reading 0x0, which is what a lookup of storm id 0 returning null and
+        // then being dereferenced would produce, and HERMES_256_CREATEORDER defers WEATHER (and
+        // this) until after the self create, so the pair lands inside the resurrect burst. Two
+        // crashes, 29 Aug 23:29:45 and 30 Aug 15:10:00, are the same instruction - both addresses
+        // end in 2554 and the module base is 64 KB aligned. Sending nothing is correct regardless
+        // of whether it is the crash.
+        if (!s_noLightning)
+            SendPacketToClient(new StartLightningStorm());
     }
+
+    /// <summary>HERMES_256_NOLIGHTNING=1 stops synthesising SMSG_START_LIGHTNING_STORM after every
+    /// weather update. Blizzard never sends it; we always do, with an id of 0.</summary>
+    static readonly bool s_noLightning =
+        System.Environment.GetEnvironmentVariable("HERMES_256_NOLIGHTNING") == "1";
 
     [PacketHandler(Opcode.SMSG_LOGIN_SET_TIME_SPEED)]
     void HandleLoginSetTimeSpeed(WorldPacket packet)

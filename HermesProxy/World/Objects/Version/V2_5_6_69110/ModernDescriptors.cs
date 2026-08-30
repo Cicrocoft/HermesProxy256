@@ -1986,14 +1986,32 @@ public partial class ObjectUpdateBuilder
     // Same bug class: the handler fills CorpseData (DynamicFlags, DisplayID, Items, RaceId,
     // SexId, Flags, plus the Owner/GuildGUID guids) and the writer discarded it - a player
     // corpse would render as nothing.
+    /// <summary>HERMES_256_CORPSEOWNER=1 writes the corpse's real Owner guid instead of Empty,
+    /// so the client knows whose corpse it is. Changes the block length (a packed guid is
+    /// length-variable), which is why it is opt-in.</summary>
+    static readonly bool s_corpseOwner =
+        System.Environment.GetEnvironmentVariable("HERMES_256_CORPSEOWNER") == "1";
+
     void WriteCorpseData(WorldPacket w)
     {
         var corpse = m_updateData.CorpseData;
         w.WriteUInt32(corpse?.DynamicFlags ?? 0);        // DynamicFlags obj+0x0
-        // Owner/PartyGUID/GuildGUID kept Empty DELIBERATELY: the handler fills Owner and
-        // GuildGUID, but non-empty packed guids are length-variable; report, do not wire,
-        // per the current rules. Consequence: corpse ownership (loot/release UI) is untested.
-        w.WritePackedGuid128(WowGuid128.Empty);        // Owner (see note above) obj+0x8
+        // HERMES_256_CORPSEOWNER: write the real Owner. It was kept Empty deliberately because a
+        // non-empty packed guid is length-variable, and this note already predicted the cost —
+        // "corpse ownership (loot/release UI) is untested". It is now tested and it is the fault:
+        // the player could not see or reclaim their corpse. Blizzard's own corpse in
+        // `w18_parsed.txt` carries `Owner: <the player's guid>`; a corpse with an empty owner is
+        // nobody's, so the client has no reason to offer a release or a reclaim on it.
+        //
+        // Everything else about our corpse block is already correct, checked against that same
+        // capture: object type 10, fragments [CGObject, Tag_Corpse], the stationary position (our
+        // own block carries the exact DB coordinates), and the field ORDER — 553 reads the
+        // Customizations count before Flags and FactionTemplate, which is what we write, and WPP's
+        // print order only looks otherwise because that count is unlabelled.
+        //
+        // PartyGUID and GuildGUID stay Empty: Blizzard sends 0 for both on a soloing player, so
+        // there is nothing to prove there and each one would move the block again.
+        w.WritePackedGuid128(s_corpseOwner ? (corpse?.Owner ?? WowGuid128.Empty) : WowGuid128.Empty);        // Owner obj+0x8
         w.WritePackedGuid128(WowGuid128.Empty);        // PartyGUID (no legacy source) obj+0x18
         w.WritePackedGuid128(WowGuid128.Empty);        // GuildGUID (see note above) obj+0x28
         w.WriteUInt32(corpse?.DisplayID ?? 0);        // DisplayID obj+0x38

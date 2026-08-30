@@ -967,11 +967,30 @@ public enum Opcode : uint
     SMSG_FISH_NOT_HOOKED = 0x460179u,
     SMSG_FISH_ESCAPED = 0x460058u,   // displaced placeholder, real value unknown
     SMSG_HEALTH_UPDATE = 0x46017Fu,   // aligned to CypherCore, not individually verified
-    SMSG_POWER_UPDATE = 0x46005Au,   // displaced placeholder, real value unknown
-    SMSG_DEATH_RELEASE_LOC = 0x460180u,   // aligned to CypherCore, not individually verified
+    // 0x460180, MEASURED, not aligned to anything. The client's reader for this slot
+    // (ctor 0x5BB3E0 -> body 0x5BB200) is `GUID U32 U8 U32` - a packed guid, a u32 count,
+    // then count x {u8 powerType, u32 value} - which is exactly PowerUpdate, and the
+    // function names itself `WowGetRawTypeName<struct ClientPowerUpdatePower>`. Confirmed
+    // three ways: tools-256-spike/smsg_reader_shapes.txt line 375 already recorded that
+    // shape; Blizzard's own 18-byte body in ground-truth/w18_parsed.txt parses as
+    // {guid, count 1, {type 1, value 7}}; and the neighbour 0x46017F is `GUID U64` =
+    // HEALTH_UPDATE, which is adjacent to POWER_UPDATE in TrinityCore's ordering too.
+    // The old 0x46005A is a 7 x u32 reader - our bodies under-read it and failed silently.
+    SMSG_POWER_UPDATE = 0x460180u,
+    // MOVED OFF 0x460180, which is PowerUpdate above. That mis-assignment is the resurrect
+    // crash, measured in all four minidumps: our 16-byte {i32 MapID, 3 x float} body hit a
+    // guid-led reader, MapID 0xFFFFFFFF was taken as a 16-bit guid mask (popcount 16), the
+    // stream had 14 bytes left, CanRead failed, the out pointer stayed null and
+    // 0x2DF2554 `movzx r9d, byte ptr [r10]` read address 0. The comment this line used to
+    // carry - "aligned to CypherCore, not individually verified" - was the whole fault.
+    // 0x460181 is INFERRED, not measured: its reader (ctor 0x5BB450) is a deferred BLOB
+    // that swallows whatever it is given, so a wrong body cannot fault there - but the
+    // field layout could still be wrong, which is why HERMES_256_DEATHLOC must be set
+    // before we send it at all.
+    SMSG_DEATH_RELEASE_LOC = 0x460181u,
     SMSG_FORCED_DEATH_UPDATE = 0x46017Eu,
     SMSG_PLAYED_TIME = 0x460060u,   // displaced placeholder, real value unknown
-    SMSG_TITLE_EARNED = 0x460181u,
+    SMSG_TITLE_EARNED = 0x46005Au,   // displaced placeholder - 0x460181 is DeathReleaseLoc above; no handler uses this
     SMSG_TITLE_LOST = 0x460182u,
     // 0x460183 was carrying TWO names after SMSG_QUERY_TIME_RESPONSE was corrected onto
     // it, which makes Enum.ToObject's choice of name arbitrary and puts one of the two

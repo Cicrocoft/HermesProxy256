@@ -62,13 +62,21 @@ public partial class WorldClient
         SendPacketToClient(bound);
     }
 
+    /// <summary>HERMES_256_DEATHLOC=1 forwards SMSG_DEATH_RELEASE_LOC again, on its new opcode
+    /// 0x460181. Default OFF: 0x460181 is inferred, not measured, and not sending the packet costs
+    /// only the corpse-release map hint - while sending it on the WRONG slot crashed the client on
+    /// every single resurrect.</summary>
+    static readonly bool s_deathLoc =
+        System.Environment.GetEnvironmentVariable("HERMES_256_DEATHLOC") == "1";
+
     [PacketHandler(Opcode.SMSG_DEATH_RELEASE_LOC)]
     void HandleDeathReleaseLoc(WorldPacket packet)
     {
         DeathReleaseLoc death = new();
         death.MapID = packet.ReadInt32();
         death.Location = packet.ReadVector3();
-        SendPacketToClient(death);
+        if (s_deathLoc)
+            SendPacketToClient(death);
     }
 
     [PacketHandler(Opcode.SMSG_CORPSE_RECLAIM_DELAY)]

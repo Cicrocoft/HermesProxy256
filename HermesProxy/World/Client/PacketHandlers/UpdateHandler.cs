@@ -251,6 +251,9 @@ public partial class WorldClient
     /// This is the heavy hammer: it re-sends the whole ActivePlayerData block (~6.5 KB), so it is
     /// worth doing on a turn-in and nowhere else. Default off.
     /// </summary>
+    static readonly bool s_noPowerUpdate =
+        System.Environment.GetEnvironmentVariable("HERMES_256_NOPOWERUPDATE") == "1";
+
     static readonly bool s_qcRecreate =
         System.Environment.GetEnvironmentVariable("HERMES_256_QCRECREATE") == "1";
 
@@ -322,7 +325,17 @@ public partial class WorldClient
                     PowerUpdate powerUpdate = new PowerUpdate(guid);
                     ReadValuesUpdateBlock(packet, guid, updateData, auraUpdate, powerUpdate, i);
 
-                    if (powerUpdate.Powers.Count != 0)
+                    // HERMES_256_NOPOWERUPDATE: a bisection knob, not a fix. The resurrect crash
+                    // is reproducibly at RVA 0x2DF2554 - the client's packed-guid reader, reached
+                    // from the reader that names itself
+                    // `WowGetRawTypeName<struct ClientPowerUpdatePower>` at RVA 0x5BB200 - with a
+                    // NULL source buffer, i.e. no bytes where a guid was expected. Our own
+                    // SMSG_POWER_UPDATE is 14 bytes and tiles exactly (5-byte guid, u32 count 1,
+                    // one 5-byte element), so the standalone packet does not explain it, and the
+                    // frames above that reader are not cleanly analysed in Ghidra. Rather than
+                    // guess further: suppress the packet. If the crash disappears it is implicated;
+                    // if it moves, it is not. Costs live mana/rage bar updates while on.
+                    if (powerUpdate.Powers.Count != 0 && !s_noPowerUpdate)
                         SendPacketToClient(powerUpdate);
 
                     // FIXME(256-spike): diagnostic. A bag move produces four blocks from cmangos and

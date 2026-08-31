@@ -983,10 +983,10 @@ public enum Opcode : uint
     // stream had 14 bytes left, CanRead failed, the out pointer stayed null and
     // 0x2DF2554 `movzx r9d, byte ptr [r10]` read address 0. The comment this line used to
     // carry - "aligned to CypherCore, not individually verified" - was the whole fault.
-    // 0x460181 is INFERRED, not measured: its reader (ctor 0x5BB450) is a deferred BLOB
-    // that swallows whatever it is given, so a wrong body cannot fault there - but the
-    // field layout could still be wrong, which is why HERMES_256_DEATHLOC must be set
-    // before we send it at all.
+    // 0x460181 CONFIRMED live 1 Sep: with HERMES_256_DEATHLOC on, the corpse arrow, the
+    // release-location hint and the resurrect prompt all came back and the client did not
+    // fault. It was inferred when this was written - the reader (ctor 0x5BB450) is a
+    // deferred blob that cannot fault on a wrong body - and it is now measured.
     SMSG_DEATH_RELEASE_LOC = 0x460181u,
     SMSG_FORCED_DEATH_UPDATE = 0x46017Eu,
     SMSG_PLAYED_TIME = 0x460060u,   // displaced placeholder, real value unknown

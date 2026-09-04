@@ -1,4 +1,4 @@
-# HermesProxy ![Build](https://github.com/Xian55/HermesProxy/actions/workflows/Build_Proxy.yml/badge.svg)
+﻿# HermesProxy ![Build](https://github.com/Xian55/HermesProxy/actions/workflows/Build_Proxy.yml/badge.svg)
 
 This project enables play on existing legacy WoW emulation cores using the modern clients. It serves as a translation layer, converting all network traffic to the appropriate format each side can understand.
 
@@ -56,6 +56,36 @@ Stable Downloads: [Releases](https://github.com/Xian55/HermesProxy/releases)
    - Vanilla `--staticseed --version=ClassicEra`
    - TBC `--staticseed --version=Classic`
 - Start the proxy app and login through the game with your usual credentials.
+
+### Credentials on the 2.5.6 (69110) path
+
+On every other supported client the game sends your password to the proxy when you log in, and
+nothing needs configuring. **The 2.5.6 client does not.** It authenticates with SRP against the
+proxy's login endpoint and never transmits the password, while the legacy TBC logon server still
+requires it in the clear — so the proxy has to be told the account up front, or it cannot connect
+upstream on your behalf.
+
+Set these two before starting the proxy:
+
+```sh
+export HERMES_AccountOptions__Username="YOURACCOUNT"
+export HERMES_AccountOptions__Password="yourpassword"
+```
+
+(On PowerShell: `$env:HERMES_AccountOptions__Username = "YOURACCOUNT"`.) They can equally go in
+`appsettings.json` under `AccountOptions`, or on the command line as
+`--AccountOptions:Username=...` — see the Configuration Reference below for how the layers combine.
+
+If you are using the 2.5.6 spike launcher, it sources `tools-256-spike/run256.local.sh` when that
+file exists and falls back to the environment otherwise, so the two lines above are the only thing
+that file needs. It is git-ignored on purpose: **do not put an account into a tracked file.** The
+launcher stops with instructions rather than starting half-configured, because a proxy with no
+account comes up normally and the client then disconnects with `ErrorCode=0`, which at the login
+screen is indistinguishable from a wrong password.
+
+Use an account that exists only on the emulator you are proxying to, and a password you use nowhere
+else. The proxy needs it in a form it can replay, so it cannot be stored in a way that protects it
+from anything with access to the machine.
 
 ## Ingame Settings
 

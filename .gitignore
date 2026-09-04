@@ -526,3 +526,7 @@ test-loop2.ps1
 deploy_local/
 # Local reference checkout of WowPacketParser's V5_5_0 module (see REFERENCE-256-CLIENT.md 85)
 .wpp/
+
+# HermesProxy 2.5.6 spike: local account/server config, never committed
+tools-256-spike/run256.local.sh
+run256.local.sh

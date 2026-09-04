@@ -1,5 +1,13 @@
 ﻿# HermesProxy ![Build](https://github.com/Xian55/HermesProxy/actions/workflows/Build_Proxy.yml/badge.svg)
 
+> **Playing on the 2.5.6 (69110) client?** Edit the three settings at the top of
+> [`scripts/run-2.5.6.sh`](scripts/run-2.5.6.sh) — your account name, your password and your
+> emulator's address — then run it. That is the whole setup.
+>
+> Unlike every other supported client, 2.5.6 never sends your password to the proxy, so it has to
+> be configured up front. Use an account that exists only on that emulator, and a password you use
+> nowhere else.
+
 This project enables play on existing legacy WoW emulation cores using the modern clients. It serves as a translation layer, converting all network traffic to the appropriate format each side can understand.
 
 There are 4 major components to the application:
@@ -59,33 +67,26 @@ Stable Downloads: [Releases](https://github.com/Xian55/HermesProxy/releases)
 
 ### Credentials on the 2.5.6 (69110) path
 
-On every other supported client the game sends your password to the proxy when you log in, and
-nothing needs configuring. **The 2.5.6 client does not.** It authenticates with SRP against the
-proxy's login endpoint and never transmits the password, while the legacy TBC logon server still
-requires it in the clear — so the proxy has to be told the account up front, or it cannot connect
-upstream on your behalf.
+Every other supported client sends your password to the proxy when you log in, and nothing needs
+configuring. **The 2.5.6 client does not** — it authenticates with SRP against the proxy's own login
+endpoint and never transmits the password, while the legacy TBC logon server still requires it in
+the clear. So the account has to be supplied up front.
 
-Set these two before starting the proxy:
+The simplest route is [`scripts/run-2.5.6.sh`](scripts/run-2.5.6.sh), which has the settings at the
+top and sets everything else this build needs. Otherwise, supply them yourself:
 
 ```sh
 export HERMES_AccountOptions__Username="YOURACCOUNT"
 export HERMES_AccountOptions__Password="yourpassword"
 ```
 
-(On PowerShell: `$env:HERMES_AccountOptions__Username = "YOURACCOUNT"`.) They can equally go in
-`appsettings.json` under `AccountOptions`, or on the command line as
-`--AccountOptions:Username=...` — see the Configuration Reference below for how the layers combine.
+(PowerShell: `$env:HERMES_AccountOptions__Username = "YOURACCOUNT"`.) They also work in
+`appsettings.json` under `AccountOptions`, or as `--AccountOptions:Username=...` on the command
+line — see the Configuration Reference for how the layers combine.
 
-If you are using the 2.5.6 spike launcher, it sources `tools-256-spike/run256.local.sh` when that
-file exists and falls back to the environment otherwise, so the two lines above are the only thing
-that file needs. It is git-ignored on purpose: **do not put an account into a tracked file.** The
-launcher stops with instructions rather than starting half-configured, because a proxy with no
-account comes up normally and the client then disconnects with `ErrorCode=0`, which at the login
-screen is indistinguishable from a wrong password.
-
-Use an account that exists only on the emulator you are proxying to, and a password you use nowhere
-else. The proxy needs it in a form it can replay, so it cannot be stored in a way that protects it
-from anything with access to the machine.
+**Do not put an account into a file you commit.** The proxy needs the password in a form it can
+replay upstream, so no way of storing it protects it from anything with access to the machine. The
+only real mitigations are an account that exists nowhere else and a password reused nowhere else.
 
 ## Ingame Settings
 

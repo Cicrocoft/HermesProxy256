@@ -268,6 +268,16 @@ public partial class ObjectUpdateBuilder
     /// the values blob is length-prefixed - so the client consumes 105 whether we send 105 or
     /// 109 and nothing it parses changes. Only the declared size does.
     /// </summary>
+    /// <summary>
+    /// HERMES_256_EXPLOREDZONES=1 fills BitVectors[1] so the world map shows explored zones.
+    /// Create-block length change (+516 B); run gate256.py. See the note at the write site.
+    /// </summary>
+    static readonly bool s_exploredZones =
+        System.Environment.GetEnvironmentVariable("HERMES_256_EXPLOREDZONES") == "1";
+
+    /// <summary>Words in BitVectors[1]. 64 is what live sends, and 64 u64 == 2.4.3's 128 u32.</summary>
+    const uint ExploredZonesWords = 64;
+
     static readonly bool s_corpseFix =
         System.Environment.GetEnvironmentVariable("HERMES_256_CORPSEFIX") == "1";
 
@@ -499,7 +509,23 @@ public partial class ObjectUpdateBuilder
     /// </summary>
     void WriteUnitDataReal(WorldPacket w)
     {
-        w.WriteUInt64((ulong)(m_updateData.UnitData?.Health ?? 1));        // Health
+        // HERMES_256_ZEROHEALTH: an ABSENT field in a legacy create means ZERO, not one.
+        //
+        // mangos omits zero-valued fields from a create block - that omission IS the value - and the
+        // create path does not merge the field cache the way the values path does (see
+        // UpdateHandler: the Values case passes GetCachedObjectFieldsLegacy, the CreateObject case
+        // passes nothing). So a creature that has just died, whose health is 0 and therefore not in
+        // the block, arrived here as null and we invented 1.
+        //
+        // Measured 1 Sep on creature-0-1-0-0-1128-0000000125 (Low 293): combat at 02:12:21-23, then
+        // at 02:12:36 a create logged `hp=/100` - health absent, MaxHealth 100. The client showed it
+        // alive at 1/100 and `UnitIsDead` false, which is exactly what the player reported: a corpse
+        // standing passively at 1% until respawn. 125 of 4384 unit creates in that session carried an
+        // absent health.
+        //
+        // MaxHealth below keeps its 1: absent there would mean a real 0, which is degenerate for a
+        // live unit and risks a divide by zero in the client. It is never legitimately zero.
+        w.WriteUInt64((ulong)(m_updateData.UnitData?.Health ?? (s_zeroHealth ? 0 : 1)));        // Health
         w.WriteUInt64((ulong)(m_updateData.UnitData?.MaxHealth ?? 1));        // MaxHealth
         w.WriteUInt32((uint)(m_updateData.UnitData?.DisplayID ?? 0));        // DisplayID
         // NpcFlags carries the gossip (0x1) and questgiver (0x2) markers a client needs to
@@ -1152,6 +1178,12 @@ public partial class ObjectUpdateBuilder
     // ActivePlayer create (tools-256-spike/ap_rowine.bin): bag@30 = legacy[19], backpack@36/38-49
     // = PackSlots, bank@63-65 = BankSlots, all with Coinage landing exactly at +534. Returns null
     // for a modern slot with no legacy source (client reads Empty there).
+    /// <summary>HERMES_256_ZEROHEALTH=1 writes 0 for a creature whose create block omits
+    /// UNIT_FIELD_HEALTH, instead of inventing 1. An omitted field in a legacy create means zero,
+    /// and a dead creature's health is zero.</summary>
+    static readonly bool s_zeroHealth =
+        System.Environment.GetEnvironmentVariable("HERMES_256_ZEROHEALTH") == "1";
+
     static WowGuid128? GetModern69110InvSlot(ActivePlayerData a, int modernIdx)
     {
         if (a == null) return null;
@@ -1323,6 +1355,37 @@ public partial class ObjectUpdateBuilder
         // Consequence: the map shows no explored zones. Report, do not guess.
         for (int i0 = 0; i0 < 14; ++i0)
         {
+            // HERMES_256_EXPLOREDZONES: BitVectors[1] is ExploredZones - the bitfield the world map
+            // reads. Without it every zone renders as unexplored, which is what the stub note above
+            // predicted when it left this empty.
+            //
+            // Index 1 from TrinityCore Player.h:162 (PLAYER_DATA_FLAG_EXPLORED_ZONES_INDEX = 1) and
+            // from Blizzard's own wire: in all five live ActivePlayer captures in tools-256-spike
+            // (ap_rowine, ap_w16, ap_live8, ap_live9, ap_s1) entry 1 carries count 64 and entry 9
+            // carries count 64, every other entry 0.
+            //
+            // The competing model - that the client's cursor runs 8 bytes ahead of this loop, so
+            // our 9 is its 11 and ExploredZones would be somewhere before the loop - is NOT ruled
+            // out by anything measured, but it is the weaker of the two. Both models predict the
+            // same observations for QuestCompleted (i0==9 works, i0==11 fails), so those do not
+            // discriminate. Three sources agree on no offset: TrinityCore's enum, Blizzard's stream
+            // and our own working index. The offset rests on one static clientfields walk - the same
+            // instrument whose APD pass the gate has to correct by +1/-6. If the map stays dark with
+            // this knob on, that is the model to revisit, and the next thing to try is writing this
+            // payload in place of PvpPowerDamage/PvpPowerHealing, the 8 bytes immediately above.
+            //
+            // 64 u64 == 2.4.3's PLAYER_EXPLORED_ZONES_1 (128 u32, 4096 bits) exactly, and the bit
+            // numbering is shared: Mememe's legacy DB row has bits 212 and 650, which are Coldridge
+            // Valley and Coldridge Pass, and she is a level 4 dwarf in Dun Morogh.
+            // +4 +64*8 = 516 bytes of create-block length, hence the knob.
+            if (s_exploredZones && i0 == 1)
+            {
+                var ez = m_updateData.ActivePlayerData?.ExploredZones;
+                w.WriteUInt32(ExploredZonesWords);
+                for (int k = 0; k < ExploredZonesWords; ++k)
+                    w.WriteUInt64(ez != null && k < ez.Length ? (ez[k] ?? 0) : 0);
+                continue;
+            }
             // HERMES_256_QUESTCOMPLETED: BitVectors[11] is QuestCompleted - the bitfield the
             // client's IsQuestFlaggedCompleted reads. Measured 29 Aug, three ways:
             //   * in Blizzard's live ActivePlayer create the count sits at descriptor offset 9207
@@ -1353,9 +1416,18 @@ public partial class ObjectUpdateBuilder
             // at APD-rel 4846 and the count the client read at 4838 was still 0, and
             // IsQuestFlaggedCompleted stayed false.
             //
-            // Those 8 bytes are part of the ~271-byte APD overhang (the reader consumes 6288 of
-            // the 6559 we emit). When that is fixed this index MUST become 11 - it is pinned to
-            // the bug, not to the format.
+            // FALSIFIED 4 Sep, live. The paragraph above is kept because its measurements are real,
+            // but its conclusion is not: there is no 8-byte cursor offset, and this index is NOT
+            // pinned to a bug. HERMES_256_EXPLOREDZONES writes ExploredZones at i0 == 1 - the index
+            // TrinityCore and Blizzard's own stream both give it - and the world map lit up with
+            // exactly the two zones the legacy DB row holds. If the cursor really ran 8 bytes
+            // ahead, i0 == 1 would have landed on the client's entry 3 and nothing would have
+            // rendered. So the loop index maps 1:1 to the client's stream, 9 IS the format, and
+            // this index must STAY 9 when the APD overhang is fixed.
+            //
+            // Note for the values path: ModernValuesUpdate's QuestCompletedEntry defaults to 11 on
+            // the reasoning refuted here. It is overridable with HERMES_256_QCENTRY - try 9.
+            // That is a plausible part of why the values encoding of this field failed six ways.
             if (s_questCompleted && i0 == 9)
             {
                 var qc = m_updateData.ActivePlayerData?.QuestCompleted;

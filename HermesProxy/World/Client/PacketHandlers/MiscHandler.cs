@@ -79,12 +79,43 @@ public partial class WorldClient
             SendPacketToClient(death);
     }
 
+    /// <summary>
+    /// HERMES_256_CORPSELOC: ask the legacy core where the corpse is, on the player's behalf.
+    ///
+    /// Same class as HERMES_256_SPIRITHEALER — a step the modern protocol dropped. On 5.5.x the
+    /// server pushes SMSG_CORPSE_LOCATION unsolicited; the client never asks for it, which is
+    /// measured, not assumed: the retail capture behind commit 2f878e9 decodes all 743 client
+    /// packets and 0x44008C (CMSG_QUERY_CORPSE_LOCATION_FROM_CLIENT) never appears, while
+    /// SMSG_CORPSE_LOCATION arrives on its own. TBC is request/response — MSG_CORPSE_QUERY only
+    /// answers when asked — so the chain never starts: our CorpseLocation writer exists and is
+    /// correct, and SMSG_CORPSE_LOCATION has never once been sent in any session log.
+    ///
+    /// Without it the ghost has no corpse position, so no arrow and no reclaim offer, which is
+    /// what a live 4 Sep session showed: death, repop, reclaim delay, DEATH_RELEASE_LOC and a
+    /// well-formed Corpse object all arrived, the delay expired, the player stood on the corpse —
+    /// and the client sent nothing but movement. It never tried.
+    /// </summary>
+    /// <summary>HERMES_256_EXPLORERECREATE=1 re-emits the player as a create when a new area is
+    /// explored, so the map updates without a relog. Needs HERMES_256_EXPLOREDZONES to do anything.
+    /// </summary>
+    static readonly bool s_exploreRecreate =
+        System.Environment.GetEnvironmentVariable("HERMES_256_EXPLORERECREATE") == "1";
+
+    static readonly bool s_corpseLoc =
+        System.Environment.GetEnvironmentVariable("HERMES_256_CORPSELOC") == "1";
+
     [PacketHandler(Opcode.SMSG_CORPSE_RECLAIM_DELAY)]
     void HandleCorpseReclaimDelay(WorldPacket packet)
     {
         CorpseReclaimDelay delay = new CorpseReclaimDelay();
         delay.Remaining = packet.ReadUInt32();
         SendPacketToClient(delay);
+
+        // The query used to fire from here, and that was one packet too early - see the long note
+        // at the new trigger site in UpdateHandler's PLAYER_FLAGS translation. cmangos sends the
+        // reclaim delay at repop, before the ghost bit reaches the client, and the client's
+        // handler CLEARS the stored corpse info when its ghost gate fails rather than ignoring the
+        // packet. Asking here made the value worse than not asking at all.
     }
 
     [PacketHandler(Opcode.SMSG_TIME_SYNC_REQUEST)]
@@ -217,6 +248,25 @@ public partial class WorldClient
         explore.AreaID = packet.ReadUInt32();
         explore.Experience = packet.ReadUInt32();
         SendPacketToClient(explore);
+
+        // HERMES_256_EXPLORERECREATE: exploration lives in ActivePlayerData.BitVectors[1], the same
+        // nested dynamic field as QuestCompleted - whose values encoding failed six ways and was
+        // only ever landed by re-emitting the player as a create. Do the same here.
+        // TryReemitPlayerAsCreate rebuilds from the merged legacy field cache, so ExploredZones
+        // repopulates with no encoder work.
+        //
+        // Separate knob from EXPLOREDZONES on purpose: turn the field on first and check the map
+        // shows what is ALREADY explored. That is one question. Whether a NEW zone lights up on
+        // entry is a second one, and a create re-emit is ~7.6 KB per zone boundary, so it should be
+        // paid for only once it is known to be needed.
+        //
+        // Known gap even then: mangos only sends SMSG_EXPLORATION_EXPERIENCE when the area has
+        // area_level > 0 (Player.cpp:6537), while it sets the bit unconditionally just above. Zones
+        // with area_level 0 will set the bit but fire no trigger, so they appear on the next re-emit
+        // or relog rather than instantly. Closing that fully means watching the incoming legacy
+        // words change instead of listening for this packet.
+        if (s_exploreRecreate)
+            TryReemitPlayerAsCreate($"area {explore.AreaID} explored");
     }
 
     [PacketHandler(Opcode.SMSG_PLAY_MUSIC)]

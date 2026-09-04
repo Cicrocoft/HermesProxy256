@@ -1,4 +1,4 @@
-# 2.5.6 (build 69110) — the plan, on Vej B
+﻿# 2.5.6 (build 69110) — the plan, on Vej B
 
 Companion to `REFERENCE-256-CLIENT.md` (the evidence) and `tools-256-spike/model-256.md` (the layout
 model). This is the **work programme**, and it is a **living document**: the register below grows as
@@ -262,6 +262,48 @@ proxy log for the session is the 23:29-23:36 window and the crash dump is
 | D-3 | `SMSG_CLEAR_EXTRA_AURA_INFO` arrives from legacy and is still never forwarded. It sat in the crash burst and was a suspect for D-1; with D-1 and D-2 solved it is not blocking anything, and no symptom has been traced to it. Left open deliberately rather than closed - it is a real gap, just not a costly one. | **open, not blocking** | proxy log |
 | D-4 | **The resurrect crash: our opcode table had `SMSG_DEATH_RELEASE_LOC` on 0x460180, which is `SMSG_POWER_UPDATE`.** Measured in all four minidumps, which had never been opened. Our 16-byte `{i32 MapID, 3 x float}` body met a guid-led reader; on reclaim and spirit-healer the proxy sends `MapID = 0xFFFFFFFF`, so the body opens `FF FF`, the packed-guid reader took that as a 16-bit mask (popcount 16), asked the stream for 16 bytes with 14 left, `CanRead` failed leaving the pre-zeroed out pointer null, and `0x2DF2554 movzx r9d,[r10]` read address 0. Registers identical in all four. **The repo already held the answer**: `tools-256-spike/smsg_reader_shapes.txt` line 375 records `0x460180 0x5BB3E0 GUID U32 U8 U32`, never joined to the table; and the line's own comment said "aligned to CypherCore, not individually verified". Corroborated by 0x46017F being `GUID U64` = HEALTH_UPDATE, its neighbour in TrinityCore's ordering, and by Blizzard's 18-byte body on the slot parsing as {guid, count 1, {type 1, value 7}}. Fixed: POWER_UPDATE -> 0x460180, DEATH_RELEASE_LOC -> 0x460181, TITLE_EARNED takes the vacated placeholder. **Why our own gate missed it:** `undersend_gate.py` skips opcodes absent from `sent_opcodes.txt` on the rule "a writer that never runs cannot crash", and that file had no death-path opcode because no session had ever died. Re-run `sent_inventory.py` now that one has. | **SOLVED** | four minidumps; live 1 Sep |
 
+**Re-opened and re-closed 4 Sep — D-1 was green in this document and dead in every session since.**
+`HERMES_256_SPIRITHEALER` was never exported by `tools-256-spike/run256.sh`. The code, the handler
+and the write-up all landed on 1 Sep; the launcher line did not, so the knob read `0` on every run
+after that and the angel did nothing. Found from the live log in one grep — `SMSG_SPIRIT_HEALER_CONFIRM`
+received at 20:52:07, nothing after it — and confirmed the same evening: with the export in place the
+handshake auto-answers and the resurrection lands (`SMSG_CLEAR_EXTRA_AURA_INFO`, a full item resync,
+`SMSG_POWER_UPDATE` and a Player values block, 21:00:50).
+
+**The lesson is the launcher, not the knob.** `run256.sh` already prints its live knobs precisely
+because this happened once before (QCRECREATE, 29 Aug). The dump was in the log; nobody read it
+after a failure report. **When a knob-gated feature is reported broken, read the knob dump first** —
+it is the cheapest check in this project and it has now paid for itself twice.
+
+### D-2 re-opened 4 Sep: the client never asks for its corpse
+
+Corpse reclaim does not work, and the 4 Sep session **excludes almost everything D-2 blamed**. A
+fresh death (no relog) delivered the whole sequence: death 21:02:15, repop 21:02:27, then
+`SMSG_CORPSE_RECLAIM_DELAY` (30 s) and `SMSG_DEATH_RELEASE_LOC` on the corrected `0x460181`, then a
+well-formed Corpse object at 21:03:07 — `values=129`, which is commit 2f878e9's `values=126` plus
+exactly the three bytes of the Owner guid, so `HERMES_256_CORPSEOWNER` is demonstrably on the wire.
+The delay expired. The player stood on the corpse. **The client sent nothing but movement.** It never
+tried, so nothing downstream of the request can be the fault.
+
+What is left is that the client does not know where the corpse is. `SMSG_CORPSE_LOCATION` **has never
+been sent in any session log** — we have a correct writer for it, but it fires only from a
+`MSG_CORPSE_QUERY` *answer*, which legacy sends only when asked, and we ask only when the modern
+client asks us. Per 2f878e9 the modern client never asks: all 743 packets of a retail capture were
+decoded and `0x44008C` never appears, while `SMSG_CORPSE_LOCATION` arrives unsolicited. So the chain
+has no first link. This is **not** the corpse-query theory that commit rejected — that theory was
+that the client would send a query. The unsolicited push is the opposite finding, and it is in the
+same commit.
+
+`HERMES_256_CORPSELOC` asks the legacy core on the player's behalf when the reclaim delay arrives,
+which is the first moment a corpse exists to ask about. Same class as `SPIRITHEALER`: a step the
+modern protocol dropped and TBC still requires. **UNCONFIRMED — awaiting its first live test.**
+If the offer still does not appear with it on, turn it off and record that: it excludes the corpse
+position, which is worth more than a fix that merely correlates.
+
+Known gap in the hook, deliberately not closed yet: it hangs on the reclaim delay, so a player who
+**logs in already dead** still gets no corpse location. Pointless to fix before we know whether the
+corpse position gates the offer at all.
+
 **`0x42007F` is NOT noise, and calling it an advanced-flying ack was a guess from a 1:1 group mapping.**
 In Blizzard's own capture it is the client's **most frequent packet of all** - 186 of 743 - and we have no
 entry for it, so every one is dropped. It is not the corpse query and not the reclaim (both of those are
@@ -272,6 +314,19 @@ whole death flow is **`0x3E017A`**, sent once.
 `playerFlags & 16`, `health = 1`, aura 8326, plus a `corpse` row. Clearing the bit, restoring health,
 deleting the aura and the corpse row brings them back. A living level 4 reads `playerFlags = 0,
 health = 147` for comparison.
+
+### Character deletion — SOLVED 4 Sep, three faults on one four-packet path
+
+The glue screen hung on "Deleting Character". Full evidence in `REFERENCE-256-CLIENT.md` §140.
+Nothing here needed the client binary opened: the run log, `cmsg_bodies.txt` and
+`smsg_reader_shapes.txt` already held all three answers.
+
+| id | what | state | evidence |
+|---|---|---|---|
+| X-1 | **`CMSG_CHAR_DELETE` was absent from `V2_5_6_69110/Opcode.cs`**, so the request resolved to `MSG_NULL_ACTION` and was dropped before any handler ran — nothing was ever sent to the legacy core. It is **`0x4400CD`**, not the generator's drift-0 `0x4400CB` (the client has no stub there, which is exactly why the generator's bucket filter dropped the name in silence). Drift here is **+2**, inside the band pinned by `CMSG_CREATE_CHARACTER` (0) and `CMSG_BATTLENET_REQUEST` (+11). Its neighbour `0x4400CC` is the empty 90-second `CMSG_SERVER_TIME_OFFSET_REQUEST`, which pins the pair against CypherCore's adjacent `0x4000CA`/`0x4000CB`. | **SOLVED** | `hermes-run.log` 19:46:37 `first9=CD00440001A0030408` — once in seven hours, at the press; body = one packed guid; `cmsg_bodies.txt` `0x4400CD … GUID` at stub `0x596C30` |
+| X-2 | **`SMSG_DELETE_CHAR` was written one byte wide.** The client's reader for `0x4601B0` is a bare `U32` — the same widening `SMSG_CREATE_CHAR` already had and this packet never got. Three bytes short is a hang, not a crash, because nothing is dereferenced. The opcode itself is sound: `CreateChar 0x4601AF` and `AccountDataTimes 0x4601B9` are both verified and both drift +5 over a dense ten-slot run, so `DeleteChar` can only be `0x4601B0`. | **SOLVED** | `smsg_reader_shapes.txt:423` |
+| X-3 | **The success code was three too low.** 2.5.6 borrowed `V3_4_3_54261`'s `ResponseCodes`; the tables agree to 39 and then 3.4.3 stops adding `CHAR_CREATE_*` codes. `CharDeleteSuccess` went out as 63 — `CHAR_CREATE_FACTION_BALANCE` to this client — where 5.5.x wants 66. `CharCreateSuccess` is 24 in both, which is why creation never exposed it. 2.5.6 now has its own table from TrinityCore's 5.5.x `SharedDefines.h`. | **SOLVED** | both enums side by side; TC `SharedDefines.h` `CHAR_DELETE_SUCCESS = 66` |
+| X-4 | **`CMSG_SERVER_TIME_OFFSET_REQUEST = 0x4400CC` is now identified but deliberately NOT added.** Adding the name arms `WorldSocket.SendServerTimeOffset()`, and `SMSG_SERVER_TIME_OFFSET` is still on a `displaced placeholder, real value unknown` slot (`0x460080`); the aligned prediction `0x4601C3` reads a `BLOB`, not the `int64` we write. **Identify the response before adding the request.** | **open, gated** | §140.4 |
 
 ### In-world inventory — live on Mememe, 24 Aug (the "fill from truth" phase)
 
@@ -331,3 +386,35 @@ markers, the packet dumps, the descriptor-range logging and the knobs; keep the 
 both-conventions evidence check (real upstream fixes). Smoke-test 1.14, 2.5.x, 3.4.3 — byte-identical
 today, must stay so. The live-capture tools and `WPP_DUMP_DESC`/`WPP_69110` patches are dev-only and
 stay out of any HermesProxy PR.
+
+### Closed 4 Sep — and one long-standing note falsified
+
+Live-confirmed in one evening: character deletion, XP / loot / quest-progress text, the spirit
+healer, corpse reclaim, the action bar, and the world map. Evidence in `REFERENCE-256-CLIENT.md`
+sections 140-144.
+
+**The index question is settled empirically.** `ExploredZones` at `BitVectors[1]` renders, which is
+only possible if the create loop's index maps 1:1 to the client's stream. The long note claiming the
+client's cursor runs 8 bytes ahead - and that `QuestCompleted` must therefore "become 11" once the
+APD overhang is fixed - is **falsified**: at a real 8-byte offset, `i0 == 1` would have landed on the
+client's entry 3 and the map would have stayed dark. 9 is the format. Follow-up worth one test:
+`ModernValuesUpdate.QuestCompletedEntry` still defaults to 11 on the refuted reasoning, and
+`HERMES_256_QCENTRY=9` is the one-knob experiment.
+
+**Two lessons that cost the most tonight, both about inference rather than measurement.**
+
+*A packet can be correct and still wrong, if it arrives at the wrong time.* `SMSG_CORPSE_LOCATION`
+was declared excluded on two true observations - it was sent correctly with no effect, and Blizzard
+sends it with `Valid: False`. Neither was wrong; neither was sufficient. The client's handler
+**clears** the value when its ghost gate fails instead of ignoring the packet, so every send erased
+what it was meant to set. "Sent correctly, no effect" does not mean "ignored".
+
+*A knob recorded as SOLVED can be dead in every session.* `HERMES_256_SPIRITHEALER` was never
+exported by `run256.sh`. Read the knob dump at the head of the run log before believing a feature is
+unimplemented - it is the cheapest check in this project and it has now paid for itself twice.
+
+**Still open:** logging in already dead still races - the ghost flag rides the create block, so the
+corpse query completes before it is sent. Action-bar persistence is unverified: the bar renders and
+`CMSG_SET_ACTION_BUTTON` now reaches the proxy, but no new `character_action` row has appeared, and
+the re-encoding fix is untestable with a plain spell because old and new packing are byte-identical
+for type 0 below spell id 65536. Drag a macro or an item.

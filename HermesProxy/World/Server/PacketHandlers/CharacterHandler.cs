@@ -202,13 +202,31 @@ public partial class WorldSocket
         SendPacketToServer(packet);
     }
 
+    /// <summary>
+    /// HERMES_256_ACTIONBUTTONS also fixes the way a saved button is re-encoded for the legacy
+    /// core. 1.12, 2.4.3 and 3.3.5 all read `u8 button; u32 packedData` with the action in the low
+    /// 24 bits and the type in the TOP byte - the layout this proxy's own
+    /// PlayerDefines.MaxActionButtonActionValue (0x00FFFFFF + 1) already encodes. Writing two
+    /// uint16s puts the type at bit 16 instead, so every macro (0x40), item (0x80) and
+    /// equipment-set (0x20) button reached the core as a spell with a corrupted id. A plain spell
+    /// is type 0, so it survived intact - which is why this was never noticed.
+    /// Gated because this handler is shared with the 1.14 / 2.5.2 / 2.5.3 / 3.4.3 paths.
+    /// </summary>
+    static readonly bool s_actionButtons =
+        System.Environment.GetEnvironmentVariable("HERMES_256_ACTIONBUTTONS") == "1";
+
     [PacketHandler(Opcode.CMSG_SET_ACTION_BUTTON)]
     void HandleSetActionButton(SetActionButton button)
     {
         WorldPacket packet = new WorldPacket(Opcode.CMSG_SET_ACTION_BUTTON);
         packet.WriteUInt8(button.Index);
-        packet.WriteUInt16(button.Action);
-        packet.WriteUInt16(button.Type);
+        if (s_actionButtons)
+            packet.WriteUInt32(((uint)button.Action & 0x00FFFFFFu) | ((uint)button.Type << 24));
+        else
+        {
+            packet.WriteUInt16(button.Action);
+            packet.WriteUInt16(button.Type);
+        }
         SendPacketToServer(packet);
     }
 

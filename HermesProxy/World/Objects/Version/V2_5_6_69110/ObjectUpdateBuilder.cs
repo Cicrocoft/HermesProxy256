@@ -409,6 +409,18 @@ public partial class ObjectUpdateBuilder
         System.Environment.GetEnvironmentVariable("HERMES_256_CREATEBITS") == "1";
 
     /// <summary>
+    /// HERMES_256_ACTIONBUTTONS=1 sends the action bar in the ActivePlayer part of the create
+    /// block, which is where this build reads it - see the disassembly quoted at the write site.
+    /// Default off: it adds 1440 bytes before the length-prefixed values and the fragment list,
+    /// which is exactly the displacement class section 39 documents. Run gate256.py.
+    /// </summary>
+    static readonly bool s_actionButtons =
+        System.Environment.GetEnvironmentVariable("HERMES_256_ACTIONBUTTONS") == "1";
+
+    /// <summary>Slots the 69110 reader consumes: `mov r14d, 0xB4` at RVA 0x66EE58.</summary>
+    const int ActionButtonCount550 = 180;
+
+    /// <summary>
     /// TrinityCore's TypeID, which is not the BCC one this repository stores. The modern enum
     /// inserted AzeriteEmpoweredItem and AzeriteItem at 3 and 4, so everything from Unit upwards
     /// shifted by two: an active player is 7 here and 5 in the BCC numbering.
@@ -1220,22 +1232,34 @@ public partial class ObjectUpdateBuilder
         {
             bool hasSceneInstanceIDs = false;
             bool hasRuneState = false;
-            // The 5.5.0 engine writes only two bits here — HasSceneInstanceIDs and HasRuneState —
-            // and carries no action buttons in the movement block at all; they travel in
-            // SMSG_ACTION_BUTTONS instead. See CypherCore's BuildMovementUpdate.
+            // CORRECTED 4 Sep. The note that used to sit here said the 5.5.0 engine writes only two
+            // bits and carries no action buttons in the create block at all. **It does carry them**,
+            // and it reads THREE bits. From the client itself:
             //
-            // Sending them anyway added one bit plus 132 action buttons: 1 + 132*4 = 529 bytes,
-            // which is exactly how far the values size field and the entity-fragment list were
-            // displaced. The client read its fragment ids out of the middle of the action buttons,
-            // which is why it always ended up with the empty component id 0 no matter what we put
-            // in the block.
-            bool hasActionButtons = !ModernVersion.Uses550Engine
-                && m_gameState.ActionButtons.Count != 0;
+            //   0x66ED51  cmp byte ptr [rdi+0xCB0], 0   ; the ActivePlayer gate
+            //   0x66ED69  call ReadU8                   ; ONE byte
+            //   0x66ED7A  add r14b, r14b                ; bits taken MSB-first:
+            //                                           ;   0x80 HasSceneInstanceIDs
+            //                                           ;   0x40 HasRuneState
+            //                                           ;   0x20 HasActionButtons -> [rdi+0xCA8]
+            //   0x66EDC1  memset(rdi+0x708, 0, 0x5A0)   ; 1440 bytes cleared when that bit is set
+            //   0x66EE58  mov r14d, 0xB4                ; 180
+            //   0x66EE6B  call ReadU64 ; mov [rbx],rax ; lea rbx,[rbx+8]   -> 180 x u64 = 0x5A0
+            //
+            // It is the only 180-element u64 read in the image, and no packet class reads action
+            // buttons at all - so on this build they travel here and nowhere else.
+            //
+            // The old note's MEASUREMENT was right even though its conclusion was not: 132 int32s
+            // is the wrong payload, and removing 529 bytes of it un-displaced the values size field
+            // and the fragment list. Because WriteBit is MSB-first and FlushBits pads with zeros,
+            // writing two bits produces the same byte as writing three with the third clear - which
+            // is why the missing bit never showed up as a length error.
+            bool hasActionButtons = m_gameState.ActionButtons.Count != 0
+                && (!ModernVersion.Uses550Engine || s_actionButtons);
 
             data.WriteBit(hasSceneInstanceIDs);
             data.WriteBit(hasRuneState);
-            if (!ModernVersion.Uses550Engine)
-                data.WriteBit(hasActionButtons);
+            data.WriteBit(hasActionButtons);        // three bits on 69110, not two
             data.FlushBits();
 
             if (hasSceneInstanceIDs)
@@ -1261,8 +1285,24 @@ public partial class ObjectUpdateBuilder
 
             if (hasActionButtons)
             {
-                for (int i = 0; i < 132; i++)
-                    data.WriteInt32(m_gameState.ActionButtons[i]);
+                if (ModernVersion.Uses550Engine)
+                {
+                    // 180 slots of u64. 2.4.3 packs one int32 as action:24 | type:8; the 5.5.0
+                    // element carries the action in the low bits and the type in the top byte.
+                    for (int i = 0; i < ActionButtonCount550; i++)
+                    {
+                        uint legacy = i < m_gameState.ActionButtons.Count
+                            ? (uint)m_gameState.ActionButtons[i] : 0u;
+                        ulong action = legacy & 0x00FFFFFFu;
+                        ulong type = (legacy >> 24) & 0xFFu;
+                        data.WriteUInt64(action | (type << 56));
+                    }
+                }
+                else
+                {
+                    for (int i = 0; i < 132; i++)
+                        data.WriteInt32(m_gameState.ActionButtons[i]);
+                }
             }
         }
 

@@ -957,17 +957,27 @@ public class DeleteChar : ServerPacket, ISpanWritable
 {
     public DeleteChar() : base(Opcode.SMSG_DELETE_CHAR) { }
 
+    // The 5.5.0 engine widens the result to a uint32, exactly as SMSG_CREATE_CHAR does. The
+    // client's reader for 0x4601B0 is a bare `U32` (tools-256-spike/smsg_reader_shapes.txt:423,
+    // ctor 0x5BDD70), so a one-byte body leaves it three bytes short, the read fails and the
+    // glue screen sits on "Deleting Character" forever.
     public override void Write()
     {
-        _worldPacket.WriteUInt8(Code);
+        if (ModernVersion.Uses550Engine)
+            _worldPacket.WriteUInt32(Code);
+        else
+            _worldPacket.WriteUInt8(Code);
     }
 
-    public int MaxSize => 1; // byte
+    public int MaxSize => 4; // uint32 on 5.5.0, byte before it
 
     public int WriteToSpan(Span<byte> buffer)
     {
         var writer = new SpanPacketWriter(buffer);
-        writer.WriteUInt8(Code);
+        if (ModernVersion.Uses550Engine)
+            writer.WriteUInt32(Code);
+        else
+            writer.WriteUInt8(Code);
         return writer.Position;
     }
 

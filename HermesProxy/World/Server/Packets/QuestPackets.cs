@@ -1104,10 +1104,18 @@ public class QuestUpdateAddCredit : ServerPacket, ISpanWritable
         _worldPacket.WriteInt32(ObjectID);
         _worldPacket.WriteUInt16(Count);
         _worldPacket.WriteUInt16(Required);
-        _worldPacket.WriteUInt8((byte)ObjectiveType);
+        // ObjectiveType is a uint32 on the 5.5.0 engine (TrinityCore QuestPackets.cpp:265,
+        // `_worldPacket << uint32(ObjectiveType)`), a byte before it. Sending the byte made the
+        // packet 21 bytes where the client reads 24: an UNDER-send, the class that faults readers,
+        // and no objective ever printed "Boar slain: 1/8" in chat or over the top of the screen.
+        if (ModernVersion.Uses550Engine)
+            _worldPacket.WriteUInt32((uint)ObjectiveType);
+        else
+            _worldPacket.WriteUInt8((byte)ObjectiveType);
     }
 
-    public int MaxSize => PackedGuidHelper.MaxPackedGuid128Size + 13; // GUID + uint + int + 2 ushorts + byte
+    // GUID + uint + int + 2 ushorts + the objective type, four bytes wide on 5.5.0
+    public int MaxSize => PackedGuidHelper.MaxPackedGuid128Size + 16;
 
     public int WriteToSpan(Span<byte> buffer)
     {
@@ -1117,7 +1125,10 @@ public class QuestUpdateAddCredit : ServerPacket, ISpanWritable
         writer.WriteInt32(ObjectID);
         writer.WriteUInt16(Count);
         writer.WriteUInt16(Required);
-        writer.WriteUInt8((byte)ObjectiveType);
+        if (ModernVersion.Uses550Engine)
+            writer.WriteUInt32((uint)ObjectiveType);
+        else
+            writer.WriteUInt8((byte)ObjectiveType);
         return writer.Position;
     }
 

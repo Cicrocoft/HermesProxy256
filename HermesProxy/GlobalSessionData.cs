@@ -63,6 +63,9 @@ public sealed class GameSessionData
     public bool ShowPlayedTime;
     public bool IsInFarSight;
     public bool IsInTaxiFlight;
+    /// <summary>HERMES_256_CORPSELOC: one corpse-location query per death, armed again on
+    /// the transition back out of the ghost state.</summary>
+    public bool CorpseLocationAsked;
     public bool IsWaitingForTaxiStart;
     public bool IsWaitingForNewWorld;
     public bool IsWaitingForWorldPortAck;

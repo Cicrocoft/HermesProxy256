@@ -14,6 +14,33 @@ public partial class WorldClient
     static readonly bool s_knownSpellsLogin =
         System.Environment.GetEnvironmentVariable("HERMES_256_KNOWNSPELLSLOGIN") == "1";
 
+    // HERMES_256_MISSILETRAVEL: probe for the "projectiles arrive instantly" report. The value is a
+    // TravelTime in MILLISECONDS written into SMSG_SPELL_GO's MissileTrajectory; unset, 0 or
+    // unparseable leaves current behaviour untouched. 1500 is the suggested probe value - long
+    // enough that a Fireball would visibly lag its own damage log, which cmangos already delays by
+    // the real flight time (measured in proxy-trainer.log: SMSG_SPELL_GO 03:00:23 ->
+    // SMSG_SPELL_NON_MELEE_DAMAGE_LOG 03:00:24, so the server side is already correct).
+    //
+    // This is deliberately a PROBE and deliberately not a computed distance/speed value, because
+    // the engine reference says a computed value would be WRONG. TrinityCore fills
+    // MissileTrajectory only under CAST_FLAG_ADJUST_MISSILE, and only sets that flag when
+    // m_targets.HasTraj() (Spell.cpp:4796 and 4847-4851) - i.e. for arcing trajectory casts, never
+    // for a unit-targeted Fireball. Retail therefore sends TravelTime = 0 for exactly the spells
+    // reported broken here and their missiles still fly, so the modern client derives the flight
+    // itself from SpellMisc.db2 Speed. If this probe changes nothing, SMSG_SPELL_GO's TravelTime is
+    // excluded and the cause is client-side (spell visual / db2 resolution) - which the reference
+    // says is the more likely answer. Length-neutral either way: the u32 is written on every cast.
+    static readonly uint s_missileTravel256 =
+        uint.TryParse(System.Environment.GetEnvironmentVariable("HERMES_256_MISSILETRAVEL"), out var s_mt256) ? s_mt256 : 0u;
+
+    // HERMES_256_MISSILETRAVELFLAG: second half of the same probe. The client may gate its use of
+    // MissileTrajectory on CAST_FLAG_ADJUST_MISSILE (0x00020000 - identical in TrinityCore
+    // Spell.h:111 and in our own CastFlag enum), the way the server gates writing it. Set this
+    // alongside HERMES_256_MISSILETRAVEL to send the flag too. It also makes the client treat the
+    // cast as a trajectory cast, so run the value alone first and only then the value plus flag.
+    static readonly bool s_missileTravelFlag256 =
+        System.Environment.GetEnvironmentVariable("HERMES_256_MISSILETRAVELFLAG") == "1";
+
     // Handlers for SMSG opcodes coming the legacy world server
     [PacketHandler(Opcode.SMSG_SEND_KNOWN_SPELLS)]
     void HandleSendKnownSpells(WorldPacket packet)
@@ -478,6 +505,27 @@ public partial class WorldClient
 
                 GetSession().GameState.StoreLastAuraCasterOnTarget(target, spellId, spell.Cast.CasterUnit);
             }
+        }
+
+        // HERMES_256_MISSILETRAVEL probe - see the knob note at the top of this file. Only fills a
+        // TravelTime the legacy stream left at zero (the 2.4.3 SMSG_SPELL_GO has no such field at
+        // all; the WotLK branch of HandleSpellStartOrGo does read one under CastFlag.AdjustMissile,
+        // and that value is left alone), and only for a cast with a unit target other than the
+        // caster, so self-buffs are not given a fake flight time.
+        if (s_missileTravel256 != 0 &&
+            spell.Cast.MissileTrajectory.TravelTime == 0 &&
+            spell.Cast.HitTargets.Count > 0 &&
+            !spell.Cast.CasterUnit.IsEmpty() &&
+            spell.Cast.HitTargets[0] != spell.Cast.CasterUnit)
+        {
+            spell.Cast.MissileTrajectory.TravelTime = s_missileTravel256;
+            if (s_missileTravelFlag256)
+                spell.Cast.CastFlags |= (uint)CastFlag.AdjustMissile;
+
+            Framework.Logging.Log.Print(Framework.Logging.LogType.Warn,
+                $"[256-spike] missile probe: spellId={spell.Cast.SpellID} travelTime={s_missileTravel256}ms" +
+                $" flag={s_missileTravelFlag256} castFlags=0x{spell.Cast.CastFlags:X8}" +
+                $" target={spell.Cast.HitTargets[0]}");
         }
 
         SendPacketToClient(spell);

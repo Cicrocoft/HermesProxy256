@@ -209,7 +209,16 @@ class ItemPushResult : ServerPacket, ISpanWritable
         _worldPacket.WriteInt32(DungeonEncounterID);
         _worldPacket.WriteInt32(BattlePetSpeciesID);
         _worldPacket.WriteInt32(BattlePetBreedID);
-        _worldPacket.WriteUInt32(BattlePetBreedQuality);
+        // BattlePetBreedQuality is a uint8 on the 5.5.0 engine, and both authorities agree:
+        // TrinityCore writes `uint8(BattlePetBreedQuality)` (ItemPackets.cpp:269) and the client's
+        // own reader for 0x4600CE has U8 in slot 10 of `GUID U8 U32 x7 U8 U32 GUID U8 ...`. Writing
+        // four bytes pushed BattlePetLevel, ItemGUID, the bit byte and the whole ItemInstance three
+        // bytes late, so the client never resolved the item and no "You receive loot:" line
+        // appeared. Over-sends do not fault, which is why this was silent rather than a crash.
+        if (ModernVersion.Uses550Engine)
+            _worldPacket.WriteUInt8((byte)BattlePetBreedQuality);
+        else
+            _worldPacket.WriteUInt32(BattlePetBreedQuality);
         _worldPacket.WriteInt32(BattlePetLevel);
         _worldPacket.WritePackedGuid128(ItemGUID);
         _worldPacket.WriteBit(Pushed);
@@ -238,7 +247,10 @@ class ItemPushResult : ServerPacket, ISpanWritable
         writer.WriteInt32(DungeonEncounterID);
         writer.WriteInt32(BattlePetSpeciesID);
         writer.WriteInt32(BattlePetBreedID);
-        writer.WriteUInt32(BattlePetBreedQuality);
+        if (ModernVersion.Uses550Engine)
+            writer.WriteUInt8((byte)BattlePetBreedQuality);
+        else
+            writer.WriteUInt32(BattlePetBreedQuality);
         writer.WriteInt32(BattlePetLevel);
         writer.WritePackedGuid128(ItemGUID.Low, ItemGUID.High);
         writer.WriteBit(Pushed);

@@ -718,10 +718,30 @@ public class CorpseLocation : ServerPacket, ISpanWritable
         _worldPacket.FlushBits();
 
         _worldPacket.WritePackedGuid128(Player);
-        _worldPacket.WriteInt32(ActualMapID);
-        _worldPacket.WriteVector3(Position);
-        _worldPacket.WriteInt32(MapID);
-        _worldPacket.WritePackedGuid128(Transport);
+        // Field order moved on the 5.5.0 engine: ActualMapID, MapID, Transport, Position — not
+        // ActualMapID, Position, MapID, Transport. Both authorities agree. The client's reader for
+        // 0x4600F9 (ctor 0x5B3930) is `U8 GUID U32 U32 GUID U32 U32 U32`, and TrinityCore writes
+        // Player, ActualMapID, MapID, Transport, Position (QueryPackets.cpp:383-387).
+        //
+        // The old order is the same 28 bytes, so nothing ever flagged it: the client read our
+        // Position.x as MapID, our Position.y/z as a packed Transport guid, and our MapID plus
+        // Transport as the position. The ghost got nonsense coordinates, so no corpse arrow, no
+        // minimap icon and no reclaim offer — measured live 4 Sep with the position correct on our
+        // side and the client still sending nothing but movement while standing on the corpse.
+        if (ModernVersion.Uses550Engine)
+        {
+            _worldPacket.WriteInt32(ActualMapID);
+            _worldPacket.WriteInt32(MapID);
+            _worldPacket.WritePackedGuid128(Transport);
+            _worldPacket.WriteVector3(Position);
+        }
+        else
+        {
+            _worldPacket.WriteInt32(ActualMapID);
+            _worldPacket.WriteVector3(Position);
+            _worldPacket.WriteInt32(MapID);
+            _worldPacket.WritePackedGuid128(Transport);
+        }
     }
 
     public int MaxSize => 1 + PackedGuidHelper.MaxPackedGuid128Size * 2 + 4 + 12 + 4; // bit + 2 GUIDs + int + Vector3 + int
@@ -732,10 +752,20 @@ public class CorpseLocation : ServerPacket, ISpanWritable
         writer.WriteBit(Valid);
         writer.FlushBits();
         writer.WritePackedGuid128(Player.Low, Player.High);
-        writer.WriteInt32(ActualMapID);
-        writer.WriteVector3(Position);
-        writer.WriteInt32(MapID);
-        writer.WritePackedGuid128(Transport.Low, Transport.High);
+        if (ModernVersion.Uses550Engine)
+        {
+            writer.WriteInt32(ActualMapID);
+            writer.WriteInt32(MapID);
+            writer.WritePackedGuid128(Transport.Low, Transport.High);
+            writer.WriteVector3(Position);
+        }
+        else
+        {
+            writer.WriteInt32(ActualMapID);
+            writer.WriteVector3(Position);
+            writer.WriteInt32(MapID);
+            writer.WritePackedGuid128(Transport.Low, Transport.High);
+        }
         return writer.Position;
     }
 

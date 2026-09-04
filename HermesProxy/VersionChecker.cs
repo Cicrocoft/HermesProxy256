@@ -656,10 +656,11 @@ public static class ModernVersion
             ClientVersionBuild.V2_5_3_41750
                 or ClientVersionBuild.V1_14_1_40688 => typeof(World.Enums.V1_14_1_40688.ResponseCodes),
             ClientVersionBuild.V3_4_3_54261 => typeof(World.Enums.V3_4_3_54261.ResponseCodes),
-            // 2.5.6 has no table of its own yet; 3.4.3's is the closest modern one. The conversion
-            // matches by name rather than by value, so this is safe for every code both enums
-            // share, and ConvertResponseCodesValue below no longer throws for the rest.
-            ClientVersionBuild.V2_5_6_69110 => typeof(World.Enums.V3_4_3_54261.ResponseCodes),
+            // 2.5.6 used to borrow 3.4.3's table. Name-based conversion made that safe for the codes
+            // both enums share, but not for the ones they do not: 3.4.3 stops adding CHAR_CREATE_*
+            // codes at 39 where 5.5.x keeps going, so every delete, login and name code came out
+            // three too low. It now has its own table, taken from the 5.5.x engine.
+            ClientVersionBuild.V2_5_6_69110 => typeof(World.Enums.V2_5_6_69110.ResponseCodes),
             _ => null,
         };
 

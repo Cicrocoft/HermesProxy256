@@ -2751,6 +2751,45 @@ public partial class WorldClient
                 if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V3_0_2_9056) &&
                     updateData.UnitData.PvpFlags == null)
                     updateData.UnitData.PvpFlags = ReadPvPFlags(updates);
+
+                // HERMES_256_CORPSELOC: ask for the corpse location the moment the GHOST flag is
+                // translated for our own player, and not one packet earlier.
+                //
+                // The client's SMSG_CORPSE_LOCATION handler (RVA 0x1A2C940) has three gates, and
+                // failing one does not make it ignore the packet - it jumps to 0x1A2C9A2 and
+                // ACTIVELY CLEARS the stored corpse info to mapId = -1. The third gate is
+                // `[player+0x12C70] & 0x10`, which is exactly UnitIsGhost (the client's own
+                // UnitIsGhost at 0x1F2D000 tests that byte and mask).
+                //
+                // Firing from SMSG_CORPSE_RECLAIM_DELAY, as this knob first did, is one packet too
+                // early: cmangos sends the delay at repop, before the PlayerData values update
+                // carrying the ghost bit reaches the client. Measured in hermes-run.log for the
+                // 21:25:33 death - CORPSE_LOCATION on line 6167, the first PlayerData block with
+                // `10 00 00 00` on line 6174 - so the packet was correct, arrived first, and the
+                // client erased the value. It was sent once, so nothing repaired it, and
+                // C_DeathInfo.GetCorpseMapPosition returned nil: no arrow, no minimap icon, no
+                // reclaim offer.
+                //
+                // The legacy query is a round trip to the emulator, so the response cannot overtake
+                // the values update we are building here. The handler is idempotent - retail pushes
+                // this message unsolicited - so a duplicate costs nothing.
+                if (s_corpseLoc && updateData.Guid == GetSession().GameState.CurrentPlayerGuid)
+                {
+                    bool isGhost = legacyFlags.HasAnyFlag(PlayerFlagsLegacy.Ghost);
+                    if (isGhost && !GetSession().GameState.CorpseLocationAsked)
+                    {
+                        GetSession().GameState.CorpseLocationAsked = true;
+                        SendPacketToServer(new WorldPacket(Opcode.MSG_CORPSE_QUERY));
+                        Framework.Logging.Log.Print(Framework.Logging.LogType.Network,
+                            "[256-spike] CORPSELOC: ghost flag reached the client, asking the "
+                            + "legacy core for the corpse location");
+                    }
+                    else if (!isGhost)
+                    {
+                        // Alive again - arm it for the next death.
+                        GetSession().GameState.CorpseLocationAsked = false;
+                    }
+                }
             }
             else if (updateData.Guid == GetSession().GameState.CurrentPlayerGuid && GetSession().GameState.CurrentPlayerStorage.Settings.NeedToForcePatchFlags)
             { // If we did not patch the PlayerFlags the first time, we need to force include the field

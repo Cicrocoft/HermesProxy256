@@ -607,6 +607,14 @@ public enum Opcode : uint
     CMSG_SUBMIT_USER_FEEDBACK = 0x4400C2u,
     CMSG_REQUEST_ACCOUNT_DATA = 0x4400C3u,
     CMSG_UPDATE_ACCOUNT_DATA = 0x4400C4u,
+    // WIRE-CONFIRMED. The generator dropped this name because CypherCore's 0x4000CB has no
+    // stub in the client, so the whole delete path was silently dead. Pressing Delete sends
+    // 0x4400CD: `CD 00 44 00 | 01 A0 03 04 08` - opcode plus one packed guid, exactly the
+    // client serialiser's own shape at stub 0x596C30 (`GUID`). Drift is +2 here, between the
+    // 0 at CMSG_CREATE_CHARACTER (0x440070) and the +11 at CMSG_BATTLENET_REQUEST (0x44012F);
+    // its neighbour 0x4400CC is the empty 90-second CMSG_SERVER_TIME_OFFSET_REQUEST, which
+    // pins the pair against CypherCore's adjacent 0x4000CA/0x4000CB.
+    CMSG_CHAR_DELETE = 0x4400CDu,
     CMSG_BATTLE_PAY_GET_PRODUCT_LIST = 0x4400E9u,
     CMSG_BATTLE_PAY_GET_PURCHASE_LIST = 0x4400EAu,
     CMSG_CHARACTER_RENAME_REQUEST = 0x4400F0u,
@@ -772,7 +780,15 @@ public enum Opcode : uint
     SMSG_SHOW_NEUTRAL_PLAYER_FACTION_SELECT_UI = 0x46007Du,
     SMSG_NEUTRAL_PLAYER_FACTION_SELECT_RESULT = 0x46007Eu,
     SMSG_SET_CHR_UPGRADE_TIER = 0x460081u,
-    SMSG_UPDATE_ACTION_BUTTONS = 0x460082u,
+    // 0x460082 is NOT this packet, and nothing may be sent here. Two independent walks agree
+    // its parser reads `U8 U8 U8 GUID GUID U32 x5 BYTES BYTES ... STR STR STR STR`
+    // (tools-256-spike/opcode_bodies_jt.txt:131 from the dispatcher jump table, and
+    // smsg_reader_shapes.txt:121 from the class reader at 0x5AAE50). Feeding an action-bar
+    // body to a parser that ends in four strings is a crash waiting to happen.
+    // On this build action buttons travel in the create block's ActivePlayer section
+    // instead - 180 x u64, reader RVA 0x66EE58 - and no packet class in the client reads
+    // them at all. The real id for this name, if it exists, is unknown.
+    SMSG_UPDATE_ACTION_BUTTONS = 0x460082u,   // WRONG - do not send
     SMSG_DONT_AUTO_PUSH_SPELLS_TO_ACTION_BAR = 0x460083u,
     SMSG_SCENE_OBJECT_EVENT = 0x460084u,
     SMSG_SCENE_OBJECT_PET_BATTLE_INITIAL_UPDATE = 0x460085u,
@@ -1042,7 +1058,18 @@ public enum Opcode : uint
     // at 0x5BB550 takes u32, u32 and one bit, and WowPacketParser 5.5.0 agrees at index
     // 0x183 with zero drift. See REFERENCE-256-CLIENT.md section 118.
     SMSG_QUERY_TIME_RESPONSE = 0x460183u,
-    SMSG_LOG_XP_GAIN = 0x460068u,   // displaced placeholder, real value unknown
+    // MEASURED, two independent ways - was 0x460068, a displaced placeholder, and that slot's
+    // real reader is `GUID U32 U8` (13 bytes) against the 22 we send, so every XP gain was
+    // parsed as a different message and no XP text ever appeared.
+    //   1. shape: the client's reader at 0x460193 (ctor 0x5BC300) is `GUID U32 U8 U32 U32` -
+    //      exactly {Victim, Original i32, Reason u8, Amount i32, GroupBonus f32}.
+    //   2. drift: CypherCore's LogXpGain is 0x42018E, and the band around it is pinned by two
+    //      MEASURED anchors - PowerUpdate 0x42017C -> 0x460180 (+4) and TrainerList 0x420188
+    //      -> 0x46018D (+5) - with +5 again at CreateChar 0x4201AA -> 0x4601AF. Monotone, so
+    //      0x18E can only be +5 = 0x193.
+    // Our trailing RAFBonus u8 is one byte past what the reader consumes; an over-send is
+    // harmless (only an under-send faults the packed-guid reader).
+    SMSG_LOG_XP_GAIN = 0x460193u,   // measured: client reader 0x5BC300 + pinned drift band
     SMSG_ON_CANCEL_EXPECTED_RIDE_VEHICLE_AURA = 0x46018Fu,
     SMSG_CRITERIA_DELETED = 0x46006Au,   // displaced placeholder, real value unknown
     SMSG_ACHIEVEMENT_DELETED = 0x46006Du,   // displaced placeholder, real value unknown

@@ -275,7 +275,7 @@ because this happened once before (QCRECREATE, 29 Aug). The dump was in the log;
 after a failure report. **When a knob-gated feature is reported broken, read the knob dump first** —
 it is the cheapest check in this project and it has now paid for itself twice.
 
-### D-2 re-opened 4 Sep: the client never asks for its corpse
+### D-2 re-opened and closed 4 Sep: the client never asks for its corpse
 
 Corpse reclaim does not work, and the 4 Sep session **excludes almost everything D-2 blamed**. A
 fresh death (no relog) delivered the whole sequence: death 21:02:15, repop 21:02:27, then
@@ -294,15 +294,29 @@ has no first link. This is **not** the corpse-query theory that commit rejected 
 that the client would send a query. The unsolicited push is the opposite finding, and it is in the
 same commit.
 
-`HERMES_256_CORPSELOC` asks the legacy core on the player's behalf when the reclaim delay arrives,
-which is the first moment a corpse exists to ask about. Same class as `SPIRITHEALER`: a step the
-modern protocol dropped and TBC still requires. **UNCONFIRMED — awaiting its first live test.**
-If the offer still does not appear with it on, turn it off and record that: it excludes the corpse
-position, which is worth more than a fix that merely correlates.
+`HERMES_256_CORPSELOC` asks the legacy core on the player's behalf. Same class as `SPIRITHEALER`: a
+step the modern protocol dropped and TBC still requires.
 
-Known gap in the hook, deliberately not closed yet: it hangs on the reclaim delay, so a player who
-**logs in already dead** still gets no corpse location. Pointless to fix before we know whether the
-corpse position gates the offer at all.
+**SOLVED the same evening, and the fault was TIME, not content.** The first version of this hook
+fired from `SMSG_CORPSE_RECLAIM_DELAY`, which cmangos sends at repop — one packet ahead of the
+PlayerFlags update that carries the ghost bit. The client's handler at `0x1A2C940` gates on
+`[player+0x12C70] & 0x10` (exactly `UnitIsGhost`) and, when that fails, jumps to `0x1A2C9A2` and
+**actively CLEARS** the stored corpse info to `mapId = -1` rather than ignoring the packet. So every
+correct send erased the value it was meant to set. Moved to the `PLAYER_FLAGS` translation in
+`UpdateHandler`; the legacy query is a round trip, so its answer cannot overtake the values update.
+Wire order for the 22:29:07 death: query 6342, `SMSG_UPDATE_OBJECT` with the ghost flag 6381,
+`SMSG_CORPSE_LOCATION` 6403, `CMSG_RECLAIM_CORPSE` from the client at 22:29:48 — the first time that
+packet has ever appeared on this path. Full write-up in `REFERENCE-256-CLIENT.md` §143.
+
+**Retracted:** an earlier entry here declared `SMSG_CORPSE_LOCATION` EXCLUDED, on two true
+observations — it was sent correctly with no effect, and Blizzard sends it with `Valid: False`.
+Neither was wrong and neither was sufficient. **"Sent correctly, no effect" does not mean
+"ignored".** A receiver that does active damage on a failed gate is a fault class worth carrying
+forward.
+
+Still open: **logging in already dead.** There the ghost flag rides the *create* block, so the query
+still completes before the block is sent and the value is cleared again (observed 22:25:36/37).
+Closing it means deferring the query until after the create is on the wire, not moving it earlier.
 
 **`0x42007F` is NOT noise, and calling it an advanced-flying ack was a guess from a 1:1 group mapping.**
 In Blizzard's own capture it is the client's **most frequent packet of all** - 186 of 743 - and we have no
